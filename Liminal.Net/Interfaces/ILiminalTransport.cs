@@ -1,4 +1,6 @@
-﻿namespace Liminal.Net.Interfaces
+﻿using Liminal.Net.Core;
+
+namespace Liminal.Net.Interfaces
 {
     public delegate void DataReceivedHandler(ReadOnlySpan<byte> data, ushort clientId);
 
@@ -8,7 +10,7 @@
         public bool IsConnected { get; }
 
         #region Initialization
-        public void InitializeClientIdResolver(ILiminalClientIdResolver clientIdResolver);
+        public void InitializeTransport(LiminalTransportConfig config);
         #endregion
 
         #region Connection
@@ -32,6 +34,13 @@
         #region Sending
         public void SendReliable(Span<byte> data, ushort clientId);
         public void SendUnreliable(Span<byte> data, ushort clientId);
+        #endregion
+
+        #region Polling
+        /// <summary>
+        /// Polls the transport
+        /// </summary>
+        public void Poll();
         #endregion
 
         #region Events
