@@ -6,16 +6,16 @@ using System.Net.Sockets;
 
 namespace Liminal.Net.Core
 {
-    internal class HandshakePipeline
+    internal class TcpHandshakePipeline
     {
         private readonly ILiminalClientIdResolver _resolver;
-        private readonly float _timeoutMs;
+        private readonly float _timeoutSeconds;
         private readonly int _maxHandshakeSize;
 
-        public HandshakePipeline(ILiminalClientIdResolver resolver,int maxHandshakeSize = 256, float timeoutMs = 5000)
+        public TcpHandshakePipeline(ILiminalClientIdResolver resolver,int maxHandshakeSize = 256, float timeoutS = 5)
         {
             _resolver = resolver;
-            _timeoutMs = timeoutMs;
+            _timeoutSeconds = timeoutS;
             _maxHandshakeSize = maxHandshakeSize;
         }
 
@@ -24,7 +24,7 @@ namespace Liminal.Net.Core
             try
             {
                 var stream = client.GetStream();
-                TimeSpan timeout = TimeSpan.FromMilliseconds(_timeoutMs);
+                TimeSpan timeout = TimeSpan.FromSeconds(_timeoutSeconds);
                 using var cts = new CancellationTokenSource(timeout);
 
                 byte[] header = new byte[8];
@@ -48,7 +48,7 @@ namespace Liminal.Net.Core
                 if (clientInfo.ClientVersion != serverVersion)
                     return Drop(client, $"Version Mismatch: {clientInfo.ClientVersion}");
 
-                ushort assignedId = _resolver.ResolveClientId(payload);
+                ushort assignedId = _resolver.ResolveId(payload);
                 //For encrypted stuff we maybe reassign a cookie or something
 
 
@@ -85,6 +85,64 @@ namespace Liminal.Net.Core
             }
             catch (OperationCanceledException) { return Drop(client, "Handshake Timeout"); }
             catch (Exception ex) { return Drop(client, $"Fatal Handshake Error: {ex.Message}"); }
+        }
+
+        public virtual async Task<ushort> TryConnectToServerAsync(TcpClient client, ushort clientVersion)
+        {
+            try
+            {
+                var stream = client.GetStream();
+                TimeSpan timeout = TimeSpan.FromSeconds(_timeoutSeconds);
+                using var cts = new CancellationTokenSource(timeout);
+
+                var clientInfo = new ConnectionHandshakePacketClient
+                {
+                    ClientVersion = clientVersion
+                };
+                await SendPacketAsync(stream, 1, clientInfo, cts.Token);
+                LiminalLogger.Log("[Handshake] Sent client info to server.");
+
+                byte[] header = new byte[8];
+                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+
+                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+
+                if (packetId != 2 || length <= 0 || length > _maxHandshakeSize)
+                {
+                    return Drop(client, $"Unexpected Server Response. ID: {packetId}, Len: {length}");
+                }
+
+                byte[] payload = new byte[length];
+                await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
+
+                var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload);
+                if (serverResponse == null)
+                    return Drop(client, "Malformed Server Response.");
+
+                if (serverResponse.ServerVersion != clientVersion)
+                    return Drop(client, $"Server Version Mismatch: {serverResponse.ServerVersion}");
+
+                ushort assignedId = serverResponse.AssignedClientID;
+                LiminalLogger.Log($"[Handshake] Server assigned ID: {assignedId}");
+
+                var ack = new ConnectionHandshakeClientAck
+                {
+                    ClientID = assignedId,
+                    Ack = true
+                };
+                await SendPacketAsync(stream, 3, ack, cts.Token);
+
+                return assignedId;
+            }
+            catch (OperationCanceledException)
+            {
+                return Drop(client, "Connection attempt timed out.");
+            }
+            catch (Exception ex)
+            {
+                return Drop(client, $"Connection failed: {ex.Message}");
+            }
         }
 
         private T DeserializeSafe<T>(byte[] data)

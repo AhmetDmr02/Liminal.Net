@@ -1,4 +1,6 @@
-﻿namespace Liminal.Net.Interfaces
+﻿using Liminal.Net.Core;
+
+namespace Liminal.Net.Interfaces
 {
     public interface ILiminalClientIdResolver
     {
@@ -9,7 +11,7 @@
         /// </summary>
         /// <param name="payload">The payload</param>
         /// <returns>The client id</returns>
-        public ushort ResolveClientId(Span<byte> payload);
+        public ushort ResolveId(Span<byte> payload);
 
         /// <summary>
         /// Creates a new client id
@@ -20,7 +22,15 @@
         /// <summary>
         /// Releases the client id
         /// </summary>
-        /// <param name="clientId">The client id</param>
-        public void ReleaseId(ushort clientId);
+        /// <param name="targetId">The client id</param>
+        public bool UnregisterId(ushort targetId);
+
+        /// <summary>
+        /// Registers the client
+        /// </summary>
+        public bool RegisterId(ushort targetId,ConnectionPair connectionPair);
+        public bool TryGetConnectionPair(ushort targetId, out ConnectionPair connectionPair);
+        public bool IsConnectionActive(ushort targetId);
+        public void ResetResolver();
     }
 }

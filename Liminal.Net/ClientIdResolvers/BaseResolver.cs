@@ -1,22 +1,69 @@
-﻿using Liminal.Net.Interfaces;
+﻿using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
+using System.Collections.Concurrent;
 
 namespace Liminal.Net.ClientIdResolvers
 {
     public class BaseResolver : ILiminalClientIdResolver
     {
+        protected readonly ConcurrentDictionary<ushort, ConnectionPair> _activeClients = new();
+
+        protected ushort _nextClientId = 1;
         public ushort GenerateClientId()
         {
+            if (_nextClientId == ushort.MaxValue)
+            {
+                LiminalLogger.LogError("Maximum number of clients reached this is not supported for Liminal.Net expect unexpected behavior");
+
+                _nextClientId = 1;
+            }
+
+            return _nextClientId++;
+        }
+
+        public bool IsConnectionActive(ushort clientId)
+        {
+            return _activeClients.ContainsKey(clientId);
+        }
+
+        public bool RegisterId(ushort clientId, ConnectionPair connectionPair)
+        {
+            if (_activeClients.TryAdd(clientId, connectionPair))
+            {
+                return true;
+            }
+
+            LiminalLogger.LogError($"Failed to register client {clientId}");
+
+            return false;
+        }
+
+        public void ResetResolver()
+        {
+            _activeClients.Clear();
+            _nextClientId = 1;
+        }
+
+        public ushort ResolveId(Span<byte> payload)
+        {
+            //Payload will be parsed here based on packet processors
             throw new NotImplementedException();
         }
 
-        public virtual void ReleaseId(ushort clientId)
+        public bool TryGetConnectionPair(ushort clientId, out ConnectionPair connectionPair)
         {
-            throw new NotImplementedException();
+            return _activeClients.TryGetValue(clientId, out connectionPair);
         }
 
-        public virtual ushort ResolveClientId(Span<byte> payload)
+        public bool UnregisterId(ushort clientId)
         {
-            throw new NotImplementedException();
+            if(_activeClients.TryRemove(clientId, out ConnectionPair connectionPair))
+            {
+                return true;
+            }
+
+            LiminalLogger.LogWarning($"Failed to unregister client {clientId}");
+            return false;
         }
     }
 }

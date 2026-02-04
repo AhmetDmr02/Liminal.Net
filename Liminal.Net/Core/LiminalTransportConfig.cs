@@ -30,9 +30,10 @@ namespace Liminal.Net.Core
         public uint TickRate = 30;
 
         /// <summary>
-        /// The maximum size of a packet
+        /// The maximum size of a packet buffer that will be sent in a tick
+        /// Exceeding this size will cause a packet drop with a warning
         /// </summary>
-        public ushort MaxPacketSize = 1024;
+        public ushort MaxPacketSizePerBatch = 1024;
 
         /// <summary>
         /// The maximum size of a handshake
