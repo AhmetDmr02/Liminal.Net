@@ -2,7 +2,7 @@
 
 namespace Liminal.Net.Core
 {
-    [AttributeUsage(AttributeTargets.Struct, Inherited = false, AllowMultiple = false)]
+    [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
     public sealed class LiminalPacketAttribute : Attribute
     {
         public int Id { get; }

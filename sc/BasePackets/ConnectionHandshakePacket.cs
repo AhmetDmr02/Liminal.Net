@@ -5,7 +5,7 @@ namespace Liminal.Net.BasePackets
 {
     [MessagePackObject]
     [LiminalPacket(id: 1)]
-    public struct ConnectionHandshakePacketClient
+    public class ConnectionHandshakePacketClient
     {
         [Key(0)]
         public string ClientName { get; set; }
@@ -16,7 +16,7 @@ namespace Liminal.Net.BasePackets
 
     [MessagePackObject]
     [LiminalPacket(id: 2)]
-    public struct ConnectionHandshakePacketServer
+    public class ConnectionHandshakePacketServer
     {
         [Key(0)]
         public ushort ServerVersion { get; set; }
@@ -27,7 +27,7 @@ namespace Liminal.Net.BasePackets
 
     [MessagePackObject]
     [LiminalPacket(id: 3)]
-    public struct ConnectionHandshakeClientAck
+    public class ConnectionHandshakeClientAck
     {
         [Key(0)]
         public bool Ack { get; set; }

@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 
 namespace Liminal.Net.Transports
 {
@@ -136,25 +137,51 @@ namespace Liminal.Net.Transports
 
         public virtual void Disconnect(ushort clientId = 0)
         {
-            //REWRITE this later
-            if (clientId == 0) return;
-
-            if (_sockets.TryRemove(clientId, out var pair) && _clientIdResolver.UnregisterId(clientId))
+            if (_isServer && (clientId == 0 || clientId == ILiminalTransport.SERVER_ID))
             {
-                bool wasActive = _clientIdResolver.UnregisterId(clientId);
-                pair.Close();
+                Shutdown();
 
-                if (wasActive)
+                LiminalLogger.Log($"[Transport] Trying for server shutdown.");
+                return;
+            }
+
+            // Local client disconnecting from a remote server
+            if (!_isServer && (clientId == 0 || clientId == _localClientId || clientId == ILiminalTransport.SERVER_ID))
+            {
+                if (_sockets.TryRemove(ILiminalTransport.SERVER_ID, out var serverSocket))
                 {
-                    if (_isServer && clientId != ILiminalTransport.SERVER_ID)
-                        _onClientDisconnected?.Invoke(clientId);
-                    else
-                        _onLocalClientDisconnected?.Invoke(clientId);
+                    serverSocket.Close();
+                    _clientIdResolver.UnregisterId(ILiminalTransport.SERVER_ID);
                 }
-            } 
-            else
+
+                _isConnected = false;
+                _onLocalClientDisconnected?.Invoke(_localClientId);
+
+                Shutdown();
+
+                LiminalLogger.Log($"[Transport] Client {clientId} disconnected.");
+                return;
+            }
+
+            // Server kicking a specific remote player
+            if (_isServer)
             {
-                LiminalLogger.LogError($"[Transport] Failed to disconnect client {clientId}.");
+                if (_sockets.TryRemove(clientId, out var clientSocket))
+                {
+                    clientSocket.Close();
+                    bool wasActive = _clientIdResolver.UnregisterId(clientId);
+
+                    if (wasActive)
+                    {
+                        _onClientDisconnected?.Invoke(clientId);
+                    }
+
+                  LiminalLogger.Log($"[Transport] Client {clientId} kicked.");
+                }
+                else
+                {
+                    LiminalLogger.LogWarning($"[Transport] Attempted to disconnect unknown client {clientId}.");
+                }
             }
         }
 
@@ -165,9 +192,6 @@ namespace Liminal.Net.Transports
             {
                 if (_sockets.TryGetValue(targetId, out var socket))
                 {
-                    //GET IF NIC BUFFER OVERFLOWING WE NEED TO LOG
-                    socket.GetStream().Write(data);
-
                     int payloadSize = data.Length;
 
                     Span<byte> fullPacket = stackalloc byte[6 + payloadSize];
@@ -298,7 +322,7 @@ namespace Liminal.Net.Transports
 
             _onClientConnected?.Invoke(clientId);
 
-            _ = Task.Run(() => ReceiveLoop(clientId, client));
+            _ = Task.Run(async () => ReceiveLoop(clientId, client));
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
@@ -318,9 +342,79 @@ namespace Liminal.Net.Transports
             LiminalLogger.Log($"[Transport] Successfully connected to server. Local ID: {assignedId}");
         }
 
-        private async Task ReceiveLoop(ushort clientId, TcpClient client)
+        private async Task ReceiveLoop(ushort incomingId, TcpClient client)
         {
-            //TODO
+            using var ingestBuffer = new LiminalNativeBuffer(_config.MaxPacketSizePerBatch * 2);
+            var stream = client.GetStream();
+            int bytesInBuffer = 0;
+
+            try
+            {
+                while (client.Connected && _isConnected)
+                {
+                    int remainingSpace = ingestBuffer.Memory.Length - bytesInBuffer;
+                    if (remainingSpace <= 0)
+                    {
+                        LiminalLogger.LogError($"[Transport] Buffer overflow on {incomingId}");
+                        break;
+                    }
+
+                    Memory<byte> receiveTarget = ingestBuffer.Memory.Slice(bytesInBuffer, remainingSpace);
+                    int read = await stream.ReadAsync(receiveTarget);
+
+                    if (read <= 0) break;
+                    bytesInBuffer += read;
+
+                    unsafe
+                    {
+                        Span<byte> bufferSpan = ingestBuffer.GetSpan();
+
+                        fixed (byte* basePtr = bufferSpan)
+                        {
+                            while (bytesInBuffer >= 6)
+                            {
+                                bool isReliable = basePtr[0] == 1;
+                                byte metadata = basePtr[1];
+                                int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(bufferSpan.Slice(2, 4));
+
+                                if (payloadSize < 0 || payloadSize > _config.MaxPacketSizePerBatch - 6)
+                                {
+                                    LiminalLogger.LogError($"[Transport] Violation on {incomingId}: {payloadSize}b");
+                                    return;
+                                }
+
+                                if (bytesInBuffer < 6 + payloadSize) break;
+
+                                ReadOnlySpan<byte> payload = bufferSpan.Slice(6, payloadSize);
+
+                                // TCP is reliable by nature; we invoke the reliable handler
+                                _onReliable?.Invoke(payload, incomingId);
+
+                                int totalProcessed = 6 + payloadSize;
+                                int remaining = bytesInBuffer - totalProcessed;
+
+                                if (remaining > 0)
+                                {
+                                    System.Runtime.CompilerServices.Unsafe.CopyBlock(
+                                        basePtr,
+                                        basePtr + totalProcessed,
+                                        (uint)remaining);
+                                }
+
+                                bytesInBuffer = remaining;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogWarning($"[Transport] Client {incomingId} loop failed: {ex.Message}");
+            }
+            finally
+            {
+                Disconnect(incomingId);
+            }
         }
     }
 }
