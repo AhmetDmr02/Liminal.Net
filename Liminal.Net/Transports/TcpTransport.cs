@@ -348,6 +348,16 @@ namespace Liminal.Net.Transports
             var stream = client.GetStream();
             int bytesInBuffer = 0;
 
+            client.ReceiveTimeout = (int)_config.ConnectionTimeout;
+            try
+            {
+                client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            }
+            catch
+            {
+                LiminalLogger.LogWarning($"[Transport] Failed to set keep alive on socket.");
+            }
+
             try
             {
                 while (client.Connected && _isConnected)
@@ -363,44 +373,43 @@ namespace Liminal.Net.Transports
                     int read = await stream.ReadAsync(receiveTarget);
 
                     if (read <= 0) break;
+
                     bytesInBuffer += read;
 
                     unsafe
                     {
                         Span<byte> bufferSpan = ingestBuffer.GetSpan();
-
                         fixed (byte* basePtr = bufferSpan)
                         {
-                            while (bytesInBuffer >= 6)
+                            int offset = 0;
+
+                            while (bytesInBuffer - offset >= 6)
                             {
-                                bool isReliable = basePtr[0] == 1;
-                                byte metadata = basePtr[1];
-                                int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(bufferSpan.Slice(2, 4));
+                                // Read payload size from header (bytes 2-5)
+                                int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(bufferSpan.Slice(offset + 2, 4));
 
                                 if (payloadSize < 0 || payloadSize > _config.MaxPacketSizePerBatch - 6)
                                 {
-                                    LiminalLogger.LogError($"[Transport] Violation on {incomingId}: {payloadSize}b");
+                                    LiminalLogger.LogError($"[Transport] Invalid payload size {payloadSize}b on client {incomingId}");
                                     return;
                                 }
 
-                                if (bytesInBuffer < 6 + payloadSize) break;
+                                // Check if we have the complete packet
+                                if (bytesInBuffer - offset < 6 + payloadSize)
+                                    break; // Incomplete packet, wait for more data
 
-                                ReadOnlySpan<byte> payload = bufferSpan.Slice(6, payloadSize);
+                                _onReliable?.Invoke(bufferSpan.Slice(offset + 6, payloadSize), incomingId);
 
-                                // TCP is reliable by nature; we invoke the reliable handler
-                                _onReliable?.Invoke(payload, incomingId);
+                                offset += 6 + payloadSize;
+                            }
 
-                                int totalProcessed = 6 + payloadSize;
-                                int remaining = bytesInBuffer - totalProcessed;
-
+                            if (offset > 0)
+                            {
+                                int remaining = bytesInBuffer - offset;
                                 if (remaining > 0)
                                 {
-                                    System.Runtime.CompilerServices.Unsafe.CopyBlock(
-                                        basePtr,
-                                        basePtr + totalProcessed,
-                                        (uint)remaining);
+                                    System.Runtime.CompilerServices.Unsafe.CopyBlock(basePtr, basePtr + offset, (uint)remaining);
                                 }
-
                                 bytesInBuffer = remaining;
                             }
                         }

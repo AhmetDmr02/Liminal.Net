@@ -1,28 +1,25 @@
-﻿using System;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Buffers;
 using Liminal.Net.Interfaces;
-using Liminal.Net.Misc;
+using System.Buffers.Binary;
 
 namespace Liminal.Net.Core
 {
     public class LiminalSessionManager : IDisposable
     {
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
-        private readonly ConcurrentQueue<IncomingMessage> _incomingMessages = new();
         private readonly ILiminalTransport _transport;
         private readonly LiminalTransportConfig _config;
+        private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
-
-        // stateless processors
-        // private readonly LiminalPipeline _pipeline; 
 
         private volatile bool _disposed;
 
-        public LiminalSessionManager(ILiminalTransport transport, LiminalTransportConfig config)
+        public LiminalSessionManager(ILiminalTransport transport, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
         {
             _transport = transport;
             _config = config;
+            _pipeline = pipeline;
 
             _privatePool = ArrayPool<byte>.Create(config.MaxPacketSizePerBatch, 50);
 
@@ -35,50 +32,24 @@ namespace Liminal.Net.Core
 
         #region Receive Path (Background Threads)
 
-        private void HandleReliableMessage(ReadOnlySpan<byte> data, ushort id)
-            => ProcessIncoming(id, data, true);
+        private void HandleReliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
+        private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
 
-        private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id)
-            => ProcessIncoming(id, data, false);
-
-        private void ProcessIncoming(ushort id, ReadOnlySpan<byte> data, bool reliable)
+        private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> data)
         {
-            if (_disposed) return;
-            if (!_sessions.TryGetValue(id, out var session)) return;
+            if (_disposed || !_sessions.TryGetValue(ownerId, out var session)) return;
 
             unsafe
             {
-                Span<byte> stagingA = session.StagingBufferA.GetSpan();
-                data.CopyTo(stagingA);
-
-                //encryptors/Decompressors in Ping-Pong mode.
-                int processedLength = data.Length;
-
-                EnqueueToGameThread(id, stagingA.Slice(0, processedLength), reliable);
-            }
-        }
-
-        private void EnqueueToGameThread(ushort id, Span<byte> finalData, bool reliable)
-        {
-            byte[] managedBuffer = _privatePool.Rent(finalData.Length);
-
-            try
-            {
-                finalData.CopyTo(managedBuffer);
-
-                if (!_disposed)
+                lock (session)
                 {
-                    _incomingMessages.Enqueue(new IncomingMessage(id, managedBuffer, finalData.Length, reliable));
+                    // It contains [4-byte len][Packet A][4-byte len][Packet B]...
+                    data.CopyTo(session.IngestBuffer.GetSpan());
+
+                    // It will loop through StagingA, Decrypt into StagingB, 
+                    // and append to ReceiveBuffer in the end.
+                    _pipeline.ExecuteInbound(session, data.Length);
                 }
-                else
-                {
-                    _privatePool.Return(managedBuffer);
-                }
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[SessionManager] Enqueue failed for {id}: {ex.Message}");
-                _privatePool.Return(managedBuffer);
             }
         }
 
@@ -86,72 +57,106 @@ namespace Liminal.Net.Core
 
         #region Write Path (Game Thread)
 
-        public void Send(ushort clientId, ReadOnlySpan<byte> data, bool reliable)
+        /// <summary>
+        /// Sends a packet to a client.
+        /// </summary>
+        /// <param name="targetId">The client to send the packet to</param>
+        /// <param name="data">raw packet data</param>
+        public void Send(ushort targetId, ReadOnlySpan<byte> data, bool reliable)
         {
-            if (_disposed || !_sessions.TryGetValue(clientId, out var session)) return;
+            if (_disposed || !_sessions.TryGetValue(targetId, out var session)) return;
 
-            // Move to native SendBuffer for potential transformation
-            Span<byte> sendSpan = session.SendBuffer.GetSpan();
-            data.CopyTo(sendSpan);
+            lock (session)
+            {
+                data.CopyTo(session.StagingBufferA.GetSpan());
 
-            // Add encryption/compression here later
-            int finalLength = data.Length;
+                // Transform & Append to SendBuffer batch
+                _pipeline.ExecuteOutbound(session, data.Length);
+            }
+        }
 
-            // Hand-off to Transport
-            if (reliable)
-                _transport.SendReliable(sendSpan.Slice(0, finalLength), clientId);
-            else
-                _transport.SendUnreliable(sendSpan.Slice(0, finalLength), clientId);
+        /// <summary>
+        /// Flushes all batched outbound data to the transport.
+        /// </summary>
+        public void Flush()
+        {
+            foreach (var session in _sessions.Values)
+            {
+                lock (session)
+                {
+                    if (session.SendCursor == 0) continue;
+
+                    _transport.SendReliable(session.SendBuffer.GetSpan().Slice(0, session.SendCursor), session.Id);
+                    session.SendCursor = 0;
+                }
+            }
         }
 
         #endregion
 
-        #region Polling Logic (Main Thread / Unity Update)
+        #region Polling Logic (Game Thread)
 
         public void Poll()
         {
             if (_disposed) return;
 
-            while (_incomingMessages.TryDequeue(out var msg))
+            foreach (var session in _sessions.Values)
             {
+                lock (session)
+                {
+                    if (session.ReceiveCursor == 0) continue;
+
+                    // THE BUFFER WALKER: Slicing the batch back into packets
+                    ProcessReceiveBatch(session);
+
+                    // Reset batch for next frame
+                    session.ReceiveCursor = 0;
+                }
+            }
+        }
+
+        private void ProcessReceiveBatch(LiminalSession session)
+        {
+            Span<byte> batch = session.ReceiveBuffer.GetSpan().Slice(0, session.ReceiveCursor);
+            int offset = 0;
+
+            while (offset + 4 <= batch.Length)
+            {
+                int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(batch.Slice(offset, 4));
+
+                if (offset + 4 + payloadSize > batch.Length) break;
+
+                ReadOnlySpan<byte> packetData = batch.Slice(offset + 4, payloadSize);
+
+                byte[] managedCopy = _privatePool.Rent(payloadSize);
+                packetData.CopyTo(managedCopy);
+
                 try
                 {
-                    if (!_sessions.TryGetValue(msg.ClientId, out var session)) continue;
-
-                    // GAME LOGIC ENTRY POINT
-                    // Hand off msg.Buffer.AsSpan(0, msg.Length) to your packet handlers.
-                }
-                catch (Exception ex)
-                {
-                    LiminalLogger.LogError($"[SessionManager] Poll error on client {msg.ClientId}: {ex.Message}");
+                    // LiminalEventBus.Publish(session.Id, managedCopy, payloadSize);
+                    // This is where high-level systems gets the data.
                 }
                 finally
                 {
-                    // Always return the bridge buffer to the pool
-                    _privatePool.Return(msg.Buffer);
+                    _privatePool.Return(managedCopy);
                 }
+
+                offset += 4 + payloadSize;
             }
         }
 
         #endregion
 
         #region Lifecycle Handlers
-
         private void HandleClientConnected(ushort id)
         {
             if (_disposed) return;
-            var session = new LiminalSession(id, _config.MaxPacketSizePerBatch);
-            _sessions.TryAdd(id, session);
-            LiminalLogger.Log($"[SessionManager] Session {id} initialized.");
+            _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
         }
 
         private void HandleClientDisconnected(ushort id)
         {
-            if (_sessions.TryRemove(id, out var session))
-            {
-                session.Dispose();
-                LiminalLogger.Log($"[SessionManager] Session {id} cleaned up.");
-            }
+            if (_sessions.TryRemove(id, out var session)) session.Dispose();
         }
 
         public void Dispose()
@@ -165,36 +170,9 @@ namespace Liminal.Net.Core
             _transport.OnClientDisconnected -= HandleClientDisconnected;
             _transport.OnShutdown -= Dispose;
 
-            // Cleanup all sessions (Native Memory Free)
-            foreach (var session in _sessions.Values)
-            {
-                session.Dispose();
-            }
+            foreach (var session in _sessions.Values) session.Dispose();
             _sessions.Clear();
-
-            // Flush the queue and return buffers
-            while (_incomingMessages.TryDequeue(out var msg))
-            {
-                _privatePool.Return(msg.Buffer);
-            }
         }
-
         #endregion
-
-        private readonly struct IncomingMessage
-        {
-            public readonly ushort ClientId;
-            public readonly byte[] Buffer;
-            public readonly int Length;
-            public readonly bool Reliable;
-
-            public IncomingMessage(ushort id, byte[] buffer, int length, bool reliable)
-            {
-                ClientId = id;
-                Buffer = buffer;
-                Length = length;
-                Reliable = reliable;
-            }
-        }
     }
 }

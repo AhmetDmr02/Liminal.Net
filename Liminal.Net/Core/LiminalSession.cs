@@ -4,12 +4,18 @@
     {
         public ushort Id { get; }
 
-        internal LiminalNativeBuffer SendBuffer { get; }
-        internal LiminalNativeBuffer ReceiveBuffer { get; }
+        internal readonly LiminalNativeBuffer SendBuffer;
+        internal int SendCursor = 0;
+
+        internal readonly LiminalNativeBuffer ReceiveBuffer;
+        internal int ReceiveCursor = 0;
+
+        // The "Blob" Buffer
+        internal readonly LiminalNativeBuffer IngestBuffer;
 
         // Staging buffers for the Ping-Pong transformation pipeline
-        internal LiminalNativeBuffer StagingBufferA { get; }
-        internal LiminalNativeBuffer StagingBufferB { get; }
+        internal readonly LiminalNativeBuffer StagingBufferA;
+        internal readonly LiminalNativeBuffer StagingBufferB;
 
         public bool IsActive { get; private set; }
 
@@ -18,6 +24,7 @@
             Id = id;
             SendBuffer = new LiminalNativeBuffer(bufferSize);
             ReceiveBuffer = new LiminalNativeBuffer(bufferSize);
+            IngestBuffer = new LiminalNativeBuffer(bufferSize);
             StagingBufferA = new LiminalNativeBuffer(bufferSize);
             StagingBufferB = new LiminalNativeBuffer(bufferSize);
             IsActive = true;
@@ -30,6 +37,7 @@
 
             SendBuffer.ManualDispose();
             ReceiveBuffer.ManualDispose();
+            IngestBuffer.ManualDispose();
             StagingBufferA.ManualDispose();
             StagingBufferB.ManualDispose();
         }

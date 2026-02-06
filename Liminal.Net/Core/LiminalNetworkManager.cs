@@ -23,7 +23,7 @@ namespace Liminal.Net.Core
                 return;
             }
 
-            if (config.PacketProcessors == null)
+            if (config.InboundPacketProcessors == null)
             {
                 LiminalLogger.LogError("PacketProcessors cannot be null.");
                 return;

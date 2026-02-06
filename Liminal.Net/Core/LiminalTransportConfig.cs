@@ -50,7 +50,9 @@ namespace Liminal.Net.Core
         /// </summary>
         public int MaxPacketCount = 10;
 
-        public List<ILiminalPacketProcessor> PacketProcessors = new List<ILiminalPacketProcessor>();
+        public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
+
+        public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();
 
         public ILiminalClientIdResolver ClientIdResolver;
     }
