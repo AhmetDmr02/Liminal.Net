@@ -27,9 +27,13 @@ namespace Liminal.Net.Interfaces
         #region Disconnection
         /// <summary>
         /// Disconnects the transport connection
-        /// Also can act as KickPlayer if clientId is not 0 and its server
         /// </summary>
-        public void Disconnect(ushort clientId = SERVER_ID);
+        public void Disconnect();
+
+        /// <summary>
+        /// Server Only: Forcibly removes a specific client.
+        /// </summary>
+        public void Kick(ushort clientId);
 
         /// <summary>
         /// Shuts down the transport 
@@ -54,6 +58,7 @@ namespace Liminal.Net.Interfaces
         public event ClientConnectionHandler OnLocalClientDisconnected; // When this instance's local connection drops
         public event ClientConnectionHandler OnClientConnected;         // When a remote client joins this server
         public event ClientConnectionHandler OnClientDisconnected;
+        public event ClientConnectionHandler OnClientKicked;
         #endregion
     }
 }

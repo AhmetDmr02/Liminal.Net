@@ -70,7 +70,8 @@ namespace Liminal.Net.Core
         public static int GetId(Type type)
         {
             if (TypeToId.TryGetValue(type, out int id)) return id;
-            throw new KeyNotFoundException($"Type {type.Name} is not registered as a LiminalPacket.");
+            LiminalLogger.LogError($"Type {type.Name} is not registered as a LiminalPacket.");
+            return -1;
         }
 
         public static int GetId<T>() => GetId(typeof(T));
@@ -78,7 +79,8 @@ namespace Liminal.Net.Core
         public static Type GetType(int id)
         {
             if (IdToType.TryGetValue(id, out var type)) return type;
-            throw new KeyNotFoundException($"Packet ID {id} is not registered in the PacketLibrary.");
+            LiminalLogger.LogError($"Packet ID {id} is not registered in the PacketLibrary.");
+            return null;
         }
 
         public static bool TryGetType(int id, out Type type) => IdToType.TryGetValue(id, out type);

@@ -1,17 +1,17 @@
-﻿namespace Liminal.Net.Core
+﻿using System.Collections.Concurrent;
+
+namespace Liminal.Net.Core
 {
     public sealed class LiminalSession : IDisposable
     {
         public ushort Id { get; }
 
+        internal readonly object SendLock = new();
+        internal readonly LiminalNativeBuffer RawSendBuffer;
+        internal int RawSendCursor = 0;
         internal readonly LiminalNativeBuffer SendBuffer;
-        internal int SendCursor = 0;
 
-        internal readonly LiminalNativeBuffer ReceiveBuffer;
-        internal int ReceiveCursor = 0;
-
-        // The "Blob" Buffer
-        internal readonly LiminalNativeBuffer IngestBuffer;
+        internal readonly ConcurrentQueue<InboundPacket> InboundQueue = new();
 
         // Staging buffers for the Ping-Pong transformation pipeline
         internal readonly LiminalNativeBuffer StagingBufferA;
@@ -22,9 +22,9 @@
         public LiminalSession(ushort id, int bufferSize)
         {
             Id = id;
+            RawSendBuffer = new LiminalNativeBuffer(bufferSize);
             SendBuffer = new LiminalNativeBuffer(bufferSize);
-            ReceiveBuffer = new LiminalNativeBuffer(bufferSize);
-            IngestBuffer = new LiminalNativeBuffer(bufferSize);
+
             StagingBufferA = new LiminalNativeBuffer(bufferSize);
             StagingBufferB = new LiminalNativeBuffer(bufferSize);
             IsActive = true;
@@ -35,11 +35,30 @@
             if (!IsActive) return;
             IsActive = false;
 
+            RawSendBuffer.ManualDispose();
             SendBuffer.ManualDispose();
-            ReceiveBuffer.ManualDispose();
-            IngestBuffer.ManualDispose();
             StagingBufferA.ManualDispose();
             StagingBufferB.ManualDispose();
+        }
+    }
+
+    public struct InboundPacket
+    {
+        public byte[] Buffer;
+        public int Length;
+        public ushort PacketId;
+
+        public void Init(byte[] buffer, int length, ushort packetId)
+        {
+            Buffer = buffer;
+            Length = length;
+            PacketId = packetId;
+        }
+        public void Reset()
+        {
+            Buffer = null;
+            Length = 0;
+            PacketId = 0;
         }
     }
 }

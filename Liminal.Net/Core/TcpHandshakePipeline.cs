@@ -42,15 +42,14 @@ namespace Liminal.Net.Core
                 byte[] payload = new byte[length];
                 await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
 
-                var clientInfo = DeserializeSafe<ConnectionHandshakePacketClient>(payload);
-                if (clientInfo == null) return Drop(client, "Malformed Packet 1");
+                var clientInfo = DeserializeSafe<ConnectionHandshakePacketClient>(payload, out bool success);
+                if (!success) return Drop(client, "Malformed Packet 1");
 
                 if (clientInfo.ClientVersion != serverVersion)
                     return Drop(client, $"Version Mismatch: {clientInfo.ClientVersion}");
 
                 ushort assignedId = _resolver.ResolveId(payload);
                 //For encrypted stuff we maybe reassign a cookie or something
-
 
                 assignedId = assignedId == 0 ? _resolver.GenerateClientId() : assignedId;
                 if (assignedId == 0)
@@ -76,8 +75,8 @@ namespace Liminal.Net.Core
                 byte[] ackPayload = new byte[length];
                 await stream.ReadExactlyAsync(ackPayload, 0, length, cts.Token);
 
-                var ack = DeserializeSafe<ConnectionHandshakeClientAck>(ackPayload);
-                if (ack == null || !ack.Ack) return Drop(client, "Client Rejected ID/ACK");
+                var ack = DeserializeSafe<ConnectionHandshakeClientAck>(ackPayload, out success);
+                if (!success || !ack.Ack) return Drop(client, "Client Rejected ID/ACK");
 
                 if(ack.ClientID != assignedId) return Drop(client, "Client Rejected Wrong ID/ACK");
 
@@ -116,8 +115,8 @@ namespace Liminal.Net.Core
                 byte[] payload = new byte[length];
                 await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
 
-                var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload);
-                if (serverResponse == null)
+                var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload, out bool success);
+                if (!success)
                     return Drop(client, "Malformed Server Response.");
 
                 if (serverResponse.ServerVersion != clientVersion)
@@ -145,18 +144,20 @@ namespace Liminal.Net.Core
             }
         }
 
-        private T DeserializeSafe<T>(byte[] data)
+        private T DeserializeSafe<T>(byte[] data, out bool success)
         {
             try
             {
                 var options = MessagePackSerializerOptions.Standard
                     .WithSecurity(MessagePackSecurity.UntrustedData);
-
+                
+                success = true;
                 return MessagePackSerializer.Deserialize<T>(data, options);
             }
             catch (Exception ex)
             {
                 LiminalLogger.LogWarning($"[Security] Deserialization failure for {typeof(T).Name}: {ex.Message}");
+                success = false;
                 return default;
             }
         }

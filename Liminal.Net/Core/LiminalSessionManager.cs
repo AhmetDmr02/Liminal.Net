@@ -12,21 +12,29 @@ namespace Liminal.Net.Core
         private readonly LiminalTransportConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
-
         private volatile bool _disposed;
 
-        public LiminalSessionManager(ILiminalTransport transport, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
+        // Dependency Injection for your Interpreter so we can dispatch packets
+        private readonly LiminalPacketInterpreter _interpreter;
+
+        public LiminalSessionManager(ILiminalTransport transport,LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
         {
             _transport = transport;
             _config = config;
             _pipeline = pipeline;
-
+            _interpreter = interpreter;
             _privatePool = ArrayPool<byte>.Create(config.MaxPacketSizePerBatch, 50);
 
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
+
             _transport.OnClientConnected += HandleClientConnected;
             _transport.OnClientDisconnected += HandleClientDisconnected;
+
+            _transport.OnLocalClientConnected += HandleLocalConnection;
+
+            _interpreter.OnSendRequest += BufferPacket;
+
             _transport.OnShutdown += Dispose;
         }
 
@@ -35,20 +43,32 @@ namespace Liminal.Net.Core
         private void HandleReliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
         private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
 
-        private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> data)
+        private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData)
         {
             if (_disposed || !_sessions.TryGetValue(ownerId, out var session)) return;
 
-            unsafe
+            lock (session.StagingBufferA)
             {
-                lock (session)
-                {
-                    // It contains [4-byte len][Packet A][4-byte len][Packet B]...
-                    data.CopyTo(session.IngestBuffer.GetSpan());
+                var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
+                if (processedBatch.IsEmpty) return;
 
-                    // It will loop through StagingA, Decrypt into StagingB, 
-                    // and append to ReceiveBuffer in the end.
-                    _pipeline.ExecuteInbound(session, data.Length);
+                int offset = 0;
+                while (offset + 4 <= processedBatch.Length)
+                {
+                    int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
+                    if (totalLen <= 0 || offset + 4 + totalLen > processedBatch.Length) break;
+
+                    ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
+                    int payloadLen = totalLen - 2;
+
+                    byte[] rentedBuffer = _privatePool.Rent(payloadLen);
+                    processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
+
+                    var packet = LiminalPacketPool.Rent(rentedBuffer, payloadLen, packetId);
+
+                    session.InboundQueue.Enqueue(packet);
+
+                    offset += 4 + totalLen;
                 }
             }
         }
@@ -57,37 +77,49 @@ namespace Liminal.Net.Core
 
         #region Write Path (Game Thread)
 
-        /// <summary>
-        /// Sends a packet to a client.
-        /// </summary>
-        /// <param name="targetId">The client to send the packet to</param>
-        /// <param name="data">raw packet data</param>
-        public void Send(ushort targetId, ReadOnlySpan<byte> data, bool reliable)
+        public void BufferPacket(ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
         {
             if (_disposed || !_sessions.TryGetValue(targetId, out var session)) return;
 
-            lock (session)
-            {
-                data.CopyTo(session.StagingBufferA.GetSpan());
+            int frameSize = 4 + 2 + payload.Length;
 
-                // Transform & Append to SendBuffer batch
-                _pipeline.ExecuteOutbound(session, data.Length);
+            lock (session.SendLock)
+            {
+                // Check Overflow
+                if (session.RawSendCursor + frameSize > session.RawSendBuffer.Memory.Length)
+                {
+                        LiminalLogger.LogError($"[Manager] Packet dropped for {targetId}. Send Buffer Full.");
+                        return;                   
+                }
+
+                // [Len][ID][Payload]
+                Span<byte> dest = session.RawSendBuffer.GetSpan().Slice(session.RawSendCursor);
+                BinaryPrimitives.WriteInt32LittleEndian(dest.Slice(0, 4), payload.Length + 2);
+                BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(4, 2), packetId);
+                payload.CopyTo(dest.Slice(6));
+
+                session.RawSendCursor += frameSize;
             }
         }
 
-        /// <summary>
-        /// Flushes all batched outbound data to the transport.
-        /// </summary>
         public void Flush()
         {
-            foreach (var session in _sessions.Values)
-            {
-                lock (session)
-                {
-                    if (session.SendCursor == 0) continue;
+            foreach (var session in _sessions.Values) FlushSession(session);
+        }
 
-                    _transport.SendReliable(session.SendBuffer.GetSpan().Slice(0, session.SendCursor), session.Id);
-                    session.SendCursor = 0;
+        private void FlushSession(LiminalSession session)
+        {
+            lock (session.SendLock)
+            {
+                if (session.RawSendCursor == 0) return;
+
+                // Pipeline handles the messy transform logic
+                int bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
+                session.RawSendCursor = 0;
+
+                if (bytesToSend > 0)
+                {
+                    _transport.SendReliable(session.SendBuffer.GetSpan().Slice(0, bytesToSend), session.Id);
                 }
             }
         }
@@ -95,63 +127,46 @@ namespace Liminal.Net.Core
         #endregion
 
         #region Polling Logic (Game Thread)
-
         public void Poll()
         {
             if (_disposed) return;
 
             foreach (var session in _sessions.Values)
             {
-                lock (session)
+                if (session.InboundQueue.IsEmpty) continue;
+
+                while (session.InboundQueue.TryDequeue(out var packet))
                 {
-                    if (session.ReceiveCursor == 0) continue;
+                    try
+                    {
+                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.Buffer);
+                    }
+                    finally
+                    {
+                        _privatePool.Return(packet.Buffer);
 
-                    // THE BUFFER WALKER: Slicing the batch back into packets
-                    ProcessReceiveBatch(session);
-
-                    // Reset batch for next frame
-                    session.ReceiveCursor = 0;
+                        LiminalPacketPool.Return(packet);
+                    }
                 }
-            }
-        }
-
-        private void ProcessReceiveBatch(LiminalSession session)
-        {
-            Span<byte> batch = session.ReceiveBuffer.GetSpan().Slice(0, session.ReceiveCursor);
-            int offset = 0;
-
-            while (offset + 4 <= batch.Length)
-            {
-                int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(batch.Slice(offset, 4));
-
-                if (offset + 4 + payloadSize > batch.Length) break;
-
-                ReadOnlySpan<byte> packetData = batch.Slice(offset + 4, payloadSize);
-
-                byte[] managedCopy = _privatePool.Rent(payloadSize);
-                packetData.CopyTo(managedCopy);
-
-                try
-                {
-                    // LiminalEventBus.Publish(session.Id, managedCopy, payloadSize);
-                    // This is where high-level systems gets the data.
-                }
-                finally
-                {
-                    _privatePool.Return(managedCopy);
-                }
-
-                offset += 4 + payloadSize;
             }
         }
 
         #endregion
 
-        #region Lifecycle Handlers
+        #region Lifecycle Handlers (Standard)
+        private void HandleLocalConnection(ushort clientId)
+        {
+            if (!_disposed)
+            {
+                // Create the session for the Server (ID 0)
+                _sessions.TryAdd(ILiminalTransport.SERVER_ID, new LiminalSession(ILiminalTransport.SERVER_ID, _config.MaxPacketSizePerBatch));
+                LiminalLogger.Log($"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
+            }
+        }
+
         private void HandleClientConnected(ushort id)
         {
-            if (_disposed) return;
-            _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
+            if (!_disposed) _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
         }
 
         private void HandleClientDisconnected(ushort id)
@@ -163,14 +178,14 @@ namespace Liminal.Net.Core
         {
             if (_disposed) return;
             _disposed = true;
-
             _transport.OnMessageReceivedReliable -= HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;
             _transport.OnClientConnected -= HandleClientConnected;
             _transport.OnClientDisconnected -= HandleClientDisconnected;
+            _transport.OnLocalClientConnected -= HandleLocalConnection;
+            _interpreter.OnSendRequest -= BufferPacket;
             _transport.OnShutdown -= Dispose;
-
-            foreach (var session in _sessions.Values) session.Dispose();
+            foreach (var s in _sessions.Values) s.Dispose();
             _sessions.Clear();
         }
         #endregion

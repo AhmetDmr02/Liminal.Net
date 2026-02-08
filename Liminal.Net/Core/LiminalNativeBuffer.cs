@@ -17,6 +17,11 @@ namespace Liminal.Net.Core
             _ptr = (byte*)NativeMemory.Alloc((nuint)length);
         }
 
+        ~LiminalNativeBuffer()
+        {
+            Dispose(false);
+        }
+
         public Memory<byte> Memory => CreateMemory(_length);
 
         public override Span<byte> GetSpan() => new Span<byte>(_ptr, _length);
@@ -35,8 +40,11 @@ namespace Liminal.Net.Core
         {
             if (!_disposed)
             {
-                NativeMemory.Free(_ptr);
-                _ptr = null;
+                if (_ptr != null)
+                {
+                    NativeMemory.Free(_ptr);
+                    _ptr = null;
+                }
                 _disposed = true;
             }
         }
