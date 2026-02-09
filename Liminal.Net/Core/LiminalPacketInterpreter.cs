@@ -1,4 +1,5 @@
 ﻿using MessagePack;
+using System.Collections.Concurrent;
 
 namespace Liminal.Net.Core
 {
@@ -7,14 +8,64 @@ namespace Liminal.Net.Core
         [ThreadStatic]
         private static LiminalNativeBufferWriter _nativeWriter;
 
-        private readonly Dictionary<ushort, Action<byte[], ushort>> _handlers = new();
-        private readonly Dictionary<object, List<Subscription>> _subscribers = new();
+        private readonly ConcurrentDictionary<ushort, Action<byte[], ushort>> _handlers = new();
+
+        // Changed value type to thread-safe wrapper
+        private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
 
         private readonly LiminalTransportConfig _config;
+
         private struct Subscription
         {
             public ushort PacketId;
             public Action<byte[], ushort> Wrapper;
+        }
+
+        private class SubscriptionList
+        {
+            private readonly List<Subscription> _list = new();
+            private readonly object _lock = new();
+            public bool IsDisposed { get; private set; } = false;
+
+            public bool TryAdd(Subscription sub)
+            {
+                lock (_lock)
+                {
+                    if (IsDisposed) return false;
+                    _list.Add(sub);
+                    return true;
+                }
+            }
+
+            public List<Subscription> DisposeAndClear()
+            {
+                lock (_lock)
+                {
+                    IsDisposed = true;
+                    var copy = new List<Subscription>(_list);
+                    _list.Clear();
+                    return copy;
+                }
+            }
+
+            public List<Action<byte[], ushort>> RemoveAndGetWrappers(ushort packetId)
+            {
+                var removedWrappers = new List<Action<byte[], ushort>>();
+                lock (_lock)
+                {
+                    if (IsDisposed) return removedWrappers;
+
+                    for (int i = _list.Count - 1; i >= 0; i--)
+                    {
+                        if (_list[i].PacketId == packetId)
+                        {
+                            removedWrappers.Add(_list[i].Wrapper);
+                            _list.RemoveAt(i);
+                        }
+                    }
+                }
+                return removedWrappers;
+            }
         }
 
         public LiminalPacketInterpreter(LiminalTransportConfig config)
@@ -50,24 +101,29 @@ namespace Liminal.Net.Core
                 if (success) callback(packet, sender);
             };
 
-            if (_handlers.TryGetValue(packetId, out var existingHandler))
+            _handlers.AddOrUpdate(packetId, wrapper, (_, existing) => existing + wrapper);
+
+            int maxRetries = 100;
+            int attempts = 0;
+
+            while (attempts < maxRetries)
             {
-                _handlers[packetId] = existingHandler + wrapper;
-            }
-            else
-            {
-                _handlers[packetId] = wrapper;
+                var subList = _subscribers.GetOrAdd(subscriber, _ => new SubscriptionList());
+
+                if (subList.TryAdd(new Subscription { PacketId = packetId, Wrapper = wrapper }))
+                {
+                    LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
+                    return;
+                }
+
+                attempts++;
             }
 
-            if (!_subscribers.TryGetValue(subscriber, out var subList))
+            if (attempts >= maxRetries)
             {
-                subList = new List<Subscription>();
-                _subscribers[subscriber] = subList;
+                RemoveFromHandlers(packetId, wrapper);
+                LiminalLogger.LogError($"[Interpreter] Failed to subscribe {subscriber.GetType().Name} to {typeof(T).Name} after {maxRetries} attempts!");
             }
-
-            subList.Add(new Subscription { PacketId = packetId, Wrapper = wrapper });
-
-            LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
         }
 
         public void Unsubscribe<T>(object subscriber)
@@ -78,28 +134,25 @@ namespace Liminal.Net.Core
 
             if (_subscribers.TryGetValue(subscriber, out var subList))
             {
-                for (int i = subList.Count - 1; i >= 0; i--)
+                var wrappersToRemove = subList.RemoveAndGetWrappers(packetId);
+                foreach (var wrapper in wrappersToRemove)
                 {
-                    if (subList[i].PacketId == packetId)
-                    {
-                        var wrapperToRemove = subList[i].Wrapper;
-                        RemoveFromHandlers(packetId, wrapperToRemove);
-                        subList.RemoveAt(i);
-                    }
+                    RemoveFromHandlers(packetId, wrapper);
                 }
             }
         }
 
         public void UnsubscribeAll(object subscriber)
         {
-            if (_subscribers.TryGetValue(subscriber, out var subList))
+            if (_subscribers.TryRemove(subscriber, out var subList))
             {
-                foreach (var sub in subList)
+                var subscriptions = subList.DisposeAndClear();
+
+                foreach (var sub in subscriptions)
                 {
                     RemoveFromHandlers(sub.PacketId, sub.Wrapper);
                 }
 
-                _subscribers.Remove(subscriber);
                 LiminalLogger.Log($"[Interpreter] Unsubscribed all handlers for {subscriber.GetType().Name}");
             }
         }
@@ -112,22 +165,18 @@ namespace Liminal.Net.Core
 
         private void RemoveFromHandlers(ushort packetId, Action<byte[], ushort> wrapper)
         {
-            if (_handlers.TryGetValue(packetId, out var handlerChain))
-            {
-                var newChain = (Action<byte[], ushort>)Delegate.Remove(handlerChain, wrapper);
+            _handlers.AddOrUpdate(packetId,
+                (Action<byte[], ushort>)null,
+                (_, existing) => (Action<byte[], ushort>)Delegate.Remove(existing, wrapper));
 
-                if (newChain == null)
-                {
-                    _handlers.Remove(packetId);
-                }
-                else
-                {
-                    _handlers[packetId] = newChain;
-                }
+            if (_handlers.TryGetValue(packetId, out var handler) && handler == null)
+            {
+                _handlers.TryRemove(packetId, out _);
             }
         }
 
         public event Action<ushort, ushort, ReadOnlySpan<byte>> OnSendRequest;
+
         public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
         {
             int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
@@ -138,7 +187,6 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, packet);
-
                 OnSendRequest?.Invoke(targetSessionId, (ushort)idInt, writer.WrittenSpan);
             }
             catch (OutOfMemoryException)
@@ -149,7 +197,7 @@ namespace Liminal.Net.Core
 
         public void Dispatch(ushort packetId, ushort sender, byte[] rawData)
         {
-            if (_handlers.TryGetValue(packetId, out var handlerAction))
+            if (_handlers.TryGetValue(packetId, out var handlerAction) && handlerAction != null)
             {
                 try
                 {

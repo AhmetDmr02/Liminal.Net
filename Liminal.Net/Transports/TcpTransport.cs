@@ -111,6 +111,8 @@ namespace Liminal.Net.Transports
 
         internal readonly ConcurrentDictionary<ushort, TcpClient> _sockets = new();
 
+        private int _isShuttingDown = 0;
+
         public virtual void InitializeTransport(LiminalTransportConfig config)
         {
             _config = config;
@@ -176,6 +178,13 @@ namespace Liminal.Net.Transports
         public virtual void Kick(ushort clientId)
         {
             if (!_isServer) return;
+
+            if (clientId == LocalClientId)
+            {
+                // This is the server, we don't want to close the socket while we're still connected
+                LiminalLogger.LogWarning($"[Transport] Can't kick the server.");
+                return;
+            }
 
             if (_sockets.TryRemove(clientId, out var clientSocket))
             {
@@ -244,6 +253,11 @@ namespace Liminal.Net.Transports
 
         public virtual void Shutdown()
         {
+            if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+            {
+                return; // Already shutting down
+            }
+
             if (!_isConnected) return;
 
             _isConnected = false;
@@ -275,6 +289,8 @@ namespace Liminal.Net.Transports
                 _listener = null;
             }
             _onShutdown?.Invoke();
+
+            Interlocked.Exchange(ref _isShuttingDown, 0);
         }
         protected async Task AcceptConnectionsAsync(TcpListener listener)
         {
@@ -330,7 +346,6 @@ namespace Liminal.Net.Transports
                 if (_localClientId != 0)
                 {
                     _isConnected = true;
-                    _isServer = false;
 
                     PromoteLocalClient(_localClientId, client);
                 }
@@ -441,12 +456,16 @@ namespace Liminal.Net.Transports
                                 if (payloadSize < 0 || payloadSize > _config.MaxPacketSizePerBatch - 6)
                                 {
                                     LiminalLogger.LogError($"[Transport] Invalid payload size {payloadSize}b on client {incomingId}");
+                                    Kick(incomingId);
                                     return;
                                 }
 
+                                int totalPacketSize = 6 + payloadSize;
                                 // Check if we have the complete packet
-                                if (bytesInBuffer - offset < 6 + payloadSize)
+                                if (bytesInBuffer - offset < totalPacketSize)
+                                {
                                     break; // Incomplete packet, wait for more data
+                                }
 
                                 _onReliable?.Invoke(bufferSpan.Slice(offset + 6, payloadSize), incomingId);
 
@@ -458,7 +477,7 @@ namespace Liminal.Net.Transports
                                 int remaining = bytesInBuffer - offset;
                                 if (remaining > 0)
                                 {
-                                    System.Runtime.CompilerServices.Unsafe.CopyBlock(basePtr, basePtr + offset, (uint)remaining);
+                                    bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan);
                                 }
                                 bytesInBuffer = remaining;
                             }
@@ -481,19 +500,22 @@ namespace Liminal.Net.Transports
             }
             finally
             {
-                if (_sockets.TryRemove(incomingId, out _))
+                if (_isShuttingDown == 0)
                 {
-                    _clientIdResolver.UnregisterId(incomingId);
-
-                    if (incomingId != ILiminalTransport.SERVER_ID)
-                        _onClientDisconnected?.Invoke(incomingId);
-
-                    LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
-
-                    if (!_isServer && incomingId == ILiminalTransport.SERVER_ID)
+                    if (_sockets.TryRemove(incomingId, out _))
                     {
-                        LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
-                        Shutdown();
+                        _clientIdResolver.UnregisterId(incomingId);
+
+                        if (incomingId != ILiminalTransport.SERVER_ID)
+                            _onClientDisconnected?.Invoke(incomingId);
+
+                        LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
+
+                        if (!_isServer && incomingId == ILiminalTransport.SERVER_ID)
+                        {
+                            LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
+                            Shutdown();
+                        }
                     }
                 }
             }

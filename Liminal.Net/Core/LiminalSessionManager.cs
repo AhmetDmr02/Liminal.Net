@@ -117,6 +117,12 @@ namespace Liminal.Net.Core
                 int bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
                 session.RawSendCursor = 0;
 
+                if (bytesToSend > session.SendBuffer.Memory.Length)
+                {
+                    LiminalLogger.LogError($"[SessionManager] Pipeline output ({bytesToSend}b) exceeds buffer size! Dropping packet.");
+                    return;
+                }
+
                 if (bytesToSend > 0)
                 {
                     _transport.SendReliable(session.SendBuffer.GetSpan().Slice(0, bytesToSend), session.Id);
@@ -178,6 +184,7 @@ namespace Liminal.Net.Core
         {
             if (_disposed) return;
             _disposed = true;
+
             _transport.OnMessageReceivedReliable -= HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;
             _transport.OnClientConnected -= HandleClientConnected;
@@ -185,6 +192,7 @@ namespace Liminal.Net.Core
             _transport.OnLocalClientConnected -= HandleLocalConnection;
             _interpreter.OnSendRequest -= BufferPacket;
             _transport.OnShutdown -= Dispose;
+
             foreach (var s in _sessions.Values) s.Dispose();
             _sessions.Clear();
         }

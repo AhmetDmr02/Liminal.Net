@@ -7,9 +7,9 @@ namespace Liminal.Net.Core
     {
         private byte* _ptr;
         private readonly int _length;
-        private bool _disposed;
+        private int _disposed = 0;
 
-        internal bool IsDisposed => _disposed;
+        internal bool IsDisposed => _disposed != 0;
 
         public LiminalNativeBuffer(int length)
         {
@@ -38,14 +38,18 @@ namespace Liminal.Net.Core
 
         protected override void Dispose(bool disposing)
         {
-            if (!_disposed)
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
                 if (_ptr != null)
                 {
                     NativeMemory.Free(_ptr);
                     _ptr = null;
                 }
-                _disposed = true;
+
+                if (disposing)
+                {
+                    GC.SuppressFinalize(this);
+                }
             }
         }
     }

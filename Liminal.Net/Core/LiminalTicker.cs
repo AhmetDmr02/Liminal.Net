@@ -34,11 +34,18 @@ namespace Liminal.Net.Core
 
         public void Stop()
         {
+            if (!_isRunning) return;
             _isRunning = false;
+
             if (_tickThread != null && _tickThread.IsAlive)
             {
-                _tickThread.Join(500);
+                if (!_tickThread.Join(TimeSpan.FromSeconds(2)))
+                {
+                    LiminalLogger.LogWarning("[Ticker] Tick thread did not stop gracefully!");
+                }
             }
+
+            _tickThread = null;
         }
 
         private void RunLoop()

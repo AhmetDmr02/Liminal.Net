@@ -80,6 +80,8 @@ namespace Liminal.Net.Core
 
             _ticker = null;
             SessionManager = null;
+
+            _config.ClientIdResolver.ResetResolver();
         }
 
         #region Start Methods
@@ -151,6 +153,8 @@ namespace Liminal.Net.Core
             if (Role == NetworkRole.None) return;
 
             Role = NetworkRole.None;
+
+            _ticker?.Stop();
 
             //Maybe we can reset the transport here but for now just shut it down
             _transport.Shutdown();

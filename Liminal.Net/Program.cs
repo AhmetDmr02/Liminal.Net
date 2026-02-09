@@ -138,6 +138,9 @@ namespace Liminal.Net
                 case "stresstest":
                     HandleStressTest(args);
                     break;
+                case "lgo":
+                    Console.WriteLine($"Client {LiminalNetworkManager.Instance.localID}...");
+                    break;
 
                 default:
                     Console.WriteLine("Unknown command.");

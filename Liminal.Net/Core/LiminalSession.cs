@@ -6,6 +6,9 @@ namespace Liminal.Net.Core
     {
         public ushort Id { get; }
 
+        private int _disposed = 0;
+        public bool IsActive => _disposed == 0;
+
         internal readonly object SendLock = new();
         internal readonly LiminalNativeBuffer RawSendBuffer;
         internal int RawSendCursor = 0;
@@ -17,8 +20,6 @@ namespace Liminal.Net.Core
         internal readonly LiminalNativeBuffer StagingBufferA;
         internal readonly LiminalNativeBuffer StagingBufferB;
 
-        public bool IsActive { get; private set; }
-
         public LiminalSession(ushort id, int bufferSize)
         {
             Id = id;
@@ -27,13 +28,14 @@ namespace Liminal.Net.Core
 
             StagingBufferA = new LiminalNativeBuffer(bufferSize);
             StagingBufferB = new LiminalNativeBuffer(bufferSize);
-            IsActive = true;
         }
 
         public void Dispose()
         {
-            if (!IsActive) return;
-            IsActive = false;
+            if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            {
+                return; 
+            }
 
             RawSendBuffer.ManualDispose();
             SendBuffer.ManualDispose();
