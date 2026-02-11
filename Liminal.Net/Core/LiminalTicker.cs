@@ -7,7 +7,6 @@ namespace Liminal.Net.Core
         private readonly LiminalTransportConfig _config;
         private readonly Stopwatch _stopwatch = new();
 
-        // The callback that runs every tick (Poll + Flush)
         public event Action OnTick;
 
         private volatile bool _isRunning;
@@ -27,7 +26,7 @@ namespace Liminal.Net.Core
             {
                 Name = "Liminal Network Ticker",
                 IsBackground = true,
-                Priority = ThreadPriority.AboveNormal
+                Priority = ThreadPriority.Highest // Bumped priority for stability
             };
             _tickThread.Start();
         }
@@ -39,27 +38,26 @@ namespace Liminal.Net.Core
 
             if (_tickThread != null && _tickThread.IsAlive)
             {
-                if (!_tickThread.Join(TimeSpan.FromSeconds(2)))
+                if (!_tickThread.Join(500))
                 {
                     LiminalLogger.LogWarning("[Ticker] Tick thread did not stop gracefully!");
                 }
             }
-
             _tickThread = null;
         }
 
         private void RunLoop()
         {
-            double targetTickTimeMs = 1000.0 / _config.TickRate;
+            long targetTickTicks = Stopwatch.Frequency / _config.TickRate;
 
             _stopwatch.Start();
-            double nextTickTime = _stopwatch.Elapsed.TotalMilliseconds;
+            long nextTick = _stopwatch.ElapsedTicks;
 
             while (_isRunning)
             {
-                double currentTime = _stopwatch.Elapsed.TotalMilliseconds;
+                long currentTicks = _stopwatch.ElapsedTicks;
 
-                if (currentTime >= nextTickTime)
+                if (currentTicks >= nextTick)
                 {
                     try
                     {
@@ -70,24 +68,26 @@ namespace Liminal.Net.Core
                         LiminalLogger.LogError($"[Ticker] Crash: {ex}");
                     }
 
-                    nextTickTime += targetTickTimeMs;
+                    nextTick += targetTickTicks;
 
-                    if (currentTime > nextTickTime + (targetTickTimeMs * 2))
+                    if (currentTicks > nextTick + (targetTickTicks * 3))
                     {
-                        nextTickTime = currentTime + targetTickTimeMs;
+                        nextTick = currentTicks + targetTickTicks;
                     }
                 }
                 else
                 {
-                    double waitTime = nextTickTime - currentTime;
+                    long ticksRemaining = nextTick - currentTicks;
 
-                    if (waitTime > 1.0)
+                    long msRemaining = ticksRemaining * 1000 / Stopwatch.Frequency;
+
+                    if (msRemaining > 16)
                     {
-                        Thread.Sleep((int)waitTime);
+                        Thread.Sleep(1);
                     }
                     else
                     {
-                        Thread.SpinWait(100);
+                        Thread.SpinWait(10);
                     }
                 }
             }

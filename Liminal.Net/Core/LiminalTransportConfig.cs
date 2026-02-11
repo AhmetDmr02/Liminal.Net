@@ -27,7 +27,7 @@ namespace Liminal.Net.Core
         /// <summary>
         /// The number of ticks per second
         /// </summary>
-        public uint TickRate = 30;
+        public uint TickRate = 1;
 
         /// <summary>
         /// The maximum size of a packet buffer that will be sent in a tick
