@@ -7,11 +7,13 @@ namespace Liminal.Net.Core
         public ushort Id { get; }
 
         private int _disposed = 0;
-        public bool IsActive => _disposed == 0;
 
         internal readonly object SendLock = new();
+        internal readonly object ReceiveLock = new();
+
         internal readonly LiminalNativeBuffer RawSendBuffer;
         internal int RawSendCursor = 0;
+
         internal readonly LiminalNativeBuffer SendBuffer;
 
         internal readonly ConcurrentQueue<InboundPacket> InboundQueue = new();
@@ -30,17 +32,28 @@ namespace Liminal.Net.Core
             StagingBufferB = new LiminalNativeBuffer(bufferSize);
         }
 
+        public bool IsDisposed()
+        {
+            return Volatile.Read(ref _disposed) == 1;
+        }
+
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 1)
             {
-                return; 
+                return;
             }
 
-            RawSendBuffer.ManualDispose();
-            SendBuffer.ManualDispose();
-            StagingBufferA.ManualDispose();
-            StagingBufferB.ManualDispose();
+            lock (SendLock)
+            {
+                lock (ReceiveLock)
+                {
+                    RawSendBuffer.ManualDispose();
+                    SendBuffer.ManualDispose();
+                    StagingBufferA.ManualDispose();
+                    StagingBufferB.ManualDispose();
+                }
+            }
         }
     }
 

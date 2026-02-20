@@ -1,6 +1,7 @@
 ﻿using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
@@ -207,16 +208,17 @@ namespace Liminal.Net.Transports
             }
         }
 
+        private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
         public virtual void SendReliable(Span<byte> data, ushort targetId)
         {
+            int payloadSize = data.Length;
 
+            var rentedBuffer = _sendBytePool.Rent(data.Length + 6);
             try
             {
                 if (_sockets.TryGetValue(targetId, out var socket))
                 {
-                    int payloadSize = data.Length;
-
-                    Span<byte> fullPacket = stackalloc byte[6 + payloadSize];
+                    Span<byte> fullPacket = rentedBuffer.AsSpan(0, payloadSize + 6);
 
                     fullPacket[0] = 1; //Reliable indicator
                     fullPacket[1] = 0; // Length/Metadata bit
@@ -240,7 +242,10 @@ namespace Liminal.Net.Transports
             {
                 LiminalLogger.LogError($"[Transport] Send error: {ex.Message}");
             }
-
+            finally
+            {
+                _sendBytePool.Return(rentedBuffer);
+            }
         }
 
         /// <summary>
@@ -406,7 +411,6 @@ namespace Liminal.Net.Transports
 
             LiminalLogger.Log($"[Transport] Successfully connected to server. Local ID: {assignedId}");
         }
-
         private async Task ReceiveLoop(ushort incomingId, TcpClient client)
         {
             using var ingestBuffer = new LiminalNativeBuffer(_config.MaxPacketSizePerBatch * 2);
@@ -441,47 +445,41 @@ namespace Liminal.Net.Transports
 
                     bytesInBuffer += read;
 
-                    unsafe
+                    Span<byte> bufferSpan = ingestBuffer.GetSpan();
+                    int offset = 0;
+
+                    while (bytesInBuffer - offset >= 6)
                     {
-                        Span<byte> bufferSpan = ingestBuffer.GetSpan();
-                        fixed (byte* basePtr = bufferSpan)
+                        int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(bufferSpan.Slice(offset + 2, 4));
+
+                        if (payloadSize < 0 || payloadSize > _config.MaxPacketSizePerBatch - 6)
                         {
-                            int offset = 0;
-
-                            while (bytesInBuffer - offset >= 6)
-                            {
-                                // Read payload size from header (bytes 2-5)
-                                int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(bufferSpan.Slice(offset + 2, 4));
-
-                                if (payloadSize < 0 || payloadSize > _config.MaxPacketSizePerBatch - 6)
-                                {
-                                    LiminalLogger.LogError($"[Transport] Invalid payload size {payloadSize}b on client {incomingId}");
-                                    Kick(incomingId);
-                                    return;
-                                }
-
-                                int totalPacketSize = 6 + payloadSize;
-                                // Check if we have the complete packet
-                                if (bytesInBuffer - offset < totalPacketSize)
-                                {
-                                    break; // Incomplete packet, wait for more data
-                                }
-
-                                _onReliable?.Invoke(bufferSpan.Slice(offset + 6, payloadSize), incomingId);
-
-                                offset += 6 + payloadSize;
-                            }
-
-                            if (offset > 0)
-                            {
-                                int remaining = bytesInBuffer - offset;
-                                if (remaining > 0)
-                                {
-                                    bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan);
-                                }
-                                bytesInBuffer = remaining;
-                            }
+                            LiminalLogger.LogError($"[Transport] Invalid payload size {payloadSize}b on client {incomingId}");
+                            Kick(incomingId);
+                            return;
                         }
+
+                        int totalPacketSize = 6 + payloadSize;
+
+                        if (bytesInBuffer - offset < totalPacketSize)
+                        {
+                            // Incomplete packet, wait for more data
+                            break; 
+                        }
+
+                        _onReliable?.Invoke(bufferSpan.Slice(offset + 6, payloadSize), incomingId);
+
+                        offset += totalPacketSize;
+                    }
+
+                    if (offset > 0)
+                    {
+                        int remaining = bytesInBuffer - offset;
+                        if (remaining > 0)
+                        {
+                            bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan.Slice(0, remaining));
+                        }
+                        bytesInBuffer = remaining;
                     }
                 }
             }

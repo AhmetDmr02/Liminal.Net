@@ -8,12 +8,29 @@ namespace Liminal.Net.Core
         [ThreadStatic]
         private static LiminalNativeBufferWriter _nativeWriter;
 
-        private readonly ConcurrentDictionary<ushort, Action<byte[], ushort>> _handlers = new();
+        private readonly ConcurrentDictionary<ushort, PacketEvent> _handlers = new();
 
-        // Changed value type to thread-safe wrapper
         private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
 
         private readonly LiminalTransportConfig _config;
+
+        private class PacketEvent
+        {
+            public Action<byte[], ushort> Handler;
+
+            // A tiny lock just for modifying this specific packets subscription list
+            private readonly object _lock = new();
+
+            public void Add(Action<byte[], ushort> action)
+            {
+                lock (_lock) { Handler += action; }
+            }
+
+            public void Remove(Action<byte[], ushort> action)
+            {
+                lock (_lock) { Handler -= action; }
+            }
+        }
 
         private struct Subscription
         {
@@ -101,7 +118,8 @@ namespace Liminal.Net.Core
                 if (success) callback(packet, sender);
             };
 
-            _handlers.AddOrUpdate(packetId, wrapper, (_, existing) => existing + wrapper);
+            var packetEvent = _handlers.GetOrAdd(packetId, _ => new PacketEvent());
+            packetEvent.Add(wrapper);
 
             int maxRetries = 100;
             int attempts = 0;
@@ -165,13 +183,9 @@ namespace Liminal.Net.Core
 
         private void RemoveFromHandlers(ushort packetId, Action<byte[], ushort> wrapper)
         {
-            _handlers.AddOrUpdate(packetId,
-                (Action<byte[], ushort>)null,
-                (_, existing) => (Action<byte[], ushort>)Delegate.Remove(existing, wrapper));
-
-            if (_handlers.TryGetValue(packetId, out var handler) && handler == null)
+            if (_handlers.TryGetValue(packetId, out var packetEvent))
             {
-                _handlers.TryRemove(packetId, out _);
+                packetEvent.Remove(wrapper);
             }
         }
 
@@ -197,21 +211,25 @@ namespace Liminal.Net.Core
 
         public void Dispatch(ushort packetId, ushort sender, byte[] rawData)
         {
-            if (_handlers.TryGetValue(packetId, out var handlerAction) && handlerAction != null)
+            if (_handlers.TryGetValue(packetId, out var packetEvent))
             {
-                try
+                var currentHandler = packetEvent.Handler;
+
+                if (currentHandler != null)
                 {
-                    handlerAction(rawData, sender);
-                }
-                catch (Exception ex)
-                {
-                    LiminalLogger.LogError($"[Interpreter] Error in handler for ID {packetId}: {ex}");
+                    try
+                    {
+                        currentHandler(rawData, sender);
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[Interpreter] Error in handler for ID {packetId}: {ex}");
+                    }
+                    return;
                 }
             }
-            else
-            {
-                LiminalLogger.LogWarning($"[Interpreter] Unhandled Packet ID {packetId}");
-            }
+
+            LiminalLogger.LogWarning($"[Interpreter] Unhandled Packet ID {packetId}");
         }
 
         private T DeserializeSafe<T>(byte[] data, out bool success)

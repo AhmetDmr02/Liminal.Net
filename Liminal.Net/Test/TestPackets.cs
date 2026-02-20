@@ -10,4 +10,14 @@ namespace Liminal.Net.Test
         [Key(0)]
         public string Message;
     }
+    [LiminalPacket(6)]
+    [MessagePackObject]
+    public struct FilePacket
+    {
+        [Key(0)]
+        public string FileName;
+
+        [Key(1)]
+        public byte[] Data;
+    }
 }

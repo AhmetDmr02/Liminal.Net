@@ -5,6 +5,7 @@ using Liminal.Net.Transports;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 
+
 namespace Liminal.Net
 {
     public static class Program
@@ -25,7 +26,7 @@ namespace Liminal.Net
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = 7777,
-                TickRate = 1,
+                TickRate = 10,
                 MaxPacketSizePerBatch = 4096,
                 InboundPacketProcessors = new(),
                 OutboundPacketProcessors = new(),
@@ -35,8 +36,9 @@ namespace Liminal.Net
             var transport = new TcpTransport();
             _manager = new LiminalNetworkManager(transport, config);
             _manager.Interpreter.Subscribe<ChatPacket>(OnChatReceived, "Program");
+            _manager.Interpreter.Subscribe<FilePacket>(OnFileReceived, "Program");
 
-            Console.WriteLine("Commands: host, server, connect, send {t} {id}, spam {pps}, stopspam, reset, disconnect");
+            Console.WriteLine("Commands: host, server, connect, send {t} {id}, sendfile {file} {id}, spam {pps}, stopspam, reset, disconnect");
 
             bool running = true;
             string inputBuffer = "";
@@ -74,7 +76,6 @@ namespace Liminal.Net
                 }
 
                 _monitor.UpdateTitle(_totalSent);
-                //Thread.Sleep(1);
             }
 
             _manager.Shutdown();
@@ -96,6 +97,7 @@ namespace Liminal.Net
                     _manager.Disconnect();
                     break;
                 case "send": HandleSendCommand(args); break;
+                case "sendfile": HandleSendFileCommand(args); break;
                 case "spam": HandleSpamCommand(args); break;
                 case "stopspam": StopSpam(); break;
                 case "reset":
@@ -127,6 +129,50 @@ namespace Liminal.Net
                 _lastTargetId = targetId;
                 _manager.Interpreter.SendCommand(targetId, _lastPacket.Value);
                 Interlocked.Increment(ref _totalSent);
+            }
+        }
+
+        private static void HandleSendFileCommand(string[] args)
+        {
+            if (args.Length < 3)
+            {
+                Console.WriteLine("Usage: sendfile {filename} {targetid}");
+                return;
+            }
+
+            string fileName = args[1];
+            if (!ushort.TryParse(args[2], out ushort targetId))
+            {
+                Console.WriteLine("Invalid target ID.");
+                return;
+            }
+
+            string filePath = Path.Combine(Environment.CurrentDirectory, fileName);
+
+            if (!File.Exists(filePath))
+            {
+                Console.WriteLine($"File not found: {filePath}");
+                return;
+            }
+
+            try
+            {
+                byte[] fileData = File.ReadAllBytes(filePath);
+
+                var packet = new FilePacket
+                {
+                    FileName = Path.GetFileName(filePath),
+                    Data = fileData
+                };
+
+                _manager.Interpreter.SendCommand(targetId, packet);
+                Interlocked.Increment(ref _totalSent);
+
+                Console.WriteLine($"Sent file '{packet.FileName}' ({fileData.Length} bytes) to {targetId}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to send file: {ex.Message}");
             }
         }
 
@@ -167,7 +213,7 @@ namespace Liminal.Net
                         else
                         {
                             long ticksRemaining = nextPacketTime - currentTime;
-  
+
                             if (ticksRemaining > (frequency / 64))
                             {
                                 Thread.Sleep(1);
@@ -185,6 +231,7 @@ namespace Liminal.Net
                 }
             }, token);
         }
+
         private static void OnChatReceived(ChatPacket packet, ushort senderId)
         {
             _monitor.RecordPacket();
@@ -192,6 +239,29 @@ namespace Liminal.Net
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.WriteLine($"\n[MSG] {senderId}: {packet.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        private static void OnFileReceived(FilePacket packet, ushort senderId)
+        {
+            _monitor.RecordPacket();
+            try
+            {
+                string saveDir = Path.Combine(Environment.CurrentDirectory, "ReceivedFiles");
+                Directory.CreateDirectory(saveDir);
+
+                string savePath = Path.Combine(saveDir, packet.FileName);
+                File.WriteAllBytes(savePath, packet.Data);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[FILE] Received '{packet.FileName}' ({packet.Data.Length} bytes) from {senderId}. Saved to /ReceivedFiles/");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\n[FILE ERROR] Failed to save received file: {ex.Message}");
                 Console.ResetColor();
             }
         }

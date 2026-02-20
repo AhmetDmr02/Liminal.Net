@@ -12,7 +12,7 @@ namespace Liminal.Net.Core
         private readonly LiminalTransportConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
-        private volatile bool _disposed;
+        private volatile bool _sessionManagerDisposed;
 
         // Dependency Injection for your Interpreter so we can dispatch packets
         private readonly LiminalPacketInterpreter _interpreter;
@@ -45,10 +45,12 @@ namespace Liminal.Net.Core
 
         private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData)
         {
-            if (_disposed || !_sessions.TryGetValue(ownerId, out var session)) return;
+            if (_sessionManagerDisposed || !_sessions.TryGetValue(ownerId, out var session)) return;
 
-            lock (session.StagingBufferA)
+            lock (session.ReceiveLock)
             {
+                if (session.IsDisposed()) return;
+
                 var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
                 if (processedBatch.IsEmpty) return;
 
@@ -79,17 +81,20 @@ namespace Liminal.Net.Core
 
         public void BufferPacket(ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
         {
-            if (_disposed || !_sessions.TryGetValue(targetId, out var session)) return;
+            if (_sessionManagerDisposed || !_sessions.TryGetValue(targetId, out var session)) return;
 
             int frameSize = 4 + 2 + payload.Length;
 
             lock (session.SendLock)
             {
                 // Check Overflow
+
+                if (session.IsDisposed()) return;
+
                 if (session.RawSendCursor + frameSize > session.RawSendBuffer.Memory.Length)
                 {
-                        LiminalLogger.LogError($"[Manager] Packet dropped for {targetId}. Send Buffer Full.");
-                        return;                   
+                    LiminalLogger.LogError($"[Manager] Packet dropped for {targetId}. Send Buffer Full.");
+                    return;    
                 }
 
                 // [Len][ID][Payload]
@@ -112,6 +117,7 @@ namespace Liminal.Net.Core
             lock (session.SendLock)
             {
                 if (session.RawSendCursor == 0) return;
+                if (session.IsDisposed()) return;
 
                 // Pipeline handles the messy transform logic
                 int bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
@@ -135,10 +141,12 @@ namespace Liminal.Net.Core
         #region Polling Logic (Game Thread)
         public void Poll()
         {
-            if (_disposed) return;
+            if (_sessionManagerDisposed) return;
 
             foreach (var session in _sessions.Values)
             {
+                if (session.IsDisposed()) return;
+
                 if (session.InboundQueue.IsEmpty) continue;
 
                 while (session.InboundQueue.TryDequeue(out var packet))
@@ -162,7 +170,7 @@ namespace Liminal.Net.Core
         #region Lifecycle Handlers (Standard)
         private void HandleLocalConnection(ushort clientId)
         {
-            if (!_disposed)
+            if (!_sessionManagerDisposed)
             {
                 // Create the session for the Server (ID 0)
                 _sessions.TryAdd(ILiminalTransport.SERVER_ID, new LiminalSession(ILiminalTransport.SERVER_ID, _config.MaxPacketSizePerBatch));
@@ -172,7 +180,7 @@ namespace Liminal.Net.Core
 
         private void HandleClientConnected(ushort id)
         {
-            if (!_disposed) _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
+            if (!_sessionManagerDisposed) _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
         }
 
         private void HandleClientDisconnected(ushort id)
@@ -182,8 +190,8 @@ namespace Liminal.Net.Core
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
+            if (_sessionManagerDisposed) return;
+            _sessionManagerDisposed = true;
 
             _transport.OnMessageReceivedReliable -= HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;

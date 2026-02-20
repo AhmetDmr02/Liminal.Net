@@ -43,6 +43,7 @@ namespace Liminal.Net.Core
 
             if (_position + sizeHint > _buffer.Memory.Length)
             {
+                LiminalLogger.LogError($"[Liminal] Serialization exceeded fixed native buffer size of {_buffer.Memory.Length}.");
                 throw new OutOfMemoryException($"[Liminal] Serialization exceeded fixed native buffer size of {_buffer.Memory.Length}.");
             }
         }
