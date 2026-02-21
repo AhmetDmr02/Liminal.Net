@@ -8,6 +8,9 @@ namespace Liminal.Net.Core
     public class LiminalSessionManager : IDisposable
     {
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
+
+        private readonly ConcurrentQueue<(ushort SenderId, InboundPacket Packet)> _loopbackQueue = new();
+
         private readonly ILiminalTransport _transport;
         private readonly LiminalTransportConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
@@ -81,7 +84,24 @@ namespace Liminal.Net.Core
 
         public void BufferPacket(ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
         {
-            if (_sessionManagerDisposed || !_sessions.TryGetValue(targetId, out var session)) return;
+            if (_sessionManagerDisposed) return;
+
+            if (!_sessions.TryGetValue(targetId, out var session))
+            {
+                if (targetId == _transport.LocalClientId)
+                {
+                    byte[] rentedBuffer = _privatePool.Rent(payload.Length);
+                    payload.CopyTo(rentedBuffer);
+
+                    var packet = LiminalPacketPool.Rent(rentedBuffer, payload.Length, packetId);
+
+                    _loopbackQueue.Enqueue((targetId, packet));
+                    return;
+                }
+
+                LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
+                return;
+            }
 
             int frameSize = 4 + 2 + payload.Length;
 
@@ -143,6 +163,23 @@ namespace Liminal.Net.Core
         {
             if (_sessionManagerDisposed) return;
 
+            //VIRTUAL LOOPBACK Self Sends
+            while (!_loopbackQueue.IsEmpty && _loopbackQueue.TryDequeue(out var loopbackItem))
+            {
+                var senderId = loopbackItem.SenderId;
+                var packet = loopbackItem.Packet;
+
+                try
+                {
+                    _interpreter.Dispatch(packet.PacketId, senderId, packet.Buffer);
+                }
+                finally
+                {
+                    _privatePool.Return(packet.Buffer);
+                    LiminalPacketPool.Return(packet);
+                }
+            }
+
             foreach (var session in _sessions.Values)
             {
                 if (session.IsDisposed()) return;
@@ -201,9 +238,19 @@ namespace Liminal.Net.Core
             _interpreter.OnSendRequest -= BufferPacket;
             _transport.OnShutdown -= Dispose;
 
+            while (_loopbackQueue.TryDequeue(out var loopbackItem))
+            {
+                _privatePool.Return(loopbackItem.Packet.Buffer);
+                LiminalPacketPool.Return(loopbackItem.Packet);
+            }
+
             foreach (var s in _sessions.Values) s.Dispose();
             _sessions.Clear();
         }
+        #endregion
+
+        #region Test Helpers
+        public int GetActiveSessionCount() => _sessions.Count;
         #endregion
     }
 }

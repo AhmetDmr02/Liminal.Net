@@ -1,3 +1,4 @@
 <Solution>
+  <Project Path="Liminal.Net.Tests/Liminal.Net.Tests.csproj" Id="5638858a-4ebe-4274-8523-0990173f75c8" />
   <Project Path="Liminal.Net/Liminal.Net.csproj" />
 </Solution>

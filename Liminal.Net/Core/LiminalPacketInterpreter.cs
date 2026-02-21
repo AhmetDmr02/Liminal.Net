@@ -5,8 +5,7 @@ namespace Liminal.Net.Core
 {
     public class LiminalPacketInterpreter
     {
-        [ThreadStatic]
-        private static LiminalNativeBufferWriter _nativeWriter;
+        private readonly ConcurrentBag<LiminalNativeBufferWriter> _writerPool = new();
 
         private readonly ConcurrentDictionary<ushort, PacketEvent> _handlers = new();
 
@@ -90,15 +89,14 @@ namespace Liminal.Net.Core
             _config = config;
         }
 
-        private LiminalNativeBufferWriter GetThreadWriter(int maxPacketSize)
+        private LiminalNativeBufferWriter RentWriter()
         {
-            if (_nativeWriter == null)
+            if (_writerPool.TryTake(out var writer))
             {
-                _nativeWriter = new LiminalNativeBufferWriter(maxPacketSize);
+                writer.Clear();
+                return writer;
             }
-
-            _nativeWriter.Clear();
-            return _nativeWriter;
+            return new LiminalNativeBufferWriter(_config.MaxPacketSizePerBatch);
         }
 
         public void Subscribe<T>(Action<T, ushort> callback, object subscriber)
@@ -196,16 +194,21 @@ namespace Liminal.Net.Core
             int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
             if (idInt == -1) return;
 
-            var writer = GetThreadWriter(_config.MaxPacketSizePerBatch);
+            var writer = RentWriter();
 
             try
             {
                 MessagePackSerializer.Serialize(writer, packet);
                 OnSendRequest?.Invoke(targetSessionId, (ushort)idInt, writer.WrittenSpan);
             }
-            catch (OutOfMemoryException)
+            // MessagePackSerializer wraps the OutOfMemoryException
+            catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} is too large to send!");
+                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send! {ex.InnerException?.Message}");
+            }
+            finally
+            {
+                _writerPool.Add(writer);
             }
         }
 

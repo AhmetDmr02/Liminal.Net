@@ -163,13 +163,6 @@ namespace Liminal.Net.Transports
 
             if (!_isServer && _isConnected)
             {
-                if (_sockets.TryRemove(ILiminalTransport.SERVER_ID, out var serverSocket))
-                {
-                    try { serverSocket.Close(); } catch { }
-                    _clientIdResolver.UnregisterId(ILiminalTransport.SERVER_ID);
-                }
-
-                _isConnected = false;
                 _onLocalClientDisconnected?.Invoke(_localClientId);
 
                 Shutdown();
@@ -262,40 +255,44 @@ namespace Liminal.Net.Transports
             {
                 return; // Already shutting down
             }
-
-            if (!_isConnected) return;
-
-            _isConnected = false;
-            _isServer = false;
-            _isClient = false;
-            _localClientId = 0;
-            foreach (var id in _sockets.Keys)
+            try
             {
-                if (_sockets.TryRemove(id, out var clientSocket))
+                _isConnected = false;
+                _isServer = false;
+                _isClient = false;
+                _localClientId = 0;
+
+                foreach (var id in _sockets.Keys)
+                {
+                    if (_sockets.TryRemove(id, out var clientSocket))
+                    {
+                        try
+                        {
+                            clientSocket.Close();
+                        }
+                        catch { }
+
+                        _clientIdResolver.UnregisterId(id);
+
+                        LiminalLogger.Log($"[Transport] Client {id} cleared.");
+                    }
+                }
+                if (_listener != null)
                 {
                     try
                     {
-                        clientSocket.Close();
+                        _listener.Stop();
                     }
                     catch { }
-
-                    _clientIdResolver.UnregisterId(id);
-
-                    LiminalLogger.Log($"[Transport] Client {id} cleared.");
+                    _listener = null;
                 }
+                _onShutdown?.Invoke();
+
             }
-            if (_listener != null)
+            finally
             {
-                try
-                {
-                    _listener.Stop();
-                }
-                catch { }
-                _listener = null;
+                Interlocked.Exchange(ref _isShuttingDown, 0);
             }
-            _onShutdown?.Invoke();
-
-            Interlocked.Exchange(ref _isShuttingDown, 0);
         }
         protected async Task AcceptConnectionsAsync(TcpListener listener)
         {
@@ -341,7 +338,9 @@ namespace Liminal.Net.Transports
         {
             try
             {
-                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
+
+                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, cts.Token);
 
                 _onHandshakeInitialized?.Invoke();
 
@@ -364,11 +363,8 @@ namespace Liminal.Net.Transports
             }
             catch (Exception ex)
             {
-                if (_isConnected)
-                {
-                    LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
-                    Shutdown();
-                }
+                LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
+                Shutdown();
             }
         }
 
@@ -488,7 +484,6 @@ namespace Liminal.Net.Transports
                 if (_sockets.ContainsKey(incomingId))
                 {
                     LiminalLogger.LogWarning($"[Transport] Client {incomingId} connection dropped: {ex.Message}");
-                    Kick(incomingId);
                 }
                 else
                 {
@@ -500,18 +495,21 @@ namespace Liminal.Net.Transports
             {
                 if (_isShuttingDown == 0)
                 {
-                    if (_sockets.TryRemove(incomingId, out _))
+                    if (_sockets.TryRemove(incomingId, out var clientSocket))
                     {
+                        try { clientSocket.Close(); } catch { LiminalLogger.LogWarning($"[Transport] Failed to close socket for client {incomingId}."); }
+
                         _clientIdResolver.UnregisterId(incomingId);
 
                         if (incomingId != ILiminalTransport.SERVER_ID)
+                        {
                             _onClientDisconnected?.Invoke(incomingId);
-
-                        LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
-
-                        if (!_isServer && incomingId == ILiminalTransport.SERVER_ID)
+                            LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
+                        }
+                        else if (!_isServer)
                         {
                             LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
+                            _onLocalClientDisconnected?.Invoke(_localClientId);
                             Shutdown();
                         }
                     }
