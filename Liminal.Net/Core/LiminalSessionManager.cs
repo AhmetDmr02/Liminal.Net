@@ -36,6 +36,8 @@ namespace Liminal.Net.Core
 
             _transport.OnLocalClientConnected += HandleLocalConnection;
 
+            _transport.OnClientKicked += HandleClientDisconnected;
+
             _interpreter.OnSendRequest += BufferPacket;
 
             _transport.OnShutdown += Dispose;
@@ -50,31 +52,40 @@ namespace Liminal.Net.Core
         {
             if (_sessionManagerDisposed || !_sessions.TryGetValue(ownerId, out var session)) return;
 
-            lock (session.ReceiveLock)
+            try
             {
-                if (session.IsDisposed()) return;
-
-                var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
-                if (processedBatch.IsEmpty) return;
-
-                int offset = 0;
-                while (offset + 4 <= processedBatch.Length)
+                lock (session.ReceiveLock)
                 {
-                    int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
-                    if (totalLen <= 0 || offset + 4 + totalLen > processedBatch.Length) break;
+                    if (session.IsDisposed()) return;
 
-                    ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
-                    int payloadLen = totalLen - 2;
+                    var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
+                    if (processedBatch.IsEmpty) return;
 
-                    byte[] rentedBuffer = _privatePool.Rent(payloadLen);
-                    processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
+                    int offset = 0;
+                    while (offset + 4 <= processedBatch.Length)
+                    {
+                        int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
+                        if (totalLen <= 0 || offset + 4 + totalLen > processedBatch.Length) break;
 
-                    var packet = LiminalPacketPool.Rent(rentedBuffer, payloadLen, packetId);
+                        ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
+                        int payloadLen = totalLen - 2;
 
-                    session.InboundQueue.Enqueue(packet);
+                        byte[] rentedBuffer = _privatePool.Rent(payloadLen);
+                        processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
 
-                    offset += 4 + totalLen;
+                        var packet = LiminalPacketPool.Rent(rentedBuffer, payloadLen, packetId);
+
+                        session.InboundQueue.Enqueue(packet);
+
+                        offset += 4 + totalLen;
+                    }
+
                 }
+            }
+            catch (Exception e)
+            {
+                LiminalLogger.LogError($"[SessionManager] Error processing inbound packet: {e}");
+                _transport.Kick(ownerId);
             }
         }
 
@@ -235,6 +246,7 @@ namespace Liminal.Net.Core
             _transport.OnClientConnected -= HandleClientConnected;
             _transport.OnClientDisconnected -= HandleClientDisconnected;
             _transport.OnLocalClientConnected -= HandleLocalConnection;
+            _transport.OnClientKicked -= HandleClientDisconnected;
             _interpreter.OnSendRequest -= BufferPacket;
             _transport.OnShutdown -= Dispose;
 

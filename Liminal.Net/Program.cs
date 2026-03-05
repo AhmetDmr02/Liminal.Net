@@ -5,7 +5,6 @@ using Liminal.Net.Transports;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 
-
 namespace Liminal.Net
 {
     public static class Program
@@ -38,7 +37,7 @@ namespace Liminal.Net
             _manager.Interpreter.Subscribe<ChatPacket>(OnChatReceived, "Program");
             _manager.Interpreter.Subscribe<FilePacket>(OnFileReceived, "Program");
 
-            Console.WriteLine("Commands: host, server, connect, send {t} {id}, sendfile {file} {id}, spam {pps}, stopspam, reset, disconnect");
+            Console.WriteLine("Commands: host, server, connect, send {t} {id}, sendfile {file} {id}, spam {pps}, stopspam, reset, disconnect, kick {id}");
 
             bool running = true;
             string inputBuffer = "";
@@ -100,6 +99,7 @@ namespace Liminal.Net
                 case "sendfile": HandleSendFileCommand(args); break;
                 case "spam": HandleSpamCommand(args); break;
                 case "stopspam": StopSpam(); break;
+                case "kick": HandleKickCommand(args); break;
                 case "reset":
                     _monitor.Reset();
                     Interlocked.Exchange(ref _totalSent, 0);
@@ -116,6 +116,25 @@ namespace Liminal.Net
                 _spamCts.Dispose();
                 _spamCts = null;
                 Console.WriteLine("Spam Task Terminated.");
+            }
+        }
+
+        private static void HandleKickCommand(string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Console.WriteLine("Usage: kick {targetid}");
+                return;
+            }
+
+            if (ushort.TryParse(args[1], out ushort targetId))
+            {
+                _manager.Transport.Kick(targetId);
+                Console.WriteLine($"Kicked client {targetId}.");
+            }
+            else
+            {
+                Console.WriteLine("Invalid target ID.");
             }
         }
 

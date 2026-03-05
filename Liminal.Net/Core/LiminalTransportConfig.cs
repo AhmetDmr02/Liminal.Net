@@ -33,7 +33,7 @@ namespace Liminal.Net.Core
         /// The maximum size of a packet buffer that will be sent in a tick
         /// Exceeding this size will cause a packet drop with a warning
         /// </summary>
-        public ushort MaxPacketSizePerBatch = 1024;
+        public ushort MaxPacketSizePerBatch = ushort.MaxValue;
 
         /// <summary>
         /// The maximum size of a handshake

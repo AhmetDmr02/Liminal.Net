@@ -362,5 +362,140 @@ namespace Liminal.Net.Tests
                 _serverManager.ManualPoll();
             }, "Polling after a dropped packet caused an exception.");
         }
+        [Test]
+        public void Test17_Framer_Concurrency_Stress()
+        {
+            var racer = new RaceTriggerProcessor();
+            _serverConfig.OutboundPacketProcessors.Add(racer);
+            _serverConfig.InboundPacketProcessors.Add(racer);
+
+            _serverConfig.MaxPacketSizePerBatch = ushort.MaxValue;
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var clientManager = CreateAndStartClient();
+
+            Assert.That(SpinWait.SpinUntil(() => clientManager.Transport.IsConnected, 5000), Is.True);
+
+            ushort assignedId = clientManager.localID;
+
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, sender) => { }, this);
+            clientManager.Interpreter.Subscribe<ChatPacket>((pkt, sender) => { }, this);
+
+            int failed = 0;
+            long serverSent = 0;
+            long clientSent = 0;
+
+            int iterations = 1000;
+
+            int flushBatchSize = 20;
+            int workerCount = Math.Max(4, Environment.ProcessorCount);
+
+            var startGate = new CountdownEvent(1);
+            var doneGate = new CountdownEvent(workerCount * 2);
+
+            Task[] tasks = new Task[workerCount * 2];
+
+            for (int w = 0; w < workerCount; w++)
+            {
+                int workerIndex = w;
+
+                tasks[w] = Task.Run(() =>
+                {
+                    startGate.Wait();
+                    for (int i = 1; i <= iterations; i++)
+                    {
+                        try
+                        {
+                            _serverManager.Interpreter.SendCommand(assignedId, new ChatPacket { Message = $"S|{workerIndex}|{i}" });
+                            Interlocked.Increment(ref serverSent);
+
+                            if (i % flushBatchSize == 0)
+                            {
+                                _serverManager.SessionManager.Flush();
+                            }
+                        }
+                        catch
+                        {
+                            Interlocked.Exchange(ref failed, 1);
+                            break;
+                        }
+                    }
+                    _serverManager.SessionManager.Flush();
+                    doneGate.Signal();
+                });
+
+                tasks[workerCount + w] = Task.Run(() =>
+                {
+                    startGate.Wait();
+                    for (int i = 1; i <= iterations; i++)
+                    {
+                        try
+                        {
+                            clientManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"C|{workerIndex}|{i}" });
+                            Interlocked.Increment(ref clientSent);
+
+                            if (i % flushBatchSize == 0)
+                            {
+                                clientManager.SessionManager.Flush();
+                            }
+                        }
+                        catch
+                        {
+                            Interlocked.Exchange(ref failed, 1);
+                            break;
+                        }
+                    }
+                    clientManager.SessionManager.Flush();
+                    doneGate.Signal();
+                });
+            }
+
+            startGate.Signal();
+
+            bool completed = doneGate.Wait(TimeSpan.FromSeconds(60));
+            Assert.That(completed, Is.True, "Timeout waiting for worker tasks to finish.");
+
+            Assert.That(Interlocked.CompareExchange(ref failed, 0, 0), Is.EqualTo(0), "Framer collision or transport failure detected.");
+            Assert.That(serverSent, Is.EqualTo((long)iterations * workerCount));
+            Assert.That(clientSent, Is.EqualTo((long)iterations * workerCount));
+
+            _serverConfig.MaxPacketSizePerBatch = 4096;
+        }
+
+        private class RaceTriggerProcessor : ILiminalInboundTransformer, ILiminalOutboundTransformer
+        {
+            public int TransformOutbound(ReadOnlySpan<byte> input, Span<byte> output, LiminalSession session)
+            {
+                for (int i = 0; i < input.Length; i++) output[i] = (byte)(input[i] ^ 0xFF);
+                Thread.SpinWait(100);
+                return input.Length;
+            }
+
+            public int TransformInbound(ReadOnlySpan<byte> input, Span<byte> output, LiminalSession session)
+            {
+                for (int i = 0; i < input.Length; i++) output[i] = (byte)(input[i] ^ 0xFF);
+                Thread.SpinWait(100);
+                return input.Length;
+            }
+        }
+        [Test]
+        public void Test18_UngracefulSocketClose_TriggersFatalLog()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var clientManager = CreateAndStartClient();
+
+            Assert.That(SpinWait.SpinUntil(() => clientManager.Transport.IsConnected, 2000), Is.True);
+
+            Thread.Sleep(100);
+
+            ushort targetId = clientManager.localID;
+
+            _serverManager.Transport.Kick(targetId);
+
+            Thread.Sleep(200);
+
+            Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(0), "Session should be removed.");
+        }
     }
 }

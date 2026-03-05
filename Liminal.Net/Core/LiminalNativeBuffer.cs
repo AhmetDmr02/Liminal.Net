@@ -24,7 +24,13 @@ namespace Liminal.Net.Core
 
         public Memory<byte> Memory => CreateMemory(_length);
 
-        public override Span<byte> GetSpan() => new Span<byte>(_ptr, _length);
+        public override Span<byte> GetSpan()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                throw new ObjectDisposedException("LiminalNativeBuffer");
+
+            return new Span<byte>(_ptr, _length);
+        }
 
         public override MemoryHandle Pin(int elementIndex = 0)
         {

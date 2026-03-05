@@ -138,28 +138,31 @@ namespace Liminal.Net.ClientIdResolvers
         /// </summary>
         private void CleanupExpiredReservations()
         {
-            var now = DateTime.UtcNow;
-            var expiredIds = new List<ushort>();
-
-            foreach (var kvp in _reservedIds)
+            lock (_idLock) 
             {
-                if (now - kvp.Value > _reservationTimeout)
+                var now = DateTime.UtcNow;
+                var expiredIds = new List<ushort>();
+
+                foreach (var kvp in _reservedIds)
                 {
-                    expiredIds.Add(kvp.Key);
+                    if (now - kvp.Value > _reservationTimeout)
+                    {
+                        expiredIds.Add(kvp.Key);
+                    }
                 }
-            }
 
-            foreach (var id in expiredIds)
-            {
-                if (_reservedIds.TryRemove(id, out _))
+                foreach (var id in expiredIds)
                 {
-                    LiminalLogger.LogWarning($"[Resolver] Reservation for ID {id} expired and was cleaned up.");
+                    if (_reservedIds.TryRemove(id, out _))
+                    {
+                        LiminalLogger.LogWarning($"[Resolver] Reservation for ID {id} expired and was cleaned up.");
+                    }
                 }
-            }
 
-            if (expiredIds.Count > 0)
-            {
-                LiminalLogger.Log($"[Resolver] Cleaned up {expiredIds.Count} expired reservation(s).");
+                if (expiredIds.Count > 0)
+                {
+                    LiminalLogger.Log($"[Resolver] Cleaned up {expiredIds.Count} expired reservation(s).");
+                }
             }
         }
 

@@ -19,8 +19,11 @@ namespace Liminal.Net.Core
         internal readonly ConcurrentQueue<InboundPacket> InboundQueue = new();
 
         // Staging buffers for the Ping-Pong transformation pipeline
-        internal readonly LiminalNativeBuffer StagingBufferA;
-        internal readonly LiminalNativeBuffer StagingBufferB;
+        internal readonly LiminalNativeBuffer InboundStagingA;
+        internal readonly LiminalNativeBuffer InboundStagingB;
+
+        internal readonly LiminalNativeBuffer OutboundStagingA;
+        internal readonly LiminalNativeBuffer OutboundStagingB;
 
         public LiminalSession(ushort id, int bufferSize)
         {
@@ -28,8 +31,11 @@ namespace Liminal.Net.Core
             RawSendBuffer = new LiminalNativeBuffer(bufferSize);
             SendBuffer = new LiminalNativeBuffer(bufferSize);
 
-            StagingBufferA = new LiminalNativeBuffer(bufferSize);
-            StagingBufferB = new LiminalNativeBuffer(bufferSize);
+            InboundStagingA = new LiminalNativeBuffer(bufferSize);
+            InboundStagingB = new LiminalNativeBuffer(bufferSize);
+
+            OutboundStagingA = new LiminalNativeBuffer(bufferSize);
+            OutboundStagingB = new LiminalNativeBuffer(bufferSize);
         }
 
         public bool IsDisposed()
@@ -39,20 +45,20 @@ namespace Liminal.Net.Core
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) == 1)
-            {
-                return;
-            }
+            if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
 
             lock (SendLock)
             {
-                lock (ReceiveLock)
-                {
-                    RawSendBuffer.ManualDispose();
-                    SendBuffer.ManualDispose();
-                    StagingBufferA.ManualDispose();
-                    StagingBufferB.ManualDispose();
-                }
+                RawSendBuffer.ManualDispose();
+                SendBuffer.ManualDispose();
+                OutboundStagingA.ManualDispose();
+                OutboundStagingB.ManualDispose();
+            }
+
+            lock (ReceiveLock)
+            {
+                InboundStagingA.ManualDispose();
+                InboundStagingB.ManualDispose();
             }
         }
     }
