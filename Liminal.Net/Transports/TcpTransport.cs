@@ -15,16 +15,16 @@ namespace Liminal.Net.Transports
     /// </summary>
     public class TcpTransport : ILiminalTransport
     {
-        protected ushort _localClientId = 0;
+        protected volatile ushort _localClientId = 0;
         public ushort LocalClientId => _localClientId;
 
-        protected bool _isConnected = false;
+        protected volatile bool _isConnected = false;
         public bool IsConnected => _isConnected;
 
-        protected bool _isServer = false;
+        protected volatile bool _isServer = false;
         public bool IsServer => _isServer;
 
-        protected bool _isClient = false;
+        protected volatile bool _isClient = false;
         public bool IsClient => _isClient;
 
         protected TcpListener _listener;
@@ -367,27 +367,30 @@ namespace Liminal.Net.Transports
                 Shutdown();
             }
         }
-
         private void PromoteClient(ushort clientId, TcpClient client)
         {
             var endpoint = (IPEndPoint)client.Client.RemoteEndPoint;
-            if(endpoint == null)
+            if (endpoint == null)
             {
                 LiminalLogger.LogWarning($"[Transport] Client {clientId} has no remote endpoint.");
+                client.Close();
+                return;
+            }
+            if (!_clientIdResolver.RegisterId(clientId, new ConnectionPair(clientId, endpoint)))
+            {
+                LiminalLogger.LogWarning($"[Transport] Client {clientId} registration failed. Dropping connection.");
+                client.Close();
                 return;
             }
 
-            if (_clientIdResolver.IsConnectionActive(clientId))
+            var oldClient = _sockets.AddOrUpdate(clientId, client, (key, old) =>
             {
-                LiminalLogger.LogWarning($"[Transport] Client {clientId} is already connected. Dropping old session.");
-                Kick(clientId);
-            }
-
-            _sockets[clientId] = client;
-            _clientIdResolver.RegisterId(clientId, new ConnectionPair(clientId, endpoint));
+                LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
+                try { old.Close(); } catch { }
+                return client;
+            });
 
             _onClientConnected?.Invoke(clientId);
-
             _ = Task.Run(async () => ReceiveLoop(clientId, client));
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");

@@ -11,7 +11,7 @@ namespace Liminal.Net.ClientIdResolvers
         private readonly ConcurrentDictionary<ushort, DateTime> _reservedIds = new();
         private readonly TimeSpan _reservationTimeout = TimeSpan.FromSeconds(10);
 
-        protected int _nextClientId = 1;
+        protected volatile int _nextClientId = 1;
         private readonly object _idLock = new();
 
         /// <summary>
@@ -66,16 +66,19 @@ namespace Liminal.Net.ClientIdResolvers
         /// </summary>
         public bool RegisterId(ushort clientId, ConnectionPair connectionPair)
         {
-            _reservedIds.TryRemove(clientId, out _);
-
-            if (_activeClients.TryAdd(clientId, connectionPair))
+            lock (_idLock)
             {
-                LiminalLogger.Log($"[Resolver] Registered client {clientId}");
-                return true;
-            }
+                _reservedIds.TryRemove(clientId, out _);
 
-            LiminalLogger.LogError($"[Resolver] Failed to register client {clientId}. ID already in use!");
-            return false;
+                if (_activeClients.TryAdd(clientId, connectionPair))
+                {
+                    LiminalLogger.Log($"[Resolver] Registered client {clientId}");
+                    return true;
+                }
+
+                LiminalLogger.LogError($"[Resolver] Failed to register client {clientId}. ID already in use!");
+                return false;
+            }
         }
 
         /// <summary>
@@ -83,32 +86,35 @@ namespace Liminal.Net.ClientIdResolvers
         /// </summary>
         public bool UnregisterId(ushort clientId)
         {
-            bool removedFromActive = _activeClients.TryRemove(clientId, out ConnectionPair connectionPair);
-            bool removedFromReserved = _reservedIds.TryRemove(clientId, out _);
-
-            if (removedFromActive)
+            lock (_idLock)
             {
-                LiminalLogger.Log($"[Resolver] Unregistered client {clientId}");
-                return true;
-            }
+                bool removedFromActive = _activeClients.TryRemove(clientId, out ConnectionPair connectionPair);
+                bool removedFromReserved = _reservedIds.TryRemove(clientId, out _);
 
-            if (removedFromReserved)
-            {
-                LiminalLogger.LogWarning($"[Resolver] Removed reserved (but unregistered) ID {clientId}");
-                return true;
-            }
+                if (removedFromActive)
+                {
+                    LiminalLogger.Log($"[Resolver] Unregistered client {clientId}");
+                    return true;
+                }
 
-            LiminalLogger.LogWarning($"[Resolver] Could not unregister {clientId} (Already removed?)");
-            return false;
+                if (removedFromReserved)
+                {
+                    LiminalLogger.LogWarning($"[Resolver] Removed reserved (but unregistered) ID {clientId}");
+                    return true;
+                }
+
+                LiminalLogger.LogWarning($"[Resolver] Could not unregister {clientId} (Already removed?)");
+                return false;
+            }
         }
 
         public void ResetResolver()
         {
-            _activeClients.Clear();
-            _reservedIds.Clear();
-
             lock (_idLock)
             {
+                _activeClients.Clear();
+                _reservedIds.Clear();
+
                 _nextClientId = 1;
             }
 

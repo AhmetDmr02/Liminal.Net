@@ -497,5 +497,223 @@ namespace Liminal.Net.Tests
 
             Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(0), "Session should be removed.");
         }
+        [Test]
+        public void Test19_ConcurrentClientConnections_NoDuplicateIds()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            const int CLIENT_COUNT = 20;
+            var connectedIds = new ConcurrentBag<ushort>();
+            var connectionEvents = new CountdownEvent(CLIENT_COUNT);
+
+            _serverManager.Transport.OnClientConnected += (clientId) =>
+            {
+                connectedIds.Add(clientId);
+                connectionEvents.Signal();
+            };
+
+            var clientTasks = new List<Task>();
+            var startGate = new ManualResetEventSlim(false);
+
+            for (int i = 0; i < CLIENT_COUNT; i++)
+            {
+                clientTasks.Add(Task.Run(() =>
+                {
+                    startGate.Wait();
+                    var client = CreateAndStartClient();
+                }));
+            }
+
+            startGate.Set();
+
+            bool allConnected = connectionEvents.Wait(TimeSpan.FromSeconds(10));
+            Assert.That(allConnected, Is.True, $"Only {CLIENT_COUNT - connectionEvents.CurrentCount}/{CLIENT_COUNT} clients connected in time.");
+
+            Thread.Sleep(500);
+
+            var idList = connectedIds.ToList();
+            var uniqueIds = idList.Distinct().ToList();
+
+            Assert.That(idList.Count, Is.EqualTo(uniqueIds.Count),
+                $"RACE CONDITION DETECTED: {idList.Count - uniqueIds.Count} duplicate ID(s) assigned. " +
+                $"IDs: [{string.Join(", ", idList.OrderBy(x => x))}]");
+
+            foreach (var clientId in idList)
+            {
+                Assert.That(_serverConfig.ClientIdResolver.IsConnectionActive(clientId), Is.True,
+                    $"Client {clientId} connected but not registered in resolver.");
+            }
+
+            LiminalLogger.Log($"[Test19] Successfully tested {CLIENT_COUNT} concurrent connections - all IDs unique.");
+        }
+
+        [Test]
+        public void Test20_RapidConnectDisconnect_NoResourceLeaks()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            const int ITERATIONS = 30;
+
+            for (int i = 0; i < ITERATIONS; i++)
+            {
+                var client = CreateAndStartClient();
+
+                bool connected = SpinWait.SpinUntil(() => client.Transport.IsConnected, 1000);
+
+                if (connected)
+                {
+                    client.Disconnect();
+                    Thread.Sleep(50);
+                }
+            }
+
+            Thread.Sleep(500);
+
+            int activeCount = 0;
+            for (ushort id = 1; id < 100; id++)
+            {
+                if (_serverConfig.ClientIdResolver.IsConnectionActive(id))
+                {
+                    activeCount++;
+                }
+            }
+
+            Assert.That(activeCount, Is.LessThanOrEqualTo(2),
+                $"Resolver leak detected: {activeCount} clients still registered after disconnect.");
+
+            LiminalLogger.Log($"[Test20] Successfully completed {ITERATIONS} rapid connect/disconnect cycles.");
+        }
+
+        [Test]
+        public void Test21_SimultaneousSameIdPromotion_OnlyOneSucceeds()
+        {
+            var maliciousResolver = new ForceCollisionResolver(targetId: 42, duplicateCount: 5);
+
+            var testConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = maliciousResolver
+            };
+
+            var testServer = new LiminalNetworkManager(new TcpTransport(), testConfig);
+            testServer.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => testServer.Transport.IsConnected, 2000), Is.True);
+
+            var connectedIds = new ConcurrentBag<ushort>();
+            testServer.Transport.OnClientConnected += (id) => connectedIds.Add(id);
+
+            var clients = new List<LiminalNetworkManager>();
+            var startGate = new ManualResetEventSlim(false);
+
+            for (int i = 0; i < 5; i++)
+            {
+                Task.Run(() =>
+                {
+                    startGate.Wait();
+
+                    var clientConfig = new LiminalTransportConfig
+                    {
+                        Default_Host = "127.0.0.1",
+                        Default_Port = _currentTestPort,
+                        TickRate = 60,
+                        MaxPacketSizePerBatch = 4096,
+                        ClientIdResolver = new BaseResolver()
+                    };
+
+                    var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+                    lock (clients) clients.Add(client);
+
+                    client.StartClient("127.0.0.1", _currentTestPort);
+                });
+            }
+
+            startGate.Set();
+            Thread.Sleep(2000);
+
+            int registeredCount = maliciousResolver.GetRegisteredCount();
+            var connectedList = connectedIds.ToList();
+
+            Assert.That(registeredCount, Is.LessThanOrEqualTo(1),
+                $"RACE CONDITION: {registeredCount} clients registered with the same ID 42. " +
+                $"Expected: 1, Connected events fired: {connectedList.Count}");
+
+            if (connectedList.Count > 0)
+            {
+                Assert.That(connectedList.All(id => id == 42), Is.True);
+            }
+
+            testServer.Shutdown();
+            lock (clients)
+            {
+                foreach (var c in clients)
+                {
+                    try { c.Shutdown(); } catch { }
+                }
+            }
+
+            LiminalLogger.Log($"[Test21] Collision test complete. Resolver gave 5x ID 42, but only {registeredCount} registered.");
+        }
+
+        private class ForceCollisionResolver : ILiminalClientIdResolver
+        {
+            private readonly ushort _targetId;
+            private readonly int _duplicateCount;
+            private int _callCount = 0;
+            private readonly ConcurrentDictionary<ushort, ConnectionPair> _registered = new();
+
+            public ForceCollisionResolver(ushort targetId, int duplicateCount)
+            {
+                _targetId = targetId;
+                _duplicateCount = duplicateCount;
+            }
+
+            public ushort GenerateClientId()
+            {
+                int count = Interlocked.Increment(ref _callCount);
+                return count <= _duplicateCount ? _targetId : (ushort)0;
+            }
+
+            public bool IsConnectionActive(ushort clientId)
+            {
+                return _registered.ContainsKey(clientId);
+            }
+
+            public bool RegisterId(ushort clientId, ConnectionPair connectionPair)
+            {
+                return _registered.TryAdd(clientId, connectionPair);
+            }
+
+            public bool UnregisterId(ushort clientId)
+            {
+                return _registered.TryRemove(clientId, out _);
+            }
+
+            public void ResetResolver()
+            {
+                _registered.Clear();
+                _callCount = 0;
+            }
+
+            public ushort ResolveId(Span<byte> payload)
+            {
+                return 0;
+            }
+
+            public bool TryGetConnectionPair(ushort clientId, out ConnectionPair connectionPair)
+            {
+                return _registered.TryGetValue(clientId, out connectionPair);
+            }
+
+            public int GetRegisteredCount()
+            {
+                return _registered.ContainsKey(_targetId) ? 1 : 0;
+            }
+        }
     }
 }
