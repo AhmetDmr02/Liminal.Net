@@ -125,7 +125,7 @@ namespace Liminal.Net.Transports
         {
             IPAddress adress = string.IsNullOrEmpty(ip) ? IPAddress.Any : IPAddress.Parse(ip);
             _listener = new TcpListener(adress, port);
-            _listener.Start();
+            _listener.Start(100);
 
             _isServer = true;
             _isConnected = true;

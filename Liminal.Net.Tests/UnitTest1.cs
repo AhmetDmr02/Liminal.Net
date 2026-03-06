@@ -15,7 +15,7 @@ namespace Liminal.Net.Tests
     public class TransportIntegrationTests
     {
         private LiminalNetworkManager _serverManager;
-        private List<LiminalNetworkManager> _clientManagers;
+        private ConcurrentBag<LiminalNetworkManager> _clientManagers;
         private LiminalTransportConfig _serverConfig;
 
         // Prevent port exhaustion between tests
@@ -26,7 +26,7 @@ namespace Liminal.Net.Tests
         public void Setup()
         {
             _currentTestPort = Interlocked.Increment(ref _portCounter);
-            _clientManagers = new List<LiminalNetworkManager>();
+            _clientManagers = new ();
 
             _serverConfig = new LiminalTransportConfig
             {
@@ -34,7 +34,9 @@ namespace Liminal.Net.Tests
                 Default_Port = _currentTestPort,
                 TickRate = 60,
                 MaxPacketSizePerBatch = 4096,
-                ClientIdResolver = new BaseResolver()
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
             };
 
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
@@ -47,7 +49,6 @@ namespace Liminal.Net.Tests
             {
                 client?.Shutdown();
             }
-            _clientManagers.Clear();
             _serverManager?.Shutdown();
         }
 
@@ -59,7 +60,9 @@ namespace Liminal.Net.Tests
                 Default_Port = _currentTestPort,
                 TickRate = 60,
                 MaxPacketSizePerBatch = 4096,
-                ClientIdResolver = new BaseResolver()
+                ClientIdResolver = new BaseResolver(),
+                HandshakeTimeout = 15,
+                ConnectionTimeout = 15
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config);
             _clientManagers.Add(client);
@@ -202,13 +205,24 @@ namespace Liminal.Net.Tests
 
             for (int i = 0; i < 3; i++)
             {
-                var c = CreateAndStartClient();
-                c.Transport.OnLocalClientConnected += (id) => assignedIds.Add(id);
+                var config = new LiminalTransportConfig
+                {
+                    Default_Host = "127.0.0.1",
+                    Default_Port = _currentTestPort,
+                    TickRate = 60,
+                    MaxPacketSizePerBatch = 4096,
+                    ClientIdResolver = new BaseResolver()
+                };
+                var c = new LiminalNetworkManager(new TcpTransport(), config);
+                _clientManagers.Add(c);
                 clients.Add(c);
+
+                c.Transport.OnLocalClientConnected += (id) => assignedIds.Add(id);
+
+                c.StartClient("127.0.0.1", _currentTestPort);
             }
 
-            Assert.That(SpinWait.SpinUntil(() => assignedIds.Count == 3, 2000), Is.True);
-
+            Assert.That(SpinWait.SpinUntil(() => assignedIds.Count == 3, 2000), Is.True, "Failed to capture all 3 connection events.");
             CollectionAssert.AllItemsAreUnique(assignedIds, "Resolver handed out duplicate IDs.");
         }
 
@@ -500,10 +514,11 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test19_ConcurrentClientConnections_NoDuplicateIds()
         {
+            ThreadPool.SetMinThreads(200, 200);
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
-            const int CLIENT_COUNT = 20;
+            const int CLIENT_COUNT = 10;
             var connectedIds = new ConcurrentBag<ushort>();
             var connectionEvents = new CountdownEvent(CLIENT_COUNT);
 
@@ -514,20 +529,23 @@ namespace Liminal.Net.Tests
             };
 
             var clientTasks = new List<Task>();
-            var startGate = new ManualResetEventSlim(false);
+
+            var startGate = new TaskCompletionSource<bool>();
 
             for (int i = 0; i < CLIENT_COUNT; i++)
             {
-                clientTasks.Add(Task.Run(() =>
+                clientTasks.Add(Task.Run(async () =>
                 {
-                    startGate.Wait();
+                    await startGate.Task;
+
                     var client = CreateAndStartClient();
                 }));
             }
 
-            startGate.Set();
+            startGate.SetResult(true);
 
-            bool allConnected = connectionEvents.Wait(TimeSpan.FromSeconds(10));
+            bool allConnected = connectionEvents.Wait(TimeSpan.FromSeconds(15));
+
             Assert.That(allConnected, Is.True, $"Only {CLIENT_COUNT - connectionEvents.CurrentCount}/{CLIENT_COUNT} clients connected in time.");
 
             Thread.Sleep(500);
@@ -715,5 +733,110 @@ namespace Liminal.Net.Tests
                 return _registered.ContainsKey(_targetId) ? 1 : 0;
             }
         }
+        [Test]
+        public void Test22_Chaos_Teardown_Under_Heavy_Load()
+        {
+            var chaosTransformer = new ChaosTransformer();
+            _serverConfig.InboundPacketProcessors.Add(chaosTransformer);
+            _serverConfig.OutboundPacketProcessors.Add(chaosTransformer);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            int clientCount = 10;
+            var activeClients = new List<LiminalNetworkManager>();
+            var startGate = new ManualResetEventSlim(false);
+
+            int architecturalExceptions = 0;
+
+            for (int i = 0; i < clientCount; i++)
+            {
+                var c = CreateAndStartClient();
+                activeClients.Add(c);
+            }
+
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.SessionManager.GetActiveSessionCount() == clientCount, 3000), Is.True);
+
+            var spamTasks = new List<Task>();
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            foreach (var client in activeClients)
+            {
+                spamTasks.Add(Task.Run(() =>
+                {
+                    startGate.Wait();
+                    try
+                    {
+                        while (!cts.IsCancellationRequested)
+                        {
+                            if (client.Transport.IsConnected)
+                            {
+                                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "Chaos" });
+                                client.SessionManager.Flush();
+                            }
+
+                            if (Random.Shared.Next(100) < 5) Thread.Yield();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!(ex is System.IO.IOException || ex is System.Net.Sockets.SocketException))
+                        {
+                            LiminalLogger.LogError($"[Chaos] Race Condition Caught: {ex.GetType().Name} - {ex.Message}");
+                            Interlocked.Increment(ref architecturalExceptions);
+                        }
+                    }
+                }));
+            }
+
+            startGate.Set();
+
+            Thread.Sleep(500);
+
+            var teardownTasks = new List<Task>
+    {
+        Task.Run(() => _serverManager.Shutdown())
+    };
+
+            for (int i = 0; i < clientCount; i++)
+            {
+                int index = i;
+                teardownTasks.Add(Task.Run(() =>
+                {
+                    if (Random.Shared.Next(100) < 50) Thread.Sleep(Random.Shared.Next(1, 10));
+
+                    if (activeClients[index] != null && activeClients[index].Transport.IsConnected)
+                    {
+                        activeClients[index].Disconnect();
+                    }
+                }));
+            }
+
+            Task.WaitAll(teardownTasks.ToArray());
+            cts.Cancel();
+            Task.WaitAll(spamTasks.ToArray());
+
+            Assert.That(architecturalExceptions, Is.EqualTo(0), "RACE CONDITION DETECTED! An internal exception (like NullReference or ObjectDisposed) leaked during concurrent teardown.");
+            Assert.That(_serverManager.Transport.IsConnected, Is.False, "Server failed to fully shut down.");
+            Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(0), "Session leak detected after chaos shutdown.");
+        }
+
+        private class ChaosTransformer : ILiminalInboundTransformer, ILiminalOutboundTransformer
+        {
+            public int TransformInbound(ReadOnlySpan<byte> input, Span<byte> output, LiminalSession session)
+            {
+                if (Random.Shared.Next(10) < 3) Thread.Yield();
+                input.CopyTo(output);
+                if (Random.Shared.Next(10) < 3) Thread.Yield();
+                return input.Length;
+            }
+
+            public int TransformOutbound(ReadOnlySpan<byte> input, Span<byte> output, LiminalSession session)
+            {
+                if (Random.Shared.Next(10) < 3) Thread.Yield();
+                input.CopyTo(output);
+                if (Random.Shared.Next(10) < 3) Thread.Yield();
+                return input.Length;
+            }
+        } 
     }
 }

@@ -78,8 +78,8 @@ namespace Liminal.Net.Core
             //We actually wanna keep subscriptions around
             //Interpreter?.ClearAllHandlers();
 
-            _ticker = null;
-            SessionManager = null;
+            //_ticker = null;
+            //SessionManager = null;
 
             _config.ClientIdResolver.ResetResolver();
         }
@@ -169,22 +169,27 @@ namespace Liminal.Net.Core
 
         private void HostTick()
         {
-            SessionManager.Poll();
-            SessionManager.Flush();
+            var sm = SessionManager;
+
+            sm?.Poll();
+            sm?.Flush();
         }
 
         private void ServerTick()
         {
-            SessionManager.Poll();
-            SessionManager.Flush();
+            var sm = SessionManager;
+
+            sm?.Poll();
+            sm?.Flush();
         }
 
         private void ClientBackgroundTick()
         {
             //For now
-            SessionManager.Poll();
+            var sm = SessionManager;
 
-            SessionManager.Flush();
+            sm?.Poll();
+            sm?.Flush();
         }
 
         /// <summary>
@@ -194,7 +199,7 @@ namespace Liminal.Net.Core
         {
             if (Role == NetworkRole.Client)
             {
-                SessionManager.Poll();
+                SessionManager?.Poll();
             }
         }
 
