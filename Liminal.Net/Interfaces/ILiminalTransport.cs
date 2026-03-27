@@ -1,4 +1,6 @@
 ﻿using Liminal.Net.Core;
+using System;
+using System.Threading.Tasks;
 
 namespace Liminal.Net.Interfaces
 {

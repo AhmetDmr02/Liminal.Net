@@ -1,4 +1,6 @@
-﻿namespace Liminal.Net.Core
+﻿using System;
+
+namespace Liminal.Net.Core
 {
     public static class LiminalLogger
     {

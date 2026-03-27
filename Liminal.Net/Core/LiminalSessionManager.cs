@@ -1,4 +1,5 @@
 ﻿using Liminal.Net.Interfaces;
+using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;

@@ -1,4 +1,7 @@
-﻿namespace Liminal.Net.Misc
+﻿using System;
+using System.Threading;
+
+namespace Liminal.Net.Misc
 {
     public static class LiminalAtomicHelpers
     {

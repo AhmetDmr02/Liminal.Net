@@ -1,4 +1,5 @@
 ﻿using Liminal.Net.Interfaces;
+using System.Collections.Generic;
 
 namespace Liminal.Net.Core
 {

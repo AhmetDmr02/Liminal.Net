@@ -1,7 +1,9 @@
 ﻿using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace Liminal.Net.ClientIdResolvers
 {
