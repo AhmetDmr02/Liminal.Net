@@ -438,6 +438,7 @@ namespace Liminal.Net.Transports
                     }
 
                     Memory<byte> receiveTarget = ingestBuffer.Memory.Slice(bytesInBuffer, remainingSpace);
+
                     int read = await stream.ReadAsync(receiveTarget);
 
                     if (read <= 0) break;

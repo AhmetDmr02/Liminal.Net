@@ -511,60 +511,61 @@ namespace Liminal.Net.Tests
 
             Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(0), "Session should be removed.");
         }
-        [Test]
-        public void Test19_ConcurrentClientConnections_NoDuplicateIds()
-        {
-            ThreadPool.SetMinThreads(200, 200);
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+        // Carried Over To The Coyote Tests
+        //[Test]
+        //public void Test19_ConcurrentClientConnections_NoDuplicateIds()
+        //{
+        //    ThreadPool.SetMinThreads(200, 200);
+        //    _serverManager.StartServer("127.0.0.1", _currentTestPort);
+        //    Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
-            const int CLIENT_COUNT = 10;
-            var connectedIds = new ConcurrentBag<ushort>();
-            var connectionEvents = new CountdownEvent(CLIENT_COUNT);
+        //    const int CLIENT_COUNT = 10;
+        //    var connectedIds = new ConcurrentBag<ushort>();
+        //    var connectionEvents = new CountdownEvent(CLIENT_COUNT);
 
-            _serverManager.Transport.OnClientConnected += (clientId) =>
-            {
-                connectedIds.Add(clientId);
-                connectionEvents.Signal();
-            };
+        //    _serverManager.Transport.OnClientConnected += (clientId) =>
+        //    {
+        //        connectedIds.Add(clientId);
+        //        connectionEvents.Signal();
+        //    };
 
-            var clientTasks = new List<Task>();
+        //    var clientTasks = new List<Task>();
 
-            var startGate = new TaskCompletionSource<bool>();
+        //    var startGate = new TaskCompletionSource<bool>();
 
-            for (int i = 0; i < CLIENT_COUNT; i++)
-            {
-                clientTasks.Add(Task.Run(async () =>
-                {
-                    await startGate.Task;
+        //    for (int i = 0; i < CLIENT_COUNT; i++)
+        //    {
+        //        clientTasks.Add(Task.Run(async () =>
+        //        {
+        //            await startGate.Task;
 
-                    var client = CreateAndStartClient();
-                }));
-            }
+        //            var client = CreateAndStartClient();
+        //        }));
+        //    }
 
-            startGate.SetResult(true);
+        //    startGate.SetResult(true);
 
-            bool allConnected = connectionEvents.Wait(TimeSpan.FromSeconds(15));
+        //    bool allConnected = connectionEvents.Wait(TimeSpan.FromSeconds(15));
 
-            Assert.That(allConnected, Is.True, $"Only {CLIENT_COUNT - connectionEvents.CurrentCount}/{CLIENT_COUNT} clients connected in time.");
+        //    Assert.That(allConnected, Is.True, $"Only {CLIENT_COUNT - connectionEvents.CurrentCount}/{CLIENT_COUNT} clients connected in time.");
 
-            Thread.Sleep(500);
+        //    Thread.Sleep(500);
 
-            var idList = connectedIds.ToList();
-            var uniqueIds = idList.Distinct().ToList();
+        //    var idList = connectedIds.ToList();
+        //    var uniqueIds = idList.Distinct().ToList();
 
-            Assert.That(idList.Count, Is.EqualTo(uniqueIds.Count),
-                $"RACE CONDITION DETECTED: {idList.Count - uniqueIds.Count} duplicate ID(s) assigned. " +
-                $"IDs: [{string.Join(", ", idList.OrderBy(x => x))}]");
+        //    Assert.That(idList.Count, Is.EqualTo(uniqueIds.Count),
+        //        $"RACE CONDITION DETECTED: {idList.Count - uniqueIds.Count} duplicate ID(s) assigned. " +
+        //        $"IDs: [{string.Join(", ", idList.OrderBy(x => x))}]");
 
-            foreach (var clientId in idList)
-            {
-                Assert.That(_serverConfig.ClientIdResolver.IsConnectionActive(clientId), Is.True,
-                    $"Client {clientId} connected but not registered in resolver.");
-            }
+        //    foreach (var clientId in idList)
+        //    {
+        //        Assert.That(_serverConfig.ClientIdResolver.IsConnectionActive(clientId), Is.True,
+        //            $"Client {clientId} connected but not registered in resolver.");
+        //    }
 
-            LiminalLogger.Log($"[Test19] Successfully tested {CLIENT_COUNT} concurrent connections - all IDs unique.");
-        }
+        //    LiminalLogger.Log($"[Test19] Successfully tested {CLIENT_COUNT} concurrent connections - all IDs unique.");
+        //}
 
         [Test]
         public void Test20_RapidConnectDisconnect_NoResourceLeaks()

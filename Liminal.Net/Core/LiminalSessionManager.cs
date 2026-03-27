@@ -1,26 +1,23 @@
-﻿using System.Collections.Concurrent;
+﻿using Liminal.Net.Interfaces;
 using System.Buffers;
-using Liminal.Net.Interfaces;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 
 namespace Liminal.Net.Core
 {
     public class LiminalSessionManager : IDisposable
     {
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
-
         private readonly ConcurrentQueue<(ushort SenderId, InboundPacket Packet)> _loopbackQueue = new();
-
         private readonly ILiminalTransport _transport;
         private readonly LiminalTransportConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
         private volatile bool _sessionManagerDisposed;
 
-        // Dependency Injection for your Interpreter so we can dispatch packets
         private readonly LiminalPacketInterpreter _interpreter;
 
-        public LiminalSessionManager(ILiminalTransport transport,LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
+        public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
         {
             _transport = transport;
             _config = config;
@@ -30,16 +27,11 @@ namespace Liminal.Net.Core
 
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
-
             _transport.OnClientConnected += HandleClientConnected;
             _transport.OnClientDisconnected += HandleClientDisconnected;
-
             _transport.OnLocalClientConnected += HandleLocalConnection;
-
             _transport.OnClientKicked += HandleClientDisconnected;
-
             _interpreter.OnSendRequest += BufferPacket;
-
             _transport.OnShutdown += Dispose;
         }
 
@@ -73,13 +65,10 @@ namespace Liminal.Net.Core
                         byte[] rentedBuffer = _privatePool.Rent(payloadLen);
                         processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
 
-                        var packet = LiminalPacketPool.Rent(rentedBuffer, payloadLen, packetId);
-
-                        session.InboundQueue.Enqueue(packet);
+                        session.InboundQueue.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen));
 
                         offset += 4 + totalLen;
                     }
-
                 }
             }
             catch (Exception e)
@@ -104,7 +93,7 @@ namespace Liminal.Net.Core
                     byte[] rentedBuffer = _privatePool.Rent(payload.Length);
                     payload.CopyTo(rentedBuffer);
 
-                    var packet = LiminalPacketPool.Rent(rentedBuffer, payload.Length, packetId);
+                    var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
 
                     _loopbackQueue.Enqueue((targetId, packet));
                     return;
@@ -118,14 +107,12 @@ namespace Liminal.Net.Core
 
             lock (session.SendLock)
             {
-                // Check Overflow
-
                 if (session.IsDisposed()) return;
 
                 if (session.RawSendCursor + frameSize > session.RawSendBuffer.Memory.Length)
                 {
                     LiminalLogger.LogError($"[Manager] Packet dropped for {targetId}. Send Buffer Full.");
-                    return;    
+                    return;
                 }
 
                 // [Len][ID][Payload]
@@ -182,32 +169,28 @@ namespace Liminal.Net.Core
 
                 try
                 {
-                    _interpreter.Dispatch(packet.PacketId, senderId, packet.Buffer);
+                    _interpreter.Dispatch(packet.PacketId, senderId, packet.AsMemory());
                 }
                 finally
                 {
-                    _privatePool.Return(packet.Buffer);
-                    LiminalPacketPool.Return(packet);
+                    _privatePool.Return(packet.BackingBuffer);
                 }
             }
 
             foreach (var session in _sessions.Values)
             {
-                if (session.IsDisposed()) return;
-
+                if (session.IsDisposed()) continue;
                 if (session.InboundQueue.IsEmpty) continue;
 
                 while (session.InboundQueue.TryDequeue(out var packet))
                 {
                     try
                     {
-                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.Buffer);
+                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
                     }
                     finally
                     {
-                        _privatePool.Return(packet.Buffer);
-
-                        LiminalPacketPool.Return(packet);
+                        _privatePool.Return(packet.BackingBuffer);
                     }
                 }
             }
@@ -220,7 +203,6 @@ namespace Liminal.Net.Core
         {
             if (!_sessionManagerDisposed)
             {
-                // Create the session for the Server (ID 0)
                 _sessions.TryAdd(ILiminalTransport.SERVER_ID, new LiminalSession(ILiminalTransport.SERVER_ID, _config.MaxPacketSizePerBatch));
                 LiminalLogger.Log($"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
             }
@@ -252,8 +234,13 @@ namespace Liminal.Net.Core
 
             while (_loopbackQueue.TryDequeue(out var loopbackItem))
             {
-                _privatePool.Return(loopbackItem.Packet.Buffer);
-                LiminalPacketPool.Return(loopbackItem.Packet);
+                _privatePool.Return(loopbackItem.Packet.BackingBuffer);
+            }
+
+            foreach (var session in _sessions.Values)
+            {
+                while (session.InboundQueue.TryDequeue(out var packet))
+                    _privatePool.Return(packet.BackingBuffer);
             }
 
             foreach (var s in _sessions.Values) s.Dispose();

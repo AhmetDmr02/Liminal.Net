@@ -6,26 +6,21 @@ namespace Liminal.Net.Core
     public class LiminalPacketInterpreter
     {
         private readonly ConcurrentBag<LiminalNativeBufferWriter> _writerPool = new();
-
         private readonly ConcurrentDictionary<ushort, PacketEvent> _handlers = new();
-
         private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
-
         private readonly LiminalTransportConfig _config;
 
         private class PacketEvent
         {
-            public Action<byte[], ushort> Handler;
-
-            // A tiny lock just for modifying this specific packets subscription list
+            public Action<ReadOnlyMemory<byte>, ushort> Handler;
             private readonly object _lock = new();
 
-            public void Add(Action<byte[], ushort> action)
+            public void Add(Action<ReadOnlyMemory<byte>, ushort> action)
             {
                 lock (_lock) { Handler += action; }
             }
 
-            public void Remove(Action<byte[], ushort> action)
+            public void Remove(Action<ReadOnlyMemory<byte>, ushort> action)
             {
                 lock (_lock) { Handler -= action; }
             }
@@ -34,7 +29,7 @@ namespace Liminal.Net.Core
         private struct Subscription
         {
             public ushort PacketId;
-            public Action<byte[], ushort> Wrapper;
+            public Action<ReadOnlyMemory<byte>, ushort> Wrapper;
         }
 
         private class SubscriptionList
@@ -64,9 +59,9 @@ namespace Liminal.Net.Core
                 }
             }
 
-            public List<Action<byte[], ushort>> RemoveAndGetWrappers(ushort packetId)
+            public List<Action<ReadOnlyMemory<byte>, ushort>> RemoveAndGetWrappers(ushort packetId)
             {
-                var removedWrappers = new List<Action<byte[], ushort>>();
+                var removedWrappers = new List<Action<ReadOnlyMemory<byte>, ushort>>();
                 lock (_lock)
                 {
                     if (IsDisposed) return removedWrappers;
@@ -110,7 +105,7 @@ namespace Liminal.Net.Core
 
             ushort packetId = (ushort)idInt;
 
-            Action<byte[], ushort> wrapper = (byte[] rawData, ushort sender) =>
+            Action<ReadOnlyMemory<byte>, ushort> wrapper = (ReadOnlyMemory<byte> rawData, ushort sender) =>
             {
                 T packet = DeserializeSafe<T>(rawData, out bool success);
                 if (success) callback(packet, sender);
@@ -179,7 +174,7 @@ namespace Liminal.Net.Core
             _subscribers.Clear();
         }
 
-        private void RemoveFromHandlers(ushort packetId, Action<byte[], ushort> wrapper)
+        private void RemoveFromHandlers(ushort packetId, Action<ReadOnlyMemory<byte>, ushort> wrapper)
         {
             if (_handlers.TryGetValue(packetId, out var packetEvent))
             {
@@ -201,7 +196,6 @@ namespace Liminal.Net.Core
                 MessagePackSerializer.Serialize(writer, packet);
                 OnSendRequest?.Invoke(targetSessionId, (ushort)idInt, writer.WrittenSpan);
             }
-            // MessagePackSerializer wraps the OutOfMemoryException
             catch (MessagePackSerializationException ex)
             {
                 LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send! {ex.InnerException?.Message}");
@@ -212,7 +206,7 @@ namespace Liminal.Net.Core
             }
         }
 
-        public void Dispatch(ushort packetId, ushort sender, byte[] rawData)
+        public void Dispatch(ushort packetId, ushort sender, ReadOnlyMemory<byte> rawData)
         {
             if (_handlers.TryGetValue(packetId, out var packetEvent))
             {
@@ -235,13 +229,11 @@ namespace Liminal.Net.Core
             LiminalLogger.LogWarning($"[Interpreter] Unhandled Packet ID {packetId}");
         }
 
-        private T DeserializeSafe<T>(byte[] data, out bool success)
+        private T DeserializeSafe<T>(ReadOnlyMemory<byte> data, out bool success)
         {
             try
             {
-                var options = MessagePackSerializerOptions.Standard
-                    .WithSecurity(MessagePackSecurity.UntrustedData);
-
+                var options = MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
                 success = true;
                 return MessagePackSerializer.Deserialize<T>(data, options);
             }

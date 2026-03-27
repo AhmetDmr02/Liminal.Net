@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
 
 namespace Liminal.Net.Core
 {
@@ -62,24 +63,20 @@ namespace Liminal.Net.Core
             }
         }
     }
+}
 
-    public struct InboundPacket
+public readonly struct InboundPacket
+{
+    public readonly ushort PacketId;
+    public readonly byte[] BackingBuffer;
+    public readonly int Length;
+
+    public InboundPacket(ushort packetId, byte[] backingBuffer, int length)
     {
-        public byte[] Buffer;
-        public int Length;
-        public ushort PacketId;
-
-        public void Init(byte[] buffer, int length, ushort packetId)
-        {
-            Buffer = buffer;
-            Length = length;
-            PacketId = packetId;
-        }
-        public void Reset()
-        {
-            Buffer = null;
-            Length = 0;
-            PacketId = 0;
-        }
+        PacketId = packetId;
+        BackingBuffer = backingBuffer;
+        Length = length;
     }
+
+    public ReadOnlyMemory<byte> AsMemory() => new ReadOnlyMemory<byte>(BackingBuffer, 0, Length);
 }
