@@ -5,6 +5,7 @@ using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -13,10 +14,14 @@ using System.Threading.Tasks;
 
 namespace Liminal.Net.Transports
 {
+    //Example empty framing context
+    public readonly struct EmptyFramingContext { }
+    public class TcpTransport : TcpTransport<EmptyFramingContext> { }
+
     /// <summary>
     /// It uses tcp by default
     /// </summary>
-    public class TcpTransport : ILiminalTransport
+    public class TcpTransport<TContext> : ILiminalTransport where TContext : struct
     {
         protected volatile ushort _localClientId = 0;
         public ushort LocalClientId => _localClientId;
@@ -120,12 +125,24 @@ namespace Liminal.Net.Transports
         public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
         public int ConnectedClientCount => _sockets.Count;
 
+        /// <summary>
+        /// Lifecycle state for outbound frames. Mutate this directly on the transport if context needs changing.
+        /// </summary>
+        public TContext OutboundContext { get; set; }
+
+        protected ILiminalTransportFramingProvider<TContext> _framing;
+        private int _totalHeaderSize;
+
+        #region Initialization
         public virtual void InitializeTransport(LiminalTransportConfig config)
         {
             _config = config;
 
-            _clientIdResolver = _config.ClientIdResolver;
+            _framing = config.TransportFramingProvider as ILiminalTransportFramingProvider<TContext>;
 
+            _totalHeaderSize = LiminalTransportHeader.GetHeaderSize(_framing);
+
+            _clientIdResolver = _config.ClientIdResolver;
             _clientIdResolver?.Initialize(this);
         }
 
@@ -159,7 +176,9 @@ namespace Liminal.Net.Transports
                 LiminalLogger.LogError($"[Transport] Client connection failed: {ex.Message}");
             }
         }
+        #endregion
 
+        #region Shutdown & Disconnect & Kick
         public virtual void Disconnect()
         {
             if (_isServer)
@@ -206,55 +225,6 @@ namespace Liminal.Net.Transports
                 LiminalLogger.LogError($"[Transport] Couldn't find socket for client {clientId}");
             }
         }
-
-        private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
-        public virtual void SendReliable(Span<byte> data, ushort targetId)
-        {
-            int payloadSize = data.Length;
-
-            var rentedBuffer = _sendBytePool.Rent(data.Length + 6);
-            try
-            {
-                if (_sockets.TryGetValue(targetId, out var socket))
-                {
-                    Span<byte> fullPacket = rentedBuffer.AsSpan(0, payloadSize + 6);
-
-                    fullPacket[0] = 1; //Reliable indicator
-                    fullPacket[1] = 0; // Length/Metadata bit
-
-                    BinaryPrimitives.WriteInt32LittleEndian(fullPacket.Slice(2, 4), payloadSize);
-                    data.CopyTo(fullPacket.Slice(6));
-
-                    socket.GetStream().Write(fullPacket);
-                }
-                else
-                {
-                    LiminalLogger.LogError($"[Transport] Couldn't find socket for client {targetId}");
-
-                    if (IsServer)
-                        Kick(targetId);
-                    else
-                        Shutdown();
-                }
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Transport] Send error: {ex.Message}");
-            }
-            finally
-            {
-                _sendBytePool.Return(rentedBuffer);
-            }
-        }
-
-        /// <summary>
-        /// TCP is a reliable transport it will default to SendReliable
-        /// </summary>
-        public virtual void SendUnreliable(Span<byte> data, ushort clientId)
-        {
-            SendReliable(data, clientId);
-        }
-
         public virtual void Shutdown()
         {
             if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
@@ -298,6 +268,102 @@ namespace Liminal.Net.Transports
                 Interlocked.Exchange(ref _isShuttingDown, 0);
             }
         }
+        #endregion
+
+        #region Sending
+        private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
+        public virtual void SendReliable(Span<byte> data, ushort targetId)
+        {
+            SendInternal(data, targetId, TransportFlags.Reliable);
+        }
+
+        /// <summary>
+        /// TCP is a reliable transport it will default to SendReliable
+        /// </summary>
+        public virtual void SendUnreliable(Span<byte> data, ushort targetId)
+        {
+            SendInternal(data, targetId, TransportFlags.Unreliable);
+        }
+
+        protected virtual void SendInternal(Span<byte> data, ushort targetId, TransportFlags flags)
+        {
+            int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
+            int totalSize = headerSize + data.Length;
+
+            TContext contextSnapshot = OutboundContext;
+
+            var rentedBuffer = _sendBytePool.Rent(totalSize);
+            try
+            {
+                if (_sockets.TryGetValue(targetId, out var socket))
+                {
+                    Span<byte> fullPacket = rentedBuffer.AsSpan(0, totalSize);
+
+                    LiminalTransportHeader.WriteHeader(fullPacket, flags, data.Length, in contextSnapshot, _framing);
+
+                    data.CopyTo(fullPacket.Slice(headerSize));
+
+                    try
+                    {
+                        socket.GetStream().Write(fullPacket);
+                    }
+                    catch (Exception ex) when (ex is ObjectDisposedException || ex is InvalidOperationException || ex is IOException || ex is SocketException)
+                    {
+                        LiminalLogger.LogWarning($"[Transport] Failed to write to {targetId}, socket closed concurrently.");
+
+                        if (IsServer) Kick(targetId);
+                        else Shutdown();
+                    }
+                }
+                else
+                {
+                    LiminalLogger.LogError($"[Transport] Couldn't find socket for client {targetId}");
+                    if (IsServer) Kick(targetId);
+                    else Shutdown();
+                }
+            }
+            finally
+            {
+                _sendBytePool.Return(rentedBuffer);
+            }
+        }
+
+        protected async Task TryToConnectAsync(TcpClient client, (string ip, int port) connectionInfo)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
+
+                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, cts.Token);
+
+                _onHandshakeInitialized?.Invoke();
+
+                // Run the orchestrator
+                _localClientId = await ClientHandshaker(client, _config);
+
+                if (_localClientId != 0)
+                {
+                    _isConnected = true;
+
+                    PromoteLocalClient(_localClientId, client);
+                }
+                else
+                {
+                    client.Close();
+                    _onLocalClientDisconnected?.Invoke(0);
+
+                    Shutdown();
+                }
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
+                Shutdown();
+            }
+        }
+        #endregion
+
+        #region Receiving
         protected async Task AcceptConnectionsAsync(TcpListener listener)
         {
             while (IsConnected && _isServer && listener == _listener)
@@ -348,39 +414,6 @@ namespace Liminal.Net.Transports
                 }
             }
         }
-        protected async Task TryToConnectAsync(TcpClient client, (string ip, int port) connectionInfo)
-        {
-            try
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
-
-                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, cts.Token);
-
-                _onHandshakeInitialized?.Invoke();
-
-                // Run the orchestrator
-                _localClientId = await ClientHandshaker(client, _config);
-
-                if (_localClientId != 0)
-                {
-                    _isConnected = true;
-
-                    PromoteLocalClient(_localClientId, client);
-                }
-                else
-                {
-                    client.Close();
-                    _onLocalClientDisconnected?.Invoke(0);
-
-                    Shutdown();
-                }
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
-                Shutdown();
-            }
-        }
         private void PromoteClient(ushort clientId, TcpClient client)
         {
             _sockets.AddOrUpdate(clientId, client, (key, old) =>
@@ -397,7 +430,6 @@ namespace Liminal.Net.Transports
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
-
         private void PromoteLocalClient(ushort assignedId, TcpClient client)
         {
             _sockets[ILiminalTransport.SERVER_ID] = client;
@@ -445,29 +477,57 @@ namespace Liminal.Net.Transports
 
                     Span<byte> bufferSpan = ingestBuffer.GetSpan();
                     int offset = 0;
+                    int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
 
-                    while (bytesInBuffer - offset >= 6)
+                    while (bytesInBuffer - offset >= LiminalTransportHeader.BaseHeaderSize)
                     {
-                        int payloadSize = BinaryPrimitives.ReadInt32LittleEndian(bufferSpan.Slice(offset + 2, 4));
+                        var currentSlice = bufferSpan.Slice(offset, bytesInBuffer - offset);
 
-                        if (payloadSize < 0 || payloadSize > _config.MaxPacketSizePerBatch - 6)
+                        var result = LiminalTransportHeader.TryReadHeader(currentSlice, _framing, out var flags, out int payloadLength, out TContext framingContext);
+
+                        if (result == HeaderReadResult.Incomplete)
                         {
-                            LiminalLogger.LogError($"[Transport] Invalid payload size {payloadSize}b on client {incomingId}");
+                            //Not enough bytes yet
+                            break;
+                        }
+
+                        if (result == HeaderReadResult.Malformed)
+                        {
+                            LiminalLogger.LogError($"[Transport] Malformed frame header received from {incomingId}. Kicking connection.");
                             Kick(incomingId);
                             return;
                         }
 
-                        int totalPacketSize = 6 + payloadSize;
-
-                        if (bytesInBuffer - offset < totalPacketSize)
+                        if (payloadLength < 0 || payloadLength > _config.MaxPacketSizePerBatch)
                         {
-                            // Incomplete packet, wait for more data
-                            break; 
+                            LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
+                            Kick(incomingId);
+                            return;
                         }
 
-                        _onReliable?.Invoke(bufferSpan.Slice(offset + 6, payloadSize), incomingId);
+                        int totalFrameSize = headerSize + payloadLength;
+                        if (bytesInBuffer - offset < totalFrameSize)
+                        {
+                            //waiting on the remaining payload bytes
+                            break;
+                        }
 
-                        offset += totalPacketSize;
+                        var payloadSpan = bufferSpan.Slice(offset + headerSize, payloadLength);
+
+                        if ((flags & TransportFlags.Fragmented) != 0)
+                        {
+                            // Route to Fragmentor
+                        }
+                        else if ((flags & TransportFlags.Reliable) != 0)
+                        {
+                            _onReliable?.Invoke(payloadSpan, incomingId);
+                        }
+                        else
+                        {
+                            _onUnreliable?.Invoke(payloadSpan, incomingId);
+                        }
+
+                        offset += totalFrameSize;
                     }
 
                     if (offset > 0)
@@ -497,24 +557,31 @@ namespace Liminal.Net.Transports
             {
                 if (_isShuttingDown == 0)
                 {
-                    if (_sockets.TryRemove(incomingId, out var clientSocket))
+                    bool removed = false;
+                    if (_sockets.TryGetValue(incomingId, out var currentSocket) && currentSocket == client)
                     {
-                        try { clientSocket.Close(); } catch { LiminalLogger.LogWarning($"[Transport] Failed to close socket for client {incomingId}."); }
+                        removed = _sockets.TryRemove(incomingId, out _);
+                    }
 
-                        if (incomingId != ILiminalTransport.SERVER_ID)
+                    try { client.Close(); } catch { LiminalLogger.LogWarning($"[Transport] Failed to close socket for client {incomingId}."); }
+
+                    if (incomingId != ILiminalTransport.SERVER_ID)
+                    {
+                        if (removed)
                         {
                             _onClientDisconnected?.Invoke(incomingId);
                             LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
                         }
-                        else if (!_isServer)
-                        {
-                            LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
-                            _onLocalClientDisconnected?.Invoke(_localClientId);
-                            Shutdown();
-                        }
+                    }
+                    else if (!_isServer)
+                    {
+                        LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
+                        _onLocalClientDisconnected?.Invoke(_localClientId);
+                        Shutdown();
                     }
                 }
             }
         }
+        #endregion
     }
 }

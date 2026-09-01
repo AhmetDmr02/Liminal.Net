@@ -3,6 +3,7 @@ using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 
 namespace Liminal.Net.Core
 {
@@ -128,7 +129,20 @@ namespace Liminal.Net.Core
 
         public void Flush()
         {
-            foreach (var session in _sessions.Values) FlushSession(session);
+            foreach (var session in _sessions.Values)
+            {
+                try
+                {
+                    FlushSession(session);
+                }
+                catch
+                {
+                    LiminalLogger.LogError($"[SessionManager] Error flushing session {session.Id}");
+                    _transport.Kick(session.Id);
+
+                    continue;
+                }
+            }
         }
 
         private void FlushSession(LiminalSession session)
@@ -188,6 +202,11 @@ namespace Liminal.Net.Core
                     try
                     {
                         _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                        continue;
                     }
                     finally
                     {

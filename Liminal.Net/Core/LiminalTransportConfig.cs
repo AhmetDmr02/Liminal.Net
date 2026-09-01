@@ -55,6 +55,8 @@ namespace Liminal.Net.Core
 
         public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();
 
+        public ILiminalTransportFramingProvider TransportFramingProvider { get; set; } = new DefaultTransportFramingProvider();
+
         public ILiminalClientIdResolver ClientIdResolver;
     }
 }
