@@ -15,7 +15,13 @@ namespace Liminal.Net.Interfaces
         public ushort LocalClientId { get; }
 
         const ushort SERVER_ID = 0;
+
         public bool IsConnected { get; }
+
+        #region Connection State
+        public bool IsClientConnected(ushort clientId);
+        public int ConnectedClientCount { get; }
+        #endregion
 
         #region Initialization
         public void InitializeTransport(LiminalTransportConfig config);

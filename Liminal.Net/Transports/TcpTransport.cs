@@ -117,11 +117,16 @@ namespace Liminal.Net.Transports
 
         private int _isShuttingDown = 0;
 
+        public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
+        public int ConnectedClientCount => _sockets.Count;
+
         public virtual void InitializeTransport(LiminalTransportConfig config)
         {
             _config = config;
 
             _clientIdResolver = _config.ClientIdResolver;
+
+            _clientIdResolver?.Initialize(this);
         }
 
         public virtual void StartServer(string ip, int port)
@@ -191,8 +196,6 @@ namespace Liminal.Net.Transports
                     clientSocket.Close();
                 }
                 catch { }
-
-                _clientIdResolver.UnregisterId(clientId);
 
                 _onClientKicked?.Invoke(clientId);
 
@@ -275,8 +278,6 @@ namespace Liminal.Net.Transports
                         }
                         catch { }
 
-                        _clientIdResolver.UnregisterId(id);
-
                         LiminalLogger.Log($"[Transport] Client {id} cleared.");
                     }
                 }
@@ -309,10 +310,20 @@ namespace Liminal.Net.Transports
                     _ = Task.Run(async () =>
                     {
                         _onHandshakeInitialized?.Invoke();
-                        ushort finalId = await ServerHandshaker(client, _config);
+                        ushort finalId = 0;
+                        try
+                        {
+                            finalId = await ServerHandshaker(client, _config);
 
-                        if (finalId != 0) PromoteClient(finalId, client);
-                        else client.Close();
+                            if (finalId != 0) PromoteClient(finalId, client);
+                            else client.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError($"[Transport] Handshake error: {ex.Message}");
+
+                            client.Close();
+                        }
                     });
                 }
                 catch (ObjectDisposedException)
@@ -372,26 +383,14 @@ namespace Liminal.Net.Transports
         }
         private void PromoteClient(ushort clientId, TcpClient client)
         {
-            var endpoint = (IPEndPoint)client.Client.RemoteEndPoint;
-            if (endpoint == null)
-            {
-                LiminalLogger.LogWarning($"[Transport] Client {clientId} has no remote endpoint.");
-                client.Close();
-                return;
-            }
-            if (!_clientIdResolver.RegisterId(clientId, new ConnectionPair(clientId, endpoint)))
-            {
-                LiminalLogger.LogWarning($"[Transport] Client {clientId} registration failed. Dropping connection.");
-                client.Close();
-                return;
-            }
-
-            var oldClient = _sockets.AddOrUpdate(clientId, client, (key, old) =>
+            _sockets.AddOrUpdate(clientId, client, (key, old) =>
             {
                 LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
                 try { old.Close(); } catch { }
                 return client;
             });
+
+            _clientIdResolver.ConfirmRegistration(clientId);
 
             _onClientConnected?.Invoke(clientId);
             _ = Task.Run(async () => ReceiveLoop(clientId, client));
@@ -401,11 +400,7 @@ namespace Liminal.Net.Transports
 
         private void PromoteLocalClient(ushort assignedId, TcpClient client)
         {
-            var endpoint = (IPEndPoint)client.Client.RemoteEndPoint;
-
             _sockets[ILiminalTransport.SERVER_ID] = client;
-
-            _clientIdResolver.RegisterId(ILiminalTransport.SERVER_ID, new ConnectionPair(ILiminalTransport.SERVER_ID, endpoint));
 
             _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client));
 
@@ -505,8 +500,6 @@ namespace Liminal.Net.Transports
                     if (_sockets.TryRemove(incomingId, out var clientSocket))
                     {
                         try { clientSocket.Close(); } catch { LiminalLogger.LogWarning($"[Transport] Failed to close socket for client {incomingId}."); }
-
-                        _clientIdResolver.UnregisterId(incomingId);
 
                         if (incomingId != ILiminalTransport.SERVER_ID)
                         {

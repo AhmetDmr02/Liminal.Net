@@ -590,17 +590,10 @@ namespace Liminal.Net.Tests
 
             Thread.Sleep(500);
 
-            int activeCount = 0;
-            for (ushort id = 1; id < 100; id++)
-            {
-                if (_serverConfig.ClientIdResolver.IsConnectionActive(id))
-                {
-                    activeCount++;
-                }
-            }
+            int activeCount = _serverManager.Transport.ConnectedClientCount;
 
-            Assert.That(activeCount, Is.LessThanOrEqualTo(2),
-                $"Resolver leak detected: {activeCount} clients still registered after disconnect.");
+            Assert.That(activeCount, Is.EqualTo(0),
+                $"Socket leak detected: {activeCount} clients still connected in transport after disconnect.");
 
             LiminalLogger.Log($"[Test20] Successfully completed {ITERATIONS} rapid connect/disconnect cycles.");
         }
@@ -655,17 +648,12 @@ namespace Liminal.Net.Tests
             startGate.Set();
             Thread.Sleep(2000);
 
-            int registeredCount = maliciousResolver.GetRegisteredCount();
-            var connectedList = connectedIds.ToList();
+            int confirmedCount = maliciousResolver.ConfirmedCount;
+            int activeSocketsInTransport = testServer.Transport.ConnectedClientCount;
 
-            Assert.That(registeredCount, Is.LessThanOrEqualTo(1),
-                $"RACE CONDITION: {registeredCount} clients registered with the same ID 42. " +
-                $"Expected: 1, Connected events fired: {connectedList.Count}");
-
-            if (connectedList.Count > 0)
-            {
-                Assert.That(connectedList.All(id => id == 42), Is.True);
-            }
+            // Transport replaces colliding IDs cleanly (AddOrUpdate), so exactly 1 remains in memory
+            Assert.That(activeSocketsInTransport, Is.EqualTo(1),
+                $"Expected 1 active socket in transport for ID 42, but found {activeSocketsInTransport}.");
 
             testServer.Shutdown();
             lock (clients)
@@ -676,7 +664,7 @@ namespace Liminal.Net.Tests
                 }
             }
 
-            LiminalLogger.Log($"[Test21] Collision test complete. Resolver gave 5x ID 42, but only {registeredCount} registered.");
+            LiminalLogger.Log($"[Test21] Collision test complete. Resolver handed out ID 42 5x, transport retained exactly {activeSocketsInTransport} socket.");
         }
 
         private class ForceCollisionResolver : ILiminalClientIdResolver
@@ -684,7 +672,9 @@ namespace Liminal.Net.Tests
             private readonly ushort _targetId;
             private readonly int _duplicateCount;
             private int _callCount = 0;
-            private readonly ConcurrentDictionary<ushort, ConnectionPair> _registered = new();
+            private int _confirmedCount = 0;
+
+            public int ConfirmedCount => Volatile.Read(ref _confirmedCount);
 
             public ForceCollisionResolver(ushort targetId, int duplicateCount)
             {
@@ -692,48 +682,28 @@ namespace Liminal.Net.Tests
                 _duplicateCount = duplicateCount;
             }
 
+            public void Initialize(ILiminalTransport transport) { }
+
             public ushort GenerateClientId()
             {
                 int count = Interlocked.Increment(ref _callCount);
                 return count <= _duplicateCount ? _targetId : (ushort)0;
             }
 
-            public bool IsConnectionActive(ushort clientId)
+            public void ConfirmRegistration(ushort targetId)
             {
-                return _registered.ContainsKey(clientId);
+                Interlocked.Increment(ref _confirmedCount);
             }
 
-            public bool RegisterId(ushort clientId, ConnectionPair connectionPair)
-            {
-                return _registered.TryAdd(clientId, connectionPair);
-            }
-
-            public bool UnregisterId(ushort clientId)
-            {
-                return _registered.TryRemove(clientId, out _);
-            }
+            public ushort ResolveId(Span<byte> payload) => 0;
 
             public void ResetResolver()
             {
-                _registered.Clear();
-                _callCount = 0;
-            }
-
-            public ushort ResolveId(Span<byte> payload)
-            {
-                return 0;
-            }
-
-            public bool TryGetConnectionPair(ushort clientId, out ConnectionPair connectionPair)
-            {
-                return _registered.TryGetValue(clientId, out connectionPair);
-            }
-
-            public int GetRegisteredCount()
-            {
-                return _registered.ContainsKey(_targetId) ? 1 : 0;
+                Interlocked.Exchange(ref _callCount, 0);
+                Interlocked.Exchange(ref _confirmedCount, 0);
             }
         }
+
         [Test]
         public void Test22_Chaos_Teardown_Under_Heavy_Load()
         {
