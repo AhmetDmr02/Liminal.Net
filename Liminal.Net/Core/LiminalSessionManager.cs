@@ -19,6 +19,8 @@ namespace Liminal.Net.Core
 
         private readonly LiminalPacketInterpreter _interpreter;
 
+        private const bool DisconnectClientOnInboundOverflow = true;
+
         public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
         {
             _transport = transport;
@@ -61,7 +63,16 @@ namespace Liminal.Net.Core
                         if (session.InboundQueue.Count >= _config.MaxPacketCount)
                         {
                             LiminalLogger.LogWarning($"[Security] Client {ownerId} exceeded InboundQueue capacity. Dropping connection.");
-                            _transport.Kick(ownerId);
+
+                            if (_transport.IsServer)
+                            {
+                                _transport.Kick(ownerId);
+                            }
+                            else
+                            {
+                               if (DisconnectClientOnInboundOverflow) 
+                                    _transport.Disconnect();
+                            }
                             return;
                         }
 
@@ -83,7 +94,15 @@ namespace Liminal.Net.Core
             catch (Exception e)
             {
                 LiminalLogger.LogError($"[SessionManager] Error processing inbound packet: {e}");
-                _transport.Kick(ownerId);
+
+                if (_transport.IsServer)
+                {
+                    _transport.Kick(ownerId);
+                }
+                else
+                {
+                    _transport.Disconnect();
+                }
             }
         }
 
@@ -99,6 +118,12 @@ namespace Liminal.Net.Core
             {
                 if (targetId == _transport.LocalClientId)
                 {
+                    if (_loopbackQueue.Count >= _config.MaxPacketCount)
+                    {
+                        LiminalLogger.LogError($"[SessionManager] Loopback queue overflow for local client. Dropping self-packet.");
+                        return;
+                    }
+
                     byte[] rentedBuffer = _privatePool.Rent(payload.Length);
                     payload.CopyTo(rentedBuffer);
 
@@ -120,7 +145,22 @@ namespace Liminal.Net.Core
 
                 if (session.RawSendCursor + frameSize > session.RawSendBuffer.Memory.Length)
                 {
-                    LiminalLogger.LogError($"[Manager] Packet dropped for {targetId}. Send Buffer Full.");
+                    LiminalLogger.LogError(
+                        $"[Manager] FATAL: Outbound send buffer exceeded for Session {targetId} " +
+                        $"({session.RawSendCursor + frameSize}b > {session.RawSendBuffer.Memory.Length}b). " +
+                        $"Kicking client to prevent state desync. Increase MaxPacketSizePerBatch or throttle outgoing packets.");
+
+                    session.RawSendCursor = 0;
+
+                    if (_transport.IsServer)
+                    {
+                        _transport.Kick(targetId);
+                    }
+                    else
+                    {
+                        _transport.Disconnect();
+                    }
+
                     return;
                 }
 

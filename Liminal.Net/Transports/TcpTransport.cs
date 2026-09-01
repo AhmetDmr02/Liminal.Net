@@ -200,24 +200,25 @@ namespace Liminal.Net.Transports
         {
             if (!_isServer) return;
 
-            if (clientId == LocalClientId)
+            // Dedicated server self target check
+            if (clientId == ILiminalTransport.SERVER_ID)
             {
-                // This is the server, we don't want to close the socket while we're still connected
-                LiminalLogger.LogWarning($"[Transport] Can't kick the server.");
+                LiminalLogger.LogError("[Transport] Attempted to kick Server ID (0). Internal server error.");
+                return;
+            }
+
+            // Host client self target check
+            if (clientId == LocalClientId && LocalClientId != ILiminalTransport.SERVER_ID)
+            {
+                LiminalLogger.LogWarning($"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
+                Shutdown();
                 return;
             }
 
             if (_sockets.TryRemove(clientId, out var clientSocket))
             {
-                // Close the socket (This will throw exception in ReceiveLoop)
-                try
-                {
-                    clientSocket.Close();
-                }
-                catch { }
-
+                try { clientSocket.Close(); } catch { }
                 _onClientKicked?.Invoke(clientId);
-
                 LiminalLogger.Log($"[Transport] Kicked client {clientId}.");
             }
             else

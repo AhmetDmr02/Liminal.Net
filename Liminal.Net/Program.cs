@@ -109,6 +109,9 @@ namespace Liminal.Net
                     Interlocked.Exchange(ref _totalSent, 0);
                     Console.WriteLine("Counters reset.");
                     break;
+                case "localid":
+                    Console.WriteLine($"Local ID: {_manager.Transport.LocalClientId}");
+                    break;
             }
         }
 

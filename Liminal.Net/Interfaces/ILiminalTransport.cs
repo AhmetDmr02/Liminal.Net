@@ -14,7 +14,10 @@ namespace Liminal.Net.Interfaces
     {
         public ushort LocalClientId { get; }
 
-        const ushort SERVER_ID = 0;
+        public const ushort SERVER_ID = 0;
+
+        public bool IsServer { get; }
+        public bool IsClient { get; }
 
         public bool IsConnected { get; }
 

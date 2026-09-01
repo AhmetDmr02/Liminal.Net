@@ -106,7 +106,8 @@ namespace Liminal.Net.Core
             _ticker.OnTick += HostTick;
             _ticker.Start();
 
-            LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port}");
+
+            LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
         }
 
         public void StartServer(string ip, int port)
