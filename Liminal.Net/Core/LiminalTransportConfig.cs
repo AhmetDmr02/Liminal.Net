@@ -47,9 +47,9 @@ namespace Liminal.Net.Core
         public ushort Version = 1;
         
         /// <summary>
-        /// The maximum number of packets that will be held in the queue per connection
+        /// The maximum number of packets that will be held in the inbound queue per connection
         /// </summary>
-        public int MaxPacketCount = 10;
+        public int MaxPacketCount = 50;
 
         public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
 

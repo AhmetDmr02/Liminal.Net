@@ -230,8 +230,28 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test10_RapidSpam_DoesNotCorruptBuffer()
         {
+            _serverConfig.MaxPacketCount = 150;
+            _serverConfig.MaxPacketSizePerBatch = 65535;
+
+            var clientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 65535,
+                MaxPacketCount = 150,
+                ClientIdResolver = new BaseResolver(),
+                HandshakeTimeout = 15,
+                ConnectionTimeout = 15
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(client);
+            client.StartClient("127.0.0.1", _currentTestPort);
 
             int receivedCount = 0;
             client.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref receivedCount), this);
@@ -905,6 +925,7 @@ namespace Liminal.Net.Tests
 
             _serverConfig.TransportFramingProvider = serverFramer;
             _serverConfig.MaxPacketSizePerBatch = ushort.MaxValue;
+            _serverConfig.MaxPacketCount = ushort.MaxValue;
             _serverManager = new LiminalNetworkManager(new TcpTransport<SecureFramingContext>(), _serverConfig);
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
@@ -914,6 +935,7 @@ namespace Liminal.Net.Tests
                 Default_Port = _currentTestPort,
                 TickRate = 60,
                 MaxPacketSizePerBatch = ushort.MaxValue,
+                MaxPacketCount = ushort.MaxValue,
                 ClientIdResolver = new BaseResolver(),
                 TransportFramingProvider = clientFramer
             };
@@ -1045,7 +1067,91 @@ namespace Liminal.Net.Tests
                 return true;
             }
         }
+        [Test]
+        public void Test26_InboundQueue_WithinMaxPacketCount_ProcessesSuccessfully()
+        {
+            const int maxPacketCount = 10;
+            const int sentPackets = 5;
 
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = maxPacketCount,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var customServer = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            customServer.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            int serverReceivedCount = 0;
+            customServer.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref serverReceivedCount), this);
+
+            for (int i = 0; i < sentPackets; i++)
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"SafeBatch_{i}" });
+            }
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => serverReceivedCount == sentPackets, 2000), Is.True,
+                $"Server only processed {serverReceivedCount}/{sentPackets} packets within the threshold.");
+            Assert.That(client.Transport.IsConnected, Is.True, "Client was kicked unexpectedly under the packet limit.");
+
+            customServer.Shutdown();
+        }
+
+        [Test]
+        public void Test27_InboundQueue_ExceedingMaxPacketCount_KicksOffendingClient()
+        {
+            const int maxPacketCount = 5;
+            const int overflowPackets = 15;
+
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = maxPacketCount,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var customServer = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            customServer.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            bool serverKickedClient = false;
+            customServer.Transport.OnClientKicked += (id) => serverKickedClient = true;
+
+            // Send more packets in a single batch than the server's InboundQueue MaxPacketCount can tolerate
+            for (int i = 0; i < overflowPackets; i++)
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"Flood_{i}" });
+            }
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => serverKickedClient, 2000), Is.True,
+                "Server failed to kick client after exceeding InboundQueue MaxPacketCount.");
+            Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 2000), Is.True,
+                "Client remained connected after exceeding InboundQueue capacity limit.");
+
+            customServer.Shutdown();
+        }
         #endregion
     }
 }

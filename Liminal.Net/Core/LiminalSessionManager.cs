@@ -58,6 +58,13 @@ namespace Liminal.Net.Core
                     int offset = 0;
                     while (offset + 4 <= processedBatch.Length)
                     {
+                        if (session.InboundQueue.Count >= _config.MaxPacketCount)
+                        {
+                            LiminalLogger.LogWarning($"[Security] Client {ownerId} exceeded InboundQueue capacity. Dropping connection.");
+                            _transport.Kick(ownerId);
+                            return;
+                        }
+
                         int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
                         if (totalLen <= 0 || offset + 4 + totalLen > processedBatch.Length) break;
 
