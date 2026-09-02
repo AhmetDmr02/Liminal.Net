@@ -27,7 +27,9 @@ namespace Liminal.Net.Core
             _config = config;
             _pipeline = pipeline;
             _interpreter = interpreter;
+
             _privatePool = ArrayPool<byte>.Create(config.MaxPacketSizePerBatch, 50);
+            _loopbackQueue = new ConcurrentQueue<(ushort SenderId, InboundPacket Packet)>();
 
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
@@ -70,7 +72,7 @@ namespace Liminal.Net.Core
                             }
                             else
                             {
-                               if (DisconnectClientOnInboundOverflow) 
+                                if (DisconnectClientOnInboundOverflow)
                                     _transport.Disconnect();
                             }
                             return;
@@ -176,6 +178,13 @@ namespace Liminal.Net.Core
 
         public void Flush()
         {
+            if (_sessionManagerDisposed)
+            {
+                RaiseShutdown();
+
+                return;
+            }
+
             foreach (var session in _sessions.Values)
             {
                 try
@@ -221,7 +230,12 @@ namespace Liminal.Net.Core
         #region Polling Logic (Game Thread)
         public void Poll()
         {
-            if (_sessionManagerDisposed) return;
+            if (_sessionManagerDisposed)
+            {
+                RaiseShutdown();
+
+                return;
+            }
 
             //VIRTUAL LOOPBACK Self Sends
             while (!_loopbackQueue.IsEmpty && _loopbackQueue.TryDequeue(out var loopbackItem))
@@ -261,6 +275,8 @@ namespace Liminal.Net.Core
                     }
                 }
             }
+
+            ProcessPendingDisconnects();
         }
 
         #endregion
@@ -280,15 +296,33 @@ namespace Liminal.Net.Core
             if (!_sessionManagerDisposed) _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
         }
 
+        private readonly ConcurrentQueue<ushort> _pendingDisconnects = new();
         private void HandleClientDisconnected(ushort id)
         {
-            if (_sessions.TryRemove(id, out var session)) session.Dispose();
+            _pendingDisconnects.Enqueue(id);
+
         }
 
-        public void Dispose()
+        private void ProcessPendingDisconnects()
         {
-            if (_sessionManagerDisposed) return;
-            _sessionManagerDisposed = true;
+            while (_pendingDisconnects.TryDequeue(out var id))
+            {
+                if (_sessions.TryRemove(id, out var session))
+                {
+                    session.Dispose();
+
+                    while (session.InboundQueue.TryDequeue(out var packet))
+                    {
+                        _privatePool.Return(packet.BackingBuffer);
+                    }
+                }
+            }
+        }
+
+        private void RaiseShutdown()
+        {
+            if (disposed) return;
+            disposed = true;
 
             _transport.OnMessageReceivedReliable -= HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;
@@ -297,7 +331,7 @@ namespace Liminal.Net.Core
             _transport.OnLocalClientConnected -= HandleLocalConnection;
             _transport.OnClientKicked -= HandleClientDisconnected;
             _interpreter.OnSendRequest -= BufferPacket;
-            _transport.OnShutdown -= Dispose;
+            _transport.OnShutdown -= RaiseShutdown;
 
             while (_loopbackQueue.TryDequeue(out var loopbackItem))
             {
@@ -306,12 +340,23 @@ namespace Liminal.Net.Core
 
             foreach (var session in _sessions.Values)
             {
+                session.Dispose();
+
                 while (session.InboundQueue.TryDequeue(out var packet))
+                {
                     _privatePool.Return(packet.BackingBuffer);
+                }
             }
 
-            foreach (var s in _sessions.Values) s.Dispose();
             _sessions.Clear();
+            _pendingDisconnects.Clear();
+        }
+
+        private bool disposed = false;
+        public void Dispose()
+        {
+            if (_sessionManagerDisposed) return;
+            _sessionManagerDisposed = true;
         }
         #endregion
 

@@ -5,6 +5,7 @@ using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -215,10 +216,10 @@ namespace Liminal.Net.Transports
                 return;
             }
 
-            if (_sockets.TryRemove(clientId, out var clientSocket))
+            if (_sockets.TryGetValue(clientId, out var clientSocket))
             {
-                try { clientSocket.Close(); } catch { }
                 _onClientKicked?.Invoke(clientId);
+                try { clientSocket.Close(); } catch { }
                 LiminalLogger.Log($"[Transport] Kicked client {clientId}.");
             }
             else
@@ -267,6 +268,7 @@ namespace Liminal.Net.Transports
             finally
             {
                 Interlocked.Exchange(ref _isShuttingDown, 0);
+                Volatile.Write(ref _totalConnections, 0);
             }
         }
         #endregion
@@ -368,62 +370,90 @@ namespace Liminal.Net.Transports
 
         #region Receiving
 
+        private int _totalConnections = 0;
         protected async Task AcceptConnectionsAsync(TcpListener listener)
         {
             while (IsConnected && _isServer && listener == _listener)
             {
+                TcpClient client = null;
+                bool counted = false;  
+                bool handedOff = false; 
+
                 try
                 {
-                    TcpClient client = await listener.AcceptTcpClientAsync();
+                    client = await listener.AcceptTcpClientAsync();
                     client.NoDelay = true;
 
-                    if (_sockets.Count >= _config.MaxConnectionCount)
+                    int total = Interlocked.Increment(ref _totalConnections);
+                    counted = true;
+
+                    if (total > _config.MaxConnectionCount)
                     {
-                        client.Close();
-                        continue;
+                        LiminalLogger.LogWarning($"[Transport] Max connection count reached ({_config.MaxConnectionCount}). Disconnecting client.");
+                        continue; 
                     }
+
+                    var acceptedClient = client;
 
                     _ = Task.Run(async () =>
                     {
-                        _onHandshakeInitialized?.Invoke();
-                        ushort finalId = 0;
+                        bool promoted = false;
                         try
                         {
-                            finalId = await ServerHandshaker(client, _config);
+                            _onHandshakeInitialized?.Invoke();
+                            ushort finalId = await ServerHandshaker(acceptedClient, _config);
 
-                            if (finalId != 0) PromoteClient(finalId, client);
-                            else client.Close();
+                            if (finalId != 0)
+                            {
+                                PromoteClient(finalId, acceptedClient);
+                                promoted = true;
+                            }
+                            else
+                            {
+                                try { acceptedClient.Close(); } catch { }
+                            }
                         }
                         catch (Exception ex)
                         {
                             LiminalLogger.LogError($"[Transport] Handshake error: {ex.Message}");
-
-                            client.Close();
+                            try { acceptedClient.Close(); } catch { }
+                        }
+                        finally
+                        {
+                            if (!promoted)
+                            {
+                                Interlocked.Decrement(ref _totalConnections);
+                            }
                         }
                     });
+
+                    handedOff = true;
                 }
                 catch (ObjectDisposedException)
                 {
-                    // Listener has been disposed
                     break;
                 }
                 catch (SocketException ex)
                 {
-                    if (!_isConnected || !_isServer || listener != _listener)
-                    {
-                        break;
-                    }
-
+                    if (!_isConnected || !_isServer || listener != _listener) break;
                     LiminalLogger.LogError($"[Transport] Accept Socket Error: {ex.Message}");
                 }
                 catch (Exception ex)
                 {
                     if (!_isConnected) break;
-
                     LiminalLogger.LogError($"[Transport] Accept error: {ex.Message}");
+                }
+                finally
+                {
+                    if (client != null && !handedOff)
+                    {
+                        if (counted) Interlocked.Decrement(ref _totalConnections);
+                        try { client.Close(); } catch { }
+                    }
                 }
             }
         }
+
         private void PromoteClient(ushort clientId, TcpClient client)
         {
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
@@ -432,18 +462,11 @@ namespace Liminal.Net.Transports
             {
                 LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
                 try { old.Close(); } catch { }
+
+                Interlocked.Decrement(ref _totalConnections);
+
                 return client;
             });
-
-            if (_sockets.Count > _config.MaxConnectionCount)
-            {
-                LiminalLogger.LogWarning($"[Transport] Server full. Dropping promoted client {clientId}.");
-                if (_sockets.TryRemove(clientId, out var droppedSocket) && droppedSocket == client)
-                {
-                    try { droppedSocket.Close(); } catch { }
-                }
-                return;
-            }
 
             _clientIdResolver.ConfirmRegistration(clientId);
 
@@ -602,11 +625,8 @@ namespace Liminal.Net.Transports
             {
                 if (_isShuttingDown == 0)
                 {
-                    bool removed = false;
-                    if (_sockets.TryGetValue(incomingId, out var currentSocket) && currentSocket == client)
-                    {
-                        removed = _sockets.TryRemove(incomingId, out _);
-                    }
+                    bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets)
+                                .Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
 
                     try { client.Close(); } catch { LiminalLogger.LogWarning($"[Transport] Failed to close socket for client {incomingId}."); }
 
@@ -614,6 +634,8 @@ namespace Liminal.Net.Transports
                     {
                         if (removed)
                         {
+                            Interlocked.Decrement(ref _totalConnections);
+
                             _onClientDisconnected?.Invoke(incomingId);
                             LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
                         }

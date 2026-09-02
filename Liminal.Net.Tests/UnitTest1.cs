@@ -30,7 +30,7 @@ namespace Liminal.Net.Tests
         public void Setup()
         {
             _currentTestPort = Interlocked.Increment(ref _portCounter);
-            _clientManagers = new ();
+            _clientManagers = new();
 
             _serverConfig = new LiminalTransportConfig
             {
@@ -712,12 +712,13 @@ namespace Liminal.Net.Tests
 
         private class ForceCollisionResolver : ILiminalClientIdResolver
         {
-            private readonly ushort _targetId;
+            private volatile ushort _targetId;
             private readonly int _duplicateCount;
             private int _callCount = 0;
             private int _confirmedCount = 0;
 
             public int ConfirmedCount => Volatile.Read(ref _confirmedCount);
+            public void SetTargetId(ushort newTargetId) => _targetId = newTargetId;
 
             public ForceCollisionResolver(ushort targetId, int duplicateCount)
             {
@@ -891,7 +892,7 @@ namespace Liminal.Net.Tests
             for (int i = 0; i < 10; i++)
             {
                 _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "FramedPing" });
-                _serverManager.SessionManager.Flush(); 
+                _serverManager.SessionManager.Flush();
             }
 
             Assert.That(SpinWait.SpinUntil(() => received, 2000), Is.True, "Framed packet failed delivery.");
@@ -1408,7 +1409,7 @@ namespace Liminal.Net.Tests
 
                     client.StartClient("127.0.0.1", _currentTestPort);
 
-                    if (SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000))
+                    if (SpinWait.SpinUntil(() => client.Transport.IsConnected, 2500))
                     {
                         connectedClients.Add(client);
                     }
@@ -1417,15 +1418,18 @@ namespace Liminal.Net.Tests
 
             Task.WaitAll(tasks);
 
-            Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections));
-            Assert.That(connectedClients.Count, Is.EqualTo(maxConnections));
+            Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections),
+                "Transport connected count exceeded MaxConnectionCount.");
+            Assert.That(connectedClients.Count, Is.EqualTo(maxConnections),
+                "More clients established a connection than MaxConnectionCount permits.");
 
             if (connectedClients.TryTake(out var disconnectedClient))
             {
                 disconnectedClient.Disconnect();
             }
 
-            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.ConnectedClientCount == maxConnections - 1, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.ConnectedClientCount == maxConnections - 1, 2000), Is.True,
+                "Transport failed to drop ConnectedClientCount after graceful disconnect.");
 
             var lateClientConfig = new LiminalTransportConfig
             {
@@ -1442,14 +1446,143 @@ namespace Liminal.Net.Tests
             clients.Add(lateClient);
             lateClient.StartClient("127.0.0.1", _currentTestPort);
 
-            Assert.That(SpinWait.SpinUntil(() => lateClient.Transport.IsConnected, 2000), Is.True);
-            Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections));
+            Assert.That(SpinWait.SpinUntil(() => lateClient.Transport.IsConnected, 2000), Is.True,
+                "New client failed to claim the released connection slot.");
+            Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections),
+                "Server count did not return to max capacity after late client connected.");
 
             foreach (var c in clients)
             {
                 try { c.Shutdown(); } catch { }
             }
             customServer.Shutdown();
+        }
+
+        [Test]
+        public void Test33_ConcurrentCollisions_UnderHardCap_NeverLeaksSlots()
+        {
+            const int maxConnections = 2;
+            const int collidingAttempts = 8;
+            var collisionResolver = new ForceCollisionResolver(targetId: 42, duplicateCount: 100);
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxConnectionCount = maxConnections,
+                ClientIdResolver = collisionResolver,
+                ConnectionTimeout = 2,
+                HandshakeTimeout = 2
+            };
+            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            server.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => server.Transport.IsConnected, 2000), Is.True);
+
+            var clients = new ConcurrentBag<LiminalNetworkManager>();
+            var settled = new Task[collidingAttempts];
+
+            var barrier = new Barrier(collidingAttempts);
+            var tasks = new Task[collidingAttempts];
+
+            for (int i = 0; i < collidingAttempts; i++)
+            {
+                var tcs = new TaskCompletionSource<bool>();
+                settled[i] = tcs.Task;
+
+                tasks[i] = Task.Run(() =>
+                {
+                    var cfg = new LiminalTransportConfig
+                    {
+                        Default_Host = "127.0.0.1",
+                        Default_Port = _currentTestPort,
+                        TickRate = 60,
+                        MaxPacketSizePerBatch = 4096,
+                        ClientIdResolver = new BaseResolver(),
+                        ConnectionTimeout = 2,
+                        HandshakeTimeout = 2
+                    };
+                    var c = new LiminalNetworkManager(new TcpTransport(), cfg);
+                    clients.Add(c);
+
+                    c.Transport.OnLocalClientConnected += _ => tcs.TrySetResult(true);
+                    c.Transport.OnShutdown += () => tcs.TrySetResult(false);
+
+                    barrier.SignalAndWait();
+                    c.StartClient("127.0.0.1", _currentTestPort);
+                });
+            }
+
+            Task.WaitAll(tasks);
+
+            bool allSettled = Task.WaitAll(settled, TimeSpan.FromSeconds(5));
+            Assert.That(allSettled, Is.True, "Storm clients never reached a terminal state in time.");
+
+            Assert.That(SpinWait.SpinUntil(() => server.Transport.ConnectedClientCount == 1, 3000), Is.True,
+                "Expected exactly 1 socket surviving in the dictionary for ID 42.");
+
+            collisionResolver.SetTargetId(999);
+            var testClient = new LiminalNetworkManager(new TcpTransport(), new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 2,
+                HandshakeTimeout = 2
+            });
+            clients.Add(testClient);
+            testClient.StartClient("127.0.0.1", _currentTestPort);
+            bool admitted = SpinWait.SpinUntil(() => testClient.Transport.IsConnected, 2500);
+            Assert.That(admitted, Is.True, "CAPACITY LEAK: Server locked up because replaced sockets never decremented _totalConnections.");
+            Assert.That(server.Transport.ConnectedClientCount, Is.EqualTo(maxConnections));
+
+            foreach (var c in clients) try { c.Shutdown(); } catch { }
+            server.Shutdown();
+        }
+
+        [Test]
+        public void Test34_Kick_ReclaimsConnectionSlotImmediately()
+        {
+            const int maxConnections = 1;
+
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxConnectionCount = maxConnections,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 5,
+                HandshakeTimeout = 5
+            };
+
+            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            server.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => server.Transport.IsConnected, 2000), Is.True);
+
+            var client1 = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected, 2000), Is.True);
+            Assert.That(server.Transport.ConnectedClientCount, Is.EqualTo(1));
+
+            ushort client1Id = client1.localID;
+            Assert.That(client1Id, Is.Not.EqualTo(0));
+
+            server.Transport.Kick(client1Id);
+
+            Assert.That(SpinWait.SpinUntil(() => server.Transport.ConnectedClientCount == 0, 2000), Is.True,
+                "Server failed to decrement ConnectedClientCount after Kick.");
+
+            var client2 = CreateAndStartClient();
+            bool client2Connected = SpinWait.SpinUntil(() => client2.Transport.IsConnected, 2000);
+
+            Assert.That(client2Connected, Is.True,
+                "Kick dropped the socket but leaked the capacity slot, blocking future clients.");
+            Assert.That(server.Transport.ConnectedClientCount, Is.EqualTo(1));
+
+            client2.Shutdown();
+            server.Shutdown();
         }
     }
 }

@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="MessagePack" Version="3.1.8" />
+    <PackageReference Include="Microsoft.Coyote" Version="1.7.11" />
   </ItemGroup>
 
   <ItemGroup>
