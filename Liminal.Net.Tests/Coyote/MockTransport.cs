@@ -34,7 +34,6 @@ namespace Liminal.Net.Tests
         public void Kick(ushort clientId) => OnClientKicked?.Invoke(clientId);
         public bool IsClientConnected(ushort clientId) => true;
 
-        // --- Helper Methods for Coyote to Trigger Concurrency ---
         public void TriggerClientConnected(ushort id) => OnClientConnected?.Invoke(id);
         public void TriggerMessageReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);
         public void TriggerShutdown() => OnShutdown?.Invoke();

@@ -12,7 +12,7 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestSessionManagerFullPipelineChaos()
         {
-            var config = new LiminalTransportConfig { MaxPacketCount = 5 }; // Low threshold to force queue capacity limits
+            var config = new LiminalTransportConfig { MaxPacketCount = 5 };
             var transport = new MockTransport();
             var interpreter = new LiminalPacketInterpreter(config);
             var pipeline = new LiminalPacketFramerPipeline(config);
@@ -22,12 +22,10 @@ namespace Liminal.Net.Tests
             transport.TriggerClientConnected(clientId);
             byte[] payload = new byte[64];
 
-            // Thread 1: Inbound Network Flood (Background Transport)
             var t1 = Task.Run(() => {
                 for (int i = 0; i < 15; i++) transport.TriggerMessageReceived(payload, clientId);
             });
 
-            // Thread 2: Outbound Game Logic (Buffer + Flush)
             var t2 = Task.Run(() => {
                 for (int i = 0; i < 15; i++)
                 {
@@ -36,12 +34,10 @@ namespace Liminal.Net.Tests
                 }
             });
 
-            // Thread 3: Inbound Game Logic (Poll)
             var t3 = Task.Run(() => {
                 for (int i = 0; i < 15; i++) manager.Poll();
             });
 
-            // Thread 4: Surprise Kick
             var t4 = Task.Run(() => transport.Kick(clientId));
 
             await Task.WhenAll(t1, t2, t3, t4);
