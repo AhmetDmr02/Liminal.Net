@@ -184,7 +184,12 @@ namespace Liminal.Net.Core
             }
         }
 
+#if NET9_0_OR_GREATER
         public event Action<ushort, ushort, ReadOnlySpan<byte>> OnSendRequest;
+#else
+        public delegate void SendRequestHandler(ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload);
+        public event SendRequestHandler OnSendRequest;
+#endif
 
         public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
         {

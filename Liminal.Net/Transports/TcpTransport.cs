@@ -540,6 +540,7 @@ namespace Liminal.Net.Transports
 
                     bytesInBuffer += read;
 
+#if NET9_0_OR_GREATER
                     Span<byte> bufferSpan = ingestBuffer.GetSpan();
                     int offset = 0;
                     int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
@@ -604,6 +605,15 @@ namespace Liminal.Net.Transports
                         }
                         bytesInBuffer = remaining;
                     }
+#else
+                    ProcessIngestBufferSynchronous(incomingId, ingestBuffer, ref bytesInBuffer);
+
+                    // If the connection was kicked inside the sync method, exit the receive loop
+                    if (!IsClientConnected(incomingId) && incomingId != ILiminalTransport.SERVER_ID)
+                    {
+                        return;
+                    }
+#endif
                 }
             }
             catch (OperationCanceledException) when (readCts.IsCancellationRequested)
@@ -649,6 +659,75 @@ namespace Liminal.Net.Transports
                 }
             }
         }
-        #endregion
+
+        /// <summary>
+        /// Helper class to help us migrate for previous versions of C#
+        /// </summary>
+        private void ProcessIngestBufferSynchronous(ushort incomingId, LiminalNativeBuffer ingestBuffer, ref int bytesInBuffer)
+        {
+            Span<byte> bufferSpan = ingestBuffer.GetSpan();
+            int offset = 0;
+            int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
+
+            while (bytesInBuffer - offset >= LiminalTransportHeader.BaseHeaderSize)
+            {
+                var currentSlice = bufferSpan.Slice(offset, bytesInBuffer - offset);
+
+                var result = LiminalTransportHeader.TryReadHeader(currentSlice, _framing, out var flags, out int payloadLength, out TContext framingContext);
+
+                if (result == HeaderReadResult.Incomplete)
+                {
+                    break;
+                }
+
+                if (result == HeaderReadResult.Malformed)
+                {
+                    LiminalLogger.LogError($"[Transport] Malformed frame header received from {incomingId}. Kicking connection.");
+                    Kick(incomingId);
+                    return;
+                }
+
+                if (payloadLength < 0 || payloadLength > _config.MaxPacketSizePerBatch)
+                {
+                    LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
+                    Kick(incomingId);
+                    return;
+                }
+
+                int totalFrameSize = headerSize + payloadLength;
+                if (bytesInBuffer - offset < totalFrameSize)
+                {
+                    break;
+                }
+
+                var payloadSpan = bufferSpan.Slice(offset + headerSize, payloadLength);
+
+                if ((flags & TransportFlags.Fragmented) != 0)
+                {
+                    // Route to Fragmentor
+                }
+                else if ((flags & TransportFlags.Reliable) != 0)
+                {
+                    _onReliable?.Invoke(payloadSpan, incomingId);
+                }
+                else
+                {
+                    _onUnreliable?.Invoke(payloadSpan, incomingId);
+                }
+
+                offset += totalFrameSize;
+            }
+
+            if (offset > 0)
+            {
+                int remaining = bytesInBuffer - offset;
+                if (remaining > 0)
+                {
+                    bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan.Slice(0, remaining));
+                }
+                bytesInBuffer = remaining;
+            }
+        }
+#endregion
     }
 }

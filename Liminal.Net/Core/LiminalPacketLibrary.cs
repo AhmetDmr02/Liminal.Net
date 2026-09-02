@@ -30,6 +30,23 @@ namespace Liminal.Net.Core
 
             foreach (var assembly in assemblies)
             {
+                if (assembly.IsDynamic) continue;
+
+                string? name = assembly.GetName().Name;
+                if (name != null && (
+                    name.StartsWith("System", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("Microsoft", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("mscorlib", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("NUnit", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("testhost", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("Unity", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("UnityEngine", StringComparison.OrdinalIgnoreCase) ||
+                    name.StartsWith("UnityEditor", StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
                 Type[] types;
                 try
                 {
@@ -37,16 +54,26 @@ namespace Liminal.Net.Core
                 }
                 catch (ReflectionTypeLoadException e)
                 {
-                    types = e.Types.Where(t => t != null).ToArray();
+                    types = e.Types.Where(t => t != null).ToArray()!;
+                }
+                catch
+                {
+                    continue;
                 }
 
                 foreach (var type in types)
                 {
-                    var attr = type.GetCustomAttribute<LiminalPacketAttribute>(false);
-
-                    if (attr != null)
+                    try
                     {
-                        RegisterPacket(attr.Id, type);
+                        var attr = type.GetCustomAttribute<LiminalPacketAttribute>(false);
+                        if (attr != null)
+                        {
+                            RegisterPacket(attr.Id, type);
+                        }
+                    }
+                    catch
+                    {
+                        // Skip types whose attributes cannot be resolved or inspected
                     }
                 }
             }
