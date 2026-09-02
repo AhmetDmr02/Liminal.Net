@@ -21,6 +21,16 @@ namespace Liminal.Net.Core
         public float ConnectionTimeout = 5.0f;
 
         /// <summary>
+        /// Specifies the maximum time, in seconds, to wait for a response before timing out.
+        /// </summary>
+        public float ReceiveResponseTimeout = 50.0f;
+
+        /// <summary>
+        /// Specifies the maximum time, in seconds, to wait for a response before timing out.
+        /// </summary>
+        public float SendResponseTimeout = 10.0f;
+
+        /// <summary>
         /// Specifies the maximum time, in seconds, to wait for a handshake to complete before timing out.
         /// </summary>
         public float HandshakeTimeout = 5.0f;
@@ -50,6 +60,11 @@ namespace Liminal.Net.Core
         /// The maximum number of packets that will be held in the inbound queue per connection
         /// </summary>
         public int MaxPacketCount = 50;
+
+        /// <summary>
+        /// The maximum number of connections that will be allowed
+        /// </summary>
+        public int MaxConnectionCount = 10;
 
         public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
 

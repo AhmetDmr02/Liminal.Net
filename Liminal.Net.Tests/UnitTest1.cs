@@ -8,6 +8,9 @@ using NUnit.Framework.Legacy;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Threading;
 
 namespace Liminal.Net.Tests
@@ -134,20 +137,39 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
 
-            byte[] sentData = new byte[1024]; // 1KB test file
-            for (int i = 0; i < sentData.Length; i++) sentData[i] = (byte)(i % 255);
+            byte[] sentData = new byte[1024];
+            Random.Shared.NextBytes(sentData);
 
-            bool fileMatched = false;
+            byte[] expectedHash = SHA256.HashData(sentData);
+
+            bool packetReceived = false;
+            byte[] actualHash = null;
+            bool byteSequenceMatched = false;
+
             client.Interpreter.Subscribe<FilePacket>((pkt, id) =>
             {
-                if (pkt.FileName == "test.bin" && pkt.Data.Length == 1024 && pkt.Data[50] == sentData[50])
-                    fileMatched = true;
+                if (pkt.FileName == "test.bin" && pkt.Data != null)
+                {
+                    packetReceived = true;
+                    actualHash = SHA256.HashData(pkt.Data);
+                    byteSequenceMatched = sentData.AsSpan().SequenceEqual(pkt.Data);
+                }
             }, this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True, "Client failed to connect.");
 
             _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "test.bin", Data = sentData });
-            Assert.That(SpinWait.SpinUntil(() => fileMatched, 2000), Is.True, "File packet corrupted or dropped.");
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => packetReceived, 2000), Is.True, "File packet was not delivered.");
+
+            Assert.That(actualHash, Is.Not.Null);
+            Assert.That(
+                Convert.ToHexString(actualHash),
+                Is.EqualTo(Convert.ToHexString(expectedHash)),
+                "SHA-256 digest mismatch: payload was modified or corrupted in transit."
+            );
+            Assert.That(byteSequenceMatched, Is.True, "Direct byte sequence comparison failed.");
         }
 
         [Test]
@@ -1153,5 +1175,281 @@ namespace Liminal.Net.Tests
             customServer.Shutdown();
         }
         #endregion
+
+        #region Timeout Tests
+
+        [Test]
+        public void Test28_ServerReceiveTimeout_SilentClient_GetsKicked()
+        {
+            var serverTimeoutConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15,
+                ReceiveResponseTimeout = 1
+            };
+
+            var timeoutServer = new LiminalNetworkManager(new TcpTransport(), serverTimeoutConfig);
+            timeoutServer.StartServer("127.0.0.1", _currentTestPort);
+
+            bool serverSawDisconnect = false;
+            timeoutServer.Transport.OnClientDisconnected += (id) => serverSawDisconnect = true;
+
+            var client = CreateAndStartClient();
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(timeoutServer.Transport.ConnectedClientCount, Is.EqualTo(1));
+
+            bool timedOut = SpinWait.SpinUntil(() => serverSawDisconnect, 3000);
+
+            Assert.That(timedOut, Is.True);
+            Assert.That(timeoutServer.Transport.ConnectedClientCount, Is.EqualTo(0));
+
+            timeoutServer.Shutdown();
+        }
+
+        [Test]
+        public void Test29_ClientReceiveTimeout_SilentServer_DisconnectsLocalClient()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            var clientTimeoutConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15,
+                ReceiveResponseTimeout = 1
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientTimeoutConfig);
+            _clientManagers.Add(client);
+
+            bool clientSawDisconnect = false;
+            client.Transport.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            bool clientTimedOut = SpinWait.SpinUntil(() => clientSawDisconnect, 3000);
+
+            Assert.That(clientTimedOut, Is.True);
+            Assert.That(client.Transport.IsConnected, Is.False);
+        }
+
+        [Test]
+        public void Test30_ServerSendTimeout_UnresponsiveClientBuffer_DropsConnection()
+        {
+            var serverSendConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 65535,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15,
+                SendResponseTimeout = 1
+            };
+
+            var timeoutServer = new LiminalNetworkManager(new TcpTransport(), serverSendConfig);
+            timeoutServer.StartServer("127.0.0.1", _currentTestPort);
+
+            using var rawClient = new TcpClient();
+            rawClient.NoDelay = true;
+            rawClient.Connect("127.0.0.1", _currentTestPort);
+
+            ushort assignedId = DefaultHandshakes.ClientTcpHandshake(rawClient, serverSendConfig).GetAwaiter().GetResult();
+            Assert.That(assignedId, Is.Not.EqualTo(0));
+            Assert.That(SpinWait.SpinUntil(() => timeoutServer.Transport.ConnectedClientCount == 1, 2000), Is.True);
+
+            // Restrict kernel receive window and omit reading to force TCP window saturation
+            rawClient.Client.ReceiveBufferSize = 4096;
+
+            byte[] largePayload = new byte[32768];
+            Array.Fill(largePayload, (byte)0xEE);
+
+            bool sendFailed = false;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (!timeoutServer.Transport.IsClientConnected(assignedId))
+                {
+                    sendFailed = true;
+                    break;
+                }
+
+                timeoutServer.Transport.SendReliable(largePayload, assignedId);
+                Thread.Sleep(5);
+            }
+
+            Assert.That(sendFailed, Is.True);
+            Assert.That(timeoutServer.Transport.IsClientConnected(assignedId), Is.False);
+
+            timeoutServer.Shutdown();
+        }
+
+        [Test]
+        public void Test31_ClientSendTimeout_UnresponsiveServerBuffer_TriggersShutdown()
+        {
+            var rawListener = new TcpListener(IPAddress.Parse("127.0.0.1"), _currentTestPort);
+            rawListener.Start();
+
+            var clientSendConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 65535,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15,
+                SendResponseTimeout = 1
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientSendConfig);
+            _clientManagers.Add(client);
+
+            Task.Run(async () =>
+            {
+                var acceptedSocket = await rawListener.AcceptTcpClientAsync();
+                acceptedSocket.NoDelay = true;
+                // Restrict kernel receive window and omit reading to force TCP window saturation
+                acceptedSocket.Client.ReceiveBufferSize = 4096;
+                _ = await DefaultHandshakes.ServerTcpHandshake(acceptedSocket, clientSendConfig);
+            });
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            byte[] largePayload = new byte[32768];
+            Array.Fill(largePayload, (byte)0xFF);
+
+            bool clientShutdown = false;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (!client.Transport.IsConnected)
+                {
+                    clientShutdown = true;
+                    break;
+                }
+
+                client.Transport.SendReliable(largePayload, ILiminalTransport.SERVER_ID);
+                Thread.Sleep(5);
+            }
+
+            Assert.That(clientShutdown, Is.True);
+            Assert.That(client.Transport.IsConnected, Is.False);
+
+            rawListener.Stop();
+        }
+
+        #endregion
+
+        [Test]
+        public void Test32_MaxConnectionCount_EnforcesCapUnderTightConcurrency()
+        {
+            const int maxConnections = 3;
+            const int totalAttemptingClients = 10;
+
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxConnectionCount = maxConnections,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 5,
+                HandshakeTimeout = 5
+            };
+
+            var customServer = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            customServer.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
+
+            var clients = new ConcurrentBag<LiminalNetworkManager>();
+            var connectedClients = new ConcurrentBag<LiminalNetworkManager>();
+            var barrier = new Barrier(totalAttemptingClients);
+
+            var tasks = new Task[totalAttemptingClients];
+            for (int i = 0; i < totalAttemptingClients; i++)
+            {
+                tasks[i] = Task.Run(() =>
+                {
+                    var clientConfig = new LiminalTransportConfig
+                    {
+                        Default_Host = "127.0.0.1",
+                        Default_Port = _currentTestPort,
+                        TickRate = 60,
+                        MaxPacketSizePerBatch = 4096,
+                        ClientIdResolver = new BaseResolver(),
+                        ConnectionTimeout = 2,
+                        HandshakeTimeout = 2
+                    };
+
+                    var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+                    clients.Add(client);
+
+                    barrier.SignalAndWait();
+
+                    client.StartClient("127.0.0.1", _currentTestPort);
+
+                    if (SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000))
+                    {
+                        connectedClients.Add(client);
+                    }
+                });
+            }
+
+            Task.WaitAll(tasks);
+
+            Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections));
+            Assert.That(connectedClients.Count, Is.EqualTo(maxConnections));
+
+            if (connectedClients.TryTake(out var disconnectedClient))
+            {
+                disconnectedClient.Disconnect();
+            }
+
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.ConnectedClientCount == maxConnections - 1, 2000), Is.True);
+
+            var lateClientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 2,
+                HandshakeTimeout = 2
+            };
+
+            var lateClient = new LiminalNetworkManager(new TcpTransport(), lateClientConfig);
+            clients.Add(lateClient);
+            lateClient.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => lateClient.Transport.IsConnected, 2000), Is.True);
+            Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections));
+
+            foreach (var c in clients)
+            {
+                try { c.Shutdown(); } catch { }
+            }
+            customServer.Shutdown();
+        }
     }
 }

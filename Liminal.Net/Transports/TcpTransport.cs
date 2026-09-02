@@ -298,6 +298,7 @@ namespace Liminal.Net.Transports
             {
                 if (_sockets.TryGetValue(targetId, out var socket))
                 {
+
                     Span<byte> fullPacket = rentedBuffer.AsSpan(0, totalSize);
 
                     LiminalTransportHeader.WriteHeader(fullPacket, flags, data.Length, in contextSnapshot, _framing);
@@ -358,6 +359,7 @@ namespace Liminal.Net.Transports
             }
             catch (Exception ex)
             {
+                try { client.Close(); } catch { } 
                 LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
                 Shutdown();
             }
@@ -365,6 +367,7 @@ namespace Liminal.Net.Transports
         #endregion
 
         #region Receiving
+
         protected async Task AcceptConnectionsAsync(TcpListener listener)
         {
             while (IsConnected && _isServer && listener == _listener)
@@ -373,6 +376,12 @@ namespace Liminal.Net.Transports
                 {
                     TcpClient client = await listener.AcceptTcpClientAsync();
                     client.NoDelay = true;
+
+                    if (_sockets.Count >= _config.MaxConnectionCount)
+                    {
+                        client.Close();
+                        continue;
+                    }
 
                     _ = Task.Run(async () =>
                     {
@@ -417,6 +426,8 @@ namespace Liminal.Net.Transports
         }
         private void PromoteClient(ushort clientId, TcpClient client)
         {
+            client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
+
             _sockets.AddOrUpdate(clientId, client, (key, old) =>
             {
                 LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
@@ -424,15 +435,28 @@ namespace Liminal.Net.Transports
                 return client;
             });
 
+            if (_sockets.Count > _config.MaxConnectionCount)
+            {
+                LiminalLogger.LogWarning($"[Transport] Server full. Dropping promoted client {clientId}.");
+                if (_sockets.TryRemove(clientId, out var droppedSocket) && droppedSocket == client)
+                {
+                    try { droppedSocket.Close(); } catch { }
+                }
+                return;
+            }
+
             _clientIdResolver.ConfirmRegistration(clientId);
 
             _onClientConnected?.Invoke(clientId);
+
             _ = Task.Run(async () => ReceiveLoop(clientId, client));
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
         private void PromoteLocalClient(ushort assignedId, TcpClient client)
         {
+            client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
+
             _sockets[ILiminalTransport.SERVER_ID] = client;
 
             _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client));
@@ -441,13 +465,14 @@ namespace Liminal.Net.Transports
 
             LiminalLogger.Log($"[Transport] Successfully connected to server. Local ID: {assignedId}");
         }
+
         private async Task ReceiveLoop(ushort incomingId, TcpClient client)
         {
             using var ingestBuffer = new LiminalNativeBuffer(_config.MaxPacketSizePerBatch * 2);
             var stream = client.GetStream();
             int bytesInBuffer = 0;
 
-            client.ReceiveTimeout = (int)_config.ConnectionTimeout;
+            using var readCts = new CancellationTokenSource();
             try
             {
                 client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
@@ -470,7 +495,23 @@ namespace Liminal.Net.Transports
 
                     Memory<byte> receiveTarget = ingestBuffer.Memory.Slice(bytesInBuffer, remainingSpace);
 
-                    int read = await stream.ReadAsync(receiveTarget);
+                    int read = 0;
+
+                    if (_config.ReceiveResponseTimeout > 0)
+                    {
+                        readCts.CancelAfter(TimeSpan.FromSeconds(_config.ReceiveResponseTimeout));
+                        read = await stream.ReadAsync(receiveTarget, readCts.Token);
+
+                        // Pause timer while parsing packets
+                        if (!readCts.IsCancellationRequested)
+                        {
+                            readCts.CancelAfter(Timeout.InfiniteTimeSpan);
+                        }
+                    }
+                    else
+                    {
+                        read = await stream.ReadAsync(receiveTarget);
+                    }
 
                     if (read <= 0) break;
 
@@ -542,17 +583,20 @@ namespace Liminal.Net.Transports
                     }
                 }
             }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (readCts.IsCancellationRequested)
             {
-                if (_sockets.ContainsKey(incomingId))
+                LiminalLogger.LogWarning($"[Transport] Client {incomingId} timed out (exceeded {_config.ReceiveResponseTimeout}s).");
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException || ex is IOException || ex is SocketException)
+            {
+                if (_sockets.ContainsKey(incomingId) && _isConnected && _isShuttingDown == 0)
                 {
                     LiminalLogger.LogWarning($"[Transport] Client {incomingId} connection dropped: {ex.Message}");
                 }
-                else
-                {
-                    LiminalLogger.Log($"[Transport] Client {incomingId} is disconnected.");
-                    return;
-                }
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Transport] Unexpected error in receive loop for {incomingId}: {ex}");
             }
             finally
             {
