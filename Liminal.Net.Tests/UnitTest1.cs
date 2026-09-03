@@ -1862,5 +1862,37 @@ namespace Liminal.Net.Tests
             Assert.That(c3ReceivedCount, Is.EqualTo(0), "Client 3 received a packet it was not targeted for.");
         }
         #endregion
+
+        [Test]
+        public void Test43_SessionManager_WhenShutDown_IsGarbageCollected()
+        {
+            WeakReference weakSessionManager = IsolateNetworkRun();
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            Assert.That(weakSessionManager.IsAlive, Is.False, "FATAL: SessionManager was not garbage collected! Event memory leak detected.");
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private WeakReference IsolateNetworkRun()
+        {
+            var config = new LiminalTransportConfig { TickRate = 60, ClientIdResolver = new BaseResolver() };
+            var transport = new TcpTransport();
+            var manager = new LiminalNetworkManager(transport, config);
+
+            manager.StartClient("127.0.0.1", 7777);
+
+            var weak = new WeakReference(manager.SessionManager);
+
+            manager.Shutdown();
+
+            manager.StartClient("127.0.0.1", 7777);
+
+            LiminalNetworkManager.Instance = null;
+
+            return weak;
+        }
     }
 }

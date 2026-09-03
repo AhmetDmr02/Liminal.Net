@@ -76,6 +76,9 @@ namespace Liminal.Net.Core
             _ticker?.Stop();
             SessionManager?.Dispose();
 
+            // Last flush to trigger internal dispose
+            SessionManager?.Flush();
+
             //We actually wanna keep subscriptions around
             //Interpreter?.ClearAllHandlers();
 

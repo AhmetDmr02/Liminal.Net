@@ -1,0 +1,3560 @@
+===== F:\Projects\Liminal.Net\Liminal.Net\BasePackets\ConnectionHandshakePacket.cs =====
+using Liminal.Net.Core;
+using MessagePack;
+
+namespace Liminal.Net.BasePackets
+{
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct ConnectionHandshakePacketClient
+    {
+        [Key(0)]
+        public string ClientName { get; set; }
+
+        [Key(1)]
+        public ushort ClientVersion { get; set; }
+
+        [Key(2)]
+        public uint PacketRegistryHash { get; set; }
+    }
+
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct ConnectionHandshakePacketServer
+    {
+        [Key(0)]
+        public ushort ServerVersion { get; set; }
+
+        [Key(1)]
+        public ushort AssignedClientID { get; set; }
+
+        [Key(2)] 
+        public uint PacketRegistryHash { get; set; }
+    }
+
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct ConnectionHandshakeClientAck
+    {
+        [Key(0)]
+        public bool Ack { get; set; }
+        [Key(1)]
+        public ushort ClientID { get; set; }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\ClientIdResolvers\BaseResolver.cs =====
+using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
+using System;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+
+namespace Liminal.Net.ClientIdResolvers
+{
+    public class BaseResolver : ILiminalClientIdResolver
+    {
+        protected ILiminalTransport _transport;
+
+        private readonly ConcurrentDictionary<ushort, DateTime> _reservedIds = new();
+        private readonly TimeSpan _reservationTimeout = TimeSpan.FromSeconds(10);
+
+        protected volatile int _nextClientId = 1;
+        private readonly object _idLock = new();
+
+        public virtual void Initialize(ILiminalTransport transport)
+        {
+            _transport = transport;
+        }
+
+        /// <summary>
+        /// Reserves and returns the next available ID.
+        /// The ID is temporarily reserved until RegisterId() or timeout occurs.
+        /// Handles wrapping (ushort.MaxValue) and collisions with existing clients.
+        /// </summary>
+        public ushort GenerateClientId()
+        {
+            lock (_idLock)
+            {
+                CleanupExpiredReservations();
+
+                int attempts = 0;
+                int maxAttempts = ushort.MaxValue - 1;
+
+                while (attempts < maxAttempts)
+                {
+                    if (_nextClientId >= ushort.MaxValue)
+                    {
+                        LiminalLogger.LogWarning("[Resolver] ID Counter wrapped. Searching for recycled IDs... this can result in unexpected behavior.");
+                        _nextClientId = 1;
+                    }
+
+                    ushort candidate = (ushort)_nextClientId;
+                    _nextClientId++;
+
+                    bool isAliveInTransport = _transport?.IsClientConnected(candidate) ?? false;
+
+                    if (candidate != 0 && !isAliveInTransport && _reservedIds.TryAdd(candidate, DateTime.UtcNow))
+                    {
+                        LiminalLogger.Log($"[Resolver] Reserved ID {candidate}");
+                        return candidate;
+                    }
+
+                    attempts++;
+                }
+
+                LiminalLogger.LogError("[Resolver] CRITICAL: Server is full! No free Client IDs available.");
+                return 0;
+            }
+        }
+
+
+        /// <summary>
+        /// Removes a client Id from reserved pool.
+        /// </summary>
+
+        public virtual void ConfirmRegistration(ushort clientId)
+        {
+            lock (_idLock)
+            {
+                _reservedIds.TryRemove(clientId, out _);
+            }
+        }
+
+        public virtual void ResetResolver()
+        {
+            lock (_idLock)
+            {
+                _reservedIds.Clear();
+                _nextClientId = 1;
+            }
+            LiminalLogger.Log("[Resolver] Resolver reset complete.");
+        }
+
+        //if you wanna do for ip swapping logic etc you can do it here
+        public ushort ResolveId(Span<byte> payload)
+        {
+            return 0;
+
+            //dummy example
+
+            //int resolvedId = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(0, 4));
+
+            //return (ushort)resolvedId;
+        }
+
+        /// <summary>
+        /// Cleans up reservations that have exceeded the timeout period.
+        /// Should be called periodically or before generating new IDs.
+        /// </summary>
+        private void CleanupExpiredReservations()
+        {
+            lock (_idLock) 
+            {
+                var now = DateTime.UtcNow;
+                var expiredIds = new List<ushort>();
+
+                foreach (var kvp in _reservedIds)
+                {
+                    if (now - kvp.Value > _reservationTimeout)
+                    {
+                        expiredIds.Add(kvp.Key);
+                    }
+                }
+
+                foreach (var id in expiredIds)
+                {
+                    if (_reservedIds.TryRemove(id, out _))
+                    {
+                        LiminalLogger.LogWarning($"[Resolver] Reservation for ID {id} expired and was cleaned up.");
+                    }
+                }
+
+                if (expiredIds.Count > 0)
+                {
+                    LiminalLogger.Log($"[Resolver] Cleaned up {expiredIds.Count} expired reservation(s).");
+                }
+            }
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\DefaultHandshakes.cs =====
+using System.Net.Sockets;
+using System.Threading.Tasks;
+
+namespace Liminal.Net.Core
+{
+    public static class DefaultHandshakes
+    {
+        public static async Task<ushort> ServerTcpHandshake(TcpClient client, LiminalTransportConfig config)
+        {
+            var pipeline = new TcpHandshakePipeline(config.ClientIdResolver, config.MaxHandshakeSize, (int)config.HandshakeTimeout);
+            return await pipeline.TryVerifyClientAsync(client, config.Version);
+        }
+
+        public static async Task<ushort> ClientTcpHandshake(TcpClient client, LiminalTransportConfig config)
+        {
+            try
+            {
+                var pipeline = new TcpHandshakePipeline(config.ClientIdResolver, config.MaxHandshakeSize, (int)config.HandshakeTimeout);
+                return await pipeline.TryConnectToServerAsync(client, config.Version);
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalLogger.cs =====
+using System;
+
+namespace Liminal.Net.Core
+{
+    public static class LiminalLogger
+    {
+        private static LogLevel _logLevel = LogLevel.Detailed;
+
+        public enum LogLevel
+        {
+            Default = 0,
+            Detailed = 1,
+        }
+
+        public static void SetLogLevel(LogLevel logLevel) => _logLevel = logLevel;
+
+        public static void Log(string message, LogLevel logLevel = LogLevel.Default)
+        {
+            if (logLevel > _logLevel) return;
+
+#if UNITY_5_3_OR_NEWER
+            Debug.Log(message);
+#elif !UNITY_5_3_OR_NEWER
+            Console.WriteLine(message);
+#endif
+        }
+
+        public static void LogWarning(string message, LogLevel logLevel = LogLevel.Default)
+        {
+            if (logLevel > _logLevel) return;
+
+#if UNITY_5_3_OR_NEWER
+            Debug.LogWarning(message);
+#elif !UNITY_5_3_OR_NEWER
+            Console.WriteLine("WARNING: " + message);
+#endif
+        }
+
+        public static void LogError(string message, LogLevel logLevel = LogLevel.Default)
+        {
+            if (logLevel > _logLevel) return;
+
+#if UNITY_5_3_OR_NEWER
+            Debug.LogError(message);
+#elif !UNITY_5_3_OR_NEWER
+            Console.WriteLine("ERROR: " + message);
+#endif
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalNativeBuffer.cs =====
+using System;
+using System.Buffers;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace Liminal.Net.Core
+{
+    internal sealed unsafe class LiminalNativeBuffer : MemoryManager<byte>, IMemoryOwner<byte>
+    {
+        private byte* _ptr;
+        private readonly int _length;
+
+        private int _state;
+        private const int DisposedFlag = 1 << 31;
+
+        public bool IsDisposed => (Volatile.Read(ref _state) & DisposedFlag) != 0;
+
+        public LiminalNativeBuffer(int length)
+        {
+            if (length <= 0)
+                throw new ArgumentOutOfRangeException(nameof(length), "Length must be greater than zero.");
+
+            _length = length;
+            _ptr = (byte*)NativeMemory.Alloc((nuint)length);
+        }
+
+        ~LiminalNativeBuffer()
+        {
+            Dispose(false);
+        }
+
+        public override Span<byte> GetSpan()
+        {
+            if (IsDisposed)
+                throw new ObjectDisposedException(nameof(LiminalNativeBuffer));
+
+            return new Span<byte>(_ptr, _length);
+        }
+
+        public override MemoryHandle Pin(int elementIndex = 0)
+        {
+            if ((uint)elementIndex > (uint)_length)
+                throw new ArgumentOutOfRangeException(nameof(elementIndex));
+
+            while (true)
+            {
+                int state = Volatile.Read(ref _state);
+
+                if ((state & DisposedFlag) != 0)
+                    throw new ObjectDisposedException(nameof(LiminalNativeBuffer));
+
+                int newState = state + 1;
+                if (Interlocked.CompareExchange(ref _state, newState, state) == state)
+                    break;
+            }
+
+            return new MemoryHandle(_ptr + elementIndex, pinnable: this);
+        }
+
+        public override void Unpin()
+        {
+            while (true)
+            {
+                int state = Volatile.Read(ref _state);
+
+                if ((state & ~DisposedFlag) == 0)
+                    throw new InvalidOperationException("Unmatched Unpin. The buffer is not currently pinned.");
+
+                int newState = state - 1; 
+                if (Interlocked.CompareExchange(ref _state, newState, state) == state)
+                {
+                    if (newState == DisposedFlag)
+                    {
+                        FreeMemory();
+                    }
+                    break;
+                }
+            }
+        }
+
+        internal void ManualDispose() => ((IDisposable)this).Dispose();
+
+        protected override void Dispose(bool disposing)
+        {
+            while (true)
+            {
+                int state = Volatile.Read(ref _state);
+
+                if ((state & DisposedFlag) != 0)
+                    return; 
+
+                int newState = state | DisposedFlag;
+                if (Interlocked.CompareExchange(ref _state, newState, state) == state)
+                {
+                    if (newState == DisposedFlag)
+                    {
+                        FreeMemory();
+                    }
+
+                    if (disposing)
+                    {
+                        GC.SuppressFinalize(this);
+                    }
+                    break;
+                }
+            }
+        }
+
+        private void FreeMemory()
+        {
+            byte* ptr = _ptr;
+            _ptr = null;
+
+            if (ptr != null)
+            {
+                NativeMemory.Free(ptr);
+            }
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalNativeBufferWriter.cs =====
+using System;
+using System.Buffers;
+
+namespace Liminal.Net.Core
+{
+    internal sealed class LiminalNativeBufferWriter : IBufferWriter<byte>
+    {
+        private readonly LiminalNativeBuffer _buffer;
+        private int _position;
+
+        public LiminalNativeBufferWriter(int size)
+        {
+            _buffer = new LiminalNativeBuffer(size);
+        }
+
+        public void Advance(int count)
+        {
+            _position += count;
+            if (_position > _buffer.Memory.Length)
+            {
+                throw new InvalidOperationException("BufferWriter advanced beyond capacity.");
+            }
+        }
+
+        public Memory<byte> GetMemory(int sizeHint = 0)
+        {
+            EnsureCapacity(sizeHint);
+            return _buffer.Memory.Slice(_position);
+        }
+
+        public Span<byte> GetSpan(int sizeHint = 0)
+        {
+            EnsureCapacity(sizeHint);
+            return _buffer.GetSpan().Slice(_position);
+        }
+
+        public ReadOnlySpan<byte> WrittenSpan => _buffer.GetSpan().Slice(0, _position);
+
+        public void Clear() => _position = 0;
+
+        private void EnsureCapacity(int sizeHint)
+        {
+            if (sizeHint == 0) sizeHint = 1;
+
+            if (_position + sizeHint > _buffer.Memory.Length)
+            {
+                LiminalLogger.LogError($"[Liminal] Serialization exceeded fixed native buffer size of {_buffer.Memory.Length}.");
+                throw new OutOfMemoryException($"[Liminal] Serialization exceeded fixed native buffer size of {_buffer.Memory.Length}.");
+            }
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalNetworkManager.cs =====
+using Liminal.Net.Interfaces;
+using Liminal.Net.Core;
+using System;
+
+namespace Liminal.Net.Core
+{
+    public enum NetworkRole
+    {
+        None,
+        Server,
+        Client, 
+        Host   
+    }
+
+    public class LiminalNetworkManager
+    {
+        #region Singleton
+        public static LiminalNetworkManager Instance;
+        #endregion
+
+        public NetworkRole Role { get; private set; } = NetworkRole.None;
+
+        private readonly ILiminalTransport _transport;
+        public ILiminalTransport Transport => _transport;
+
+        private readonly LiminalTransportConfig _config;
+
+        public LiminalSessionManager SessionManager { get; private set; }
+        public LiminalPacketInterpreter Interpreter { get; private set; }
+
+        private LiminalPacketFramerPipeline _pipeline;
+        private LiminalTicker _ticker;
+
+        public ushort localID => _transport.LocalClientId;
+
+        public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config)
+        {
+            Instance = this;
+
+            if (transport == null) throw new ArgumentNullException(nameof(transport));
+            if (config == null) throw new ArgumentNullException(nameof(config));
+
+            _transport = transport;
+            _config = config;
+
+            Interpreter = new LiminalPacketInterpreter(_config);
+
+            _transport.InitializeTransport(config);
+            _transport.OnShutdown += HandleTransportShutdown;
+
+
+            InitializeSystems();
+        }
+
+        private void HandleTransportShutdown()
+        {
+            LiminalLogger.Log("[Manager] Transport reported shutdown. Resetting state...");
+
+            Shutdown();
+        }
+
+        private void InitializeSystems()
+        {
+            ShutdownSystems();
+
+            LiminalLogger.Log("[Manager] Initializing Network Systems...");
+
+            _pipeline = new LiminalPacketFramerPipeline(_config);
+            SessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
+
+            _ticker = new LiminalTicker(_config);
+        }
+
+        private void ShutdownSystems()
+        {
+            _ticker?.Stop();
+            SessionManager?.Dispose();
+
+            //We actually wanna keep subscriptions around
+            //Interpreter?.ClearAllHandlers();
+
+            //_ticker = null;
+            //SessionManager = null;
+
+            _config.ClientIdResolver.ResetResolver();
+        }
+
+        #region Start Methods
+
+        /// <summary>
+        /// Starts as a Host: Acts as a Server, but also connects a local client to itself.
+        /// </summary>
+        public void StartHost()
+        {
+            if (Role != NetworkRole.None) return;
+
+            InitializeSystems();
+
+            LiminalLogger.Log("[Manager] Starting Host Mode...");
+            Role = NetworkRole.Host;
+
+            _transport.StartServer(_config.Default_Host, _config.Default_Port);
+
+            _transport.StartClient("127.0.0.1", _config.Default_Port);
+
+            _ticker.OnTick += HostTick;
+            _ticker.Start();
+
+
+            LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+        }
+
+        public void StartServer(string ip, int port)
+        {
+            if (Role != NetworkRole.None) return;
+            Role = NetworkRole.Server;
+
+            InitializeSystems();
+
+            LiminalLogger.Log($"[Manager] Starting Dedicated Server on {ip}:{port}");
+            _transport.StartServer(ip, port);
+
+            _ticker.OnTick += ServerTick;
+            _ticker.Start();
+        }
+
+        public void StartClient(string ip, int port)
+        {
+            if (Role != NetworkRole.None) return;
+            Role = NetworkRole.Client;
+
+            InitializeSystems();
+
+            LiminalLogger.Log($"[Manager] Starting Client connecting to {ip}:{port}");
+            _transport.StartClient(ip, port);
+
+            _ticker.OnTick += ClientBackgroundTick;
+            _ticker.Start();
+        }
+
+        public void Disconnect()
+        {
+            if (Role == NetworkRole.None) return;
+            
+            Role = NetworkRole.None;
+
+            _transport.Disconnect();
+
+            ShutdownSystems();
+
+            LiminalLogger.Log("[Manager] Network State Disconnected.");
+        }
+        public void Shutdown()
+        {
+            if (Role == NetworkRole.None) return;
+
+            Role = NetworkRole.None;
+
+            _ticker?.Stop();
+
+            //Maybe we can reset the transport here but for now just shut it down
+            _transport.Shutdown();
+
+            ShutdownSystems();
+
+            LiminalLogger.Log("[Manager] Network State Reset.");
+        }
+        #endregion
+
+        #region Ticking Logic
+
+        private void HostTick()
+        {
+            var sm = SessionManager;
+
+            sm?.Poll();
+            sm?.Flush();
+        }
+
+        private void ServerTick()
+        {
+            var sm = SessionManager;
+
+            sm?.Poll();
+            sm?.Flush();
+        }
+
+        private void ClientBackgroundTick()
+        {
+            //For now
+            var sm = SessionManager;
+
+            sm?.Poll();
+            sm?.Flush();
+        }
+
+        /// <summary>
+        /// Call this from Unity FixedUpdate() on Client or Host.
+        /// </summary>
+        public void ManualPoll()
+        {
+            if (Role == NetworkRole.Client)
+            {
+                SessionManager?.Poll();
+            }
+        }
+
+        #endregion
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalPacketFragmentor.cs =====
+namespace Liminal.Net.Core
+{
+    public class LiminalPacketFragmentor
+    {
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalPacketFramerPipeline.cs =====
+using Liminal.Net.Interfaces;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Liminal.Net.Core
+{
+    public class LiminalPacketFramerPipeline
+    {
+        private readonly List<ILiminalInboundTransformer> _inboundChain;
+        private readonly List<ILiminalOutboundTransformer> _outboundChain;
+
+        public LiminalPacketFramerPipeline(LiminalTransportConfig config)
+        {
+            _inboundChain = config.InboundPacketProcessors.ToList();
+            _outboundChain = config.OutboundPacketProcessors.ToList();
+        }
+
+        public int ExecuteOutboundBatch(LiminalSession session, int rawLength)
+        {
+            session.RawSendBuffer.GetSpan().Slice(0, rawLength).CopyTo(session.OutboundStagingA.GetSpan());
+            int currentLength = rawLength;
+            bool isAtA = true;
+
+            for (int i = 0; i < _outboundChain.Count; i++)
+            {
+                var src = isAtA ? session.OutboundStagingA.GetSpan() : session.OutboundStagingB.GetSpan();
+                var dst = isAtA ? session.OutboundStagingB.GetSpan() : session.OutboundStagingA.GetSpan();
+
+                currentLength = _outboundChain[i].TransformOutbound(src.Slice(0, currentLength), dst, session);
+                isAtA = !isAtA;
+            }
+
+            var finalResult = isAtA ? session.OutboundStagingA.GetSpan() : session.OutboundStagingB.GetSpan();
+            finalResult.Slice(0, currentLength).CopyTo(session.SendBuffer.GetSpan());
+
+            return currentLength;
+        }
+
+        public ReadOnlySpan<byte> ExecuteInboundBatch(LiminalSession session, ReadOnlySpan<byte> input)
+        {
+            input.CopyTo(session.InboundStagingA.GetSpan());
+            int currentLength = input.Length;
+            bool isAtA = true;
+
+            for (int i = 0; i < _inboundChain.Count; i++)
+            {
+                var src = isAtA ? session.InboundStagingA.GetSpan() : session.InboundStagingB.GetSpan();
+                var dst = isAtA ? session.InboundStagingB.GetSpan() : session.InboundStagingA.GetSpan();
+
+                currentLength = _inboundChain[i].TransformInbound(src.Slice(0, currentLength), dst, session);
+                isAtA = !isAtA;
+                if (currentLength <= 0) return ReadOnlySpan<byte>.Empty;
+            }
+
+            var finalBuffer = isAtA ? session.InboundStagingA : session.InboundStagingB;
+            return finalBuffer.GetSpan().Slice(0, currentLength);
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalPacketInterpreter.cs =====
+using MessagePack;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace Liminal.Net.Core
+{
+    public class LiminalPacketInterpreter
+    {
+        private readonly ConcurrentBag<LiminalNativeBufferWriter> _writerPool = new();
+        private readonly ConcurrentDictionary<ushort, IPacketDispatcher> _handlers = new();
+        private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
+        private readonly LiminalTransportConfig _config;
+
+        private interface IPacketDispatcher
+        {
+            void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options);
+            void RemoveUntyped(Delegate callback);
+        }
+
+        private sealed class TypedPacketDispatcher<T> : IPacketDispatcher
+        {
+            private Action<T, ushort> _callbacks;
+            private readonly object _lock = new();
+
+            public void Add(Action<T, ushort> callback)
+            {
+                lock (_lock) { _callbacks += callback; }
+            }
+
+            public void Remove(Action<T, ushort> callback)
+            {
+                lock (_lock) { _callbacks -= callback; }
+            }
+
+            public void RemoveUntyped(Delegate callback)
+            {
+                if (callback is Action<T, ushort> typedCallback)
+                {
+                    Remove(typedCallback);
+                }
+            }
+
+            public void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options)
+            {
+                Action<T, ushort> targets;
+                lock (_lock) { targets = _callbacks; }
+
+                if (targets == null) return;
+
+                T packet = DeserializeSafe(rawData, options, out bool success);
+                if (success)
+                {
+                    targets(packet, sender);
+                }
+            }
+
+            private static T DeserializeSafe(ReadOnlyMemory<byte> data, MessagePackSerializerOptions options, out bool success)
+            {
+                try
+                {
+                    success = true;
+                    return MessagePackSerializer.Deserialize<T>(data, options);
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogWarning($"[Security] Malformed packet {typeof(T).Name}: {ex.Message}");
+                    success = false;
+                    return default;
+                }
+            }
+        }
+
+        private struct Subscription
+        {
+            public ushort PacketId;
+            public Delegate Callback;
+        }
+
+        private sealed class SubscriptionList
+        {
+            private readonly List<Subscription> _list = new();
+            public readonly object Lock = new();
+            public bool IsDisposed = false;
+
+            public int Count => _list.Count;
+
+            public void Add(Subscription sub)
+            {
+                _list.Add(sub);
+            }
+
+            public List<Subscription> DisposeAndClear()
+            {
+                IsDisposed = true;
+                if (_list.Count == 0) return null;
+                var copy = new List<Subscription>(_list);
+                _list.Clear();
+                return copy;
+            }
+
+            public List<Delegate> RemoveAndGetCallbacks(ushort packetId)
+            {
+                var removedCallbacks = new List<Delegate>();
+                if (IsDisposed) return removedCallbacks;
+
+                for (int i = _list.Count - 1; i >= 0; i--)
+                {
+                    if (_list[i].PacketId == packetId)
+                    {
+                        removedCallbacks.Add(_list[i].Callback);
+                        _list.RemoveAt(i);
+                    }
+                }
+                return removedCallbacks;
+            }
+        }
+
+        public LiminalPacketInterpreter(LiminalTransportConfig config)
+        {
+            _config = config;
+        }
+
+        private LiminalNativeBufferWriter RentWriter()
+        {
+            if (_writerPool.TryTake(out var writer))
+            {
+                writer.Clear();
+                return writer;
+            }
+            return new LiminalNativeBufferWriter(_config.MaxPacketSizePerBatch);
+        }
+
+        public void Subscribe<T>(Action<T, ushort> callback, object subscriber)
+        {
+            int idInt = LiminalPacketLibrary.GetId<T>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot subscribe to {typeof(T).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = (ushort)idInt;
+            var subscription = new Subscription { PacketId = packetId, Callback = callback };
+            var spin = new SpinWait();
+
+            while (true)
+            {
+                var subList = _subscribers.GetOrAdd(subscriber, _ => new SubscriptionList());
+
+                lock (subList.Lock)
+                {
+                    if (!subList.IsDisposed)
+                    {
+                        var dispatcher = (TypedPacketDispatcher<T>)_handlers.GetOrAdd(packetId, _ => new TypedPacketDispatcher<T>());
+                        dispatcher.Add(callback);
+
+                        subList.Add(subscription);
+
+                        LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
+                        return;
+                    }
+                }
+
+                // If subList was disposed by UnsubscribeAll or an empty Unsubscribe<T>,
+                // evict the dead instance so the next GetOrAdd generates a fresh one.
+                var entry = new KeyValuePair<object, SubscriptionList>(subscriber, subList);
+                ((ICollection<KeyValuePair<object, SubscriptionList>>)_subscribers).Remove(entry);
+
+                spin.SpinOnce();
+            }
+        }
+
+        public void Unsubscribe<T>(object subscriber)
+        {
+            int idInt = LiminalPacketLibrary.GetId<T>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot unsubscribe from {typeof(T).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = (ushort)idInt;
+
+            if (_subscribers.TryGetValue(subscriber, out var subList))
+            {
+                List<Delegate> callbacksToRemove;
+                lock (subList.Lock)
+                {
+                    callbacksToRemove = subList.RemoveAndGetCallbacks(packetId);
+
+                    // If all subscriptions are gone, mark disposed and evict under lock
+                    if (subList.Count == 0)
+                    {
+                        subList.IsDisposed = true;
+
+                        var entry = new KeyValuePair<object, SubscriptionList>(subscriber, subList);
+                        ((ICollection<KeyValuePair<object, SubscriptionList>>)_subscribers).Remove(entry);
+                    }
+                }
+
+                foreach (var cb in callbacksToRemove)
+                {
+                    RemoveFromHandlers(packetId, cb);
+                }
+            }
+        }
+
+        public void UnsubscribeAll(object subscriber)
+        {
+            if (_subscribers.TryRemove(subscriber, out var subList))
+            {
+                List<Subscription> subscriptions;
+                lock (subList.Lock)
+                {
+                    subscriptions = subList.DisposeAndClear();
+                }
+
+                if (subscriptions != null)
+                {
+                    foreach (var sub in subscriptions)
+                    {
+                        RemoveFromHandlers(sub.PacketId, sub.Callback);
+                    }
+                }
+
+                LiminalLogger.Log($"[Interpreter] Unsubscribed all handlers for {subscriber.GetType().Name}");
+            }
+        }
+
+        public void ClearAllHandlers()
+        {
+            _handlers.Clear();
+            _subscribers.Clear();
+        }
+
+        private void RemoveFromHandlers(ushort packetId, Delegate callback)
+        {
+            if (_handlers.TryGetValue(packetId, out var dispatcher))
+            {
+                dispatcher.RemoveUntyped(callback);
+            }
+        }
+
+#if NET9_0_OR_GREATER
+        public event Action<ushort, ushort, ReadOnlySpan<byte>> OnSendRequest;
+#else
+        public delegate void SendRequestHandler(ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload);
+        public event SendRequestHandler OnSendRequest;
+#endif
+
+        public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        {
+            int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send {typeof(TSendStruct).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, packet);
+                OnSendRequest?.Invoke(targetSessionId, (ushort)idInt, writer.WrittenSpan);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send! {ex.InnerException?.Message}");
+            }
+            finally
+            {
+                _writerPool.Add(writer);
+            }
+        }
+
+        public void SendCommand<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        {
+            if (targetSessionIds.IsEmpty) return;
+
+            int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send {typeof(TSendStruct).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, packet);
+                var payload = writer.WrittenSpan;
+
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                {
+                    OnSendRequest?.Invoke(targetSessionIds[i], (ushort)idInt, payload);
+                }
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send! {ex.InnerException?.Message}");
+            }
+            finally
+            {
+                _writerPool.Add(writer);
+            }
+        }
+
+        public void Dispatch(ushort packetId, ushort sender, ReadOnlyMemory<byte> rawData)
+        {
+            if (_handlers.TryGetValue(packetId, out var dispatcher))
+            {
+                try
+                {
+                    dispatcher.Dispatch(rawData, sender, _options);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Interpreter] Error in handler for ID {packetId}: {ex}");
+                    return;
+                }
+            }
+
+            LiminalLogger.LogWarning($"[Interpreter] Unhandled Packet ID {packetId}");
+        }
+
+        private readonly MessagePackSerializerOptions _options = MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalPacketLibrary.cs =====
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+
+namespace Liminal.Net.Core
+{
+    public static class LiminalPacketLibrary
+    {
+        private static readonly Dictionary<ushort, Type> IdToType = new();
+        private static readonly Dictionary<Type, ushort> TypeToId = new();
+        public static uint RegistryHash { get; private set; }
+
+        static LiminalPacketLibrary() => Initialize();
+
+        private static readonly object InitLock = new();
+        private static bool _isInitialized;
+
+        public static void Initialize()
+        {
+            if (_isInitialized) return;
+            lock (InitLock)
+            {
+                if (_isInitialized) return;
+                InternalInitialize();
+                _isInitialized = true;
+            }
+        }
+
+        private static void InternalInitialize()
+        {
+            if (IdToType.Count > 0) return;
+
+            ForceLoadAllReferencedAssemblies();
+
+            var discovered = new List<(Type Type, ushort Reserved)>();
+
+            // Dont forget to add references to link.xml for unity or otherwise it might get deleted by the stripper
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (assembly.IsDynamic) continue;
+
+                var name = assembly.GetName().Name;
+                if (name == null ||
+                    name.StartsWith("System", StringComparison.Ordinal) ||
+                    name.StartsWith("Microsoft", StringComparison.Ordinal) ||
+                    name.StartsWith("UnityEngine", StringComparison.Ordinal) ||
+                    name.StartsWith("UnityEditor", StringComparison.Ordinal) ||
+                    name.StartsWith("mscorlib", StringComparison.Ordinal) ||
+                    name.StartsWith("Mono", StringComparison.Ordinal) ||
+                    name.StartsWith("netstandard", StringComparison.Ordinal))
+
+                {
+                    continue;
+                }
+
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (ReflectionTypeLoadException e)
+                {
+                    types = e.Types.Where(t => t != null).ToArray()!;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                foreach (var type in types)
+                {
+                    if (!type.IsValueType)
+                    {
+                        continue;
+                    }
+
+                    var attr = type.GetCustomAttribute<LiminalPacketAttribute>(false);
+                    if (attr != null && (type.IsGenericTypeDefinition))
+                    {
+                        LiminalLogger.LogWarning($"[PacketLibrary] Generic packet type '{type.FullName}' is not supported.");
+                        continue;
+                    }
+
+                    if (attr != null) discovered.Add((type, attr.ReservedId));
+                }
+            }
+
+            foreach (var (type, reserved) in discovered.Where(d => d.Reserved != 0))
+            {
+                if (!IdToType.TryAdd(reserved, type))
+                    throw new InvalidOperationException(
+                        $"[Liminal] Reserved packet ID {reserved} claimed by both " +
+                        $"'{type.FullName}' and '{IdToType[reserved].FullName}'.");
+
+                LiminalLogger.Log($"[PacketLibrary] Reserved packet ID {reserved} for '{type.FullName}'.", LiminalLogger.LogLevel.Detailed);
+
+                TypeToId.Add(type, reserved);
+            }
+
+            var auto = discovered.Where(d => d.Reserved == 0)
+                                 .Select(d => d.Type)
+                                 .OrderBy(t => t.FullName, StringComparer.Ordinal)
+                                 .ToArray();
+
+            ushort next = 1;
+            var hashInput = new StringBuilder();
+
+            // Include reserved packets in the hash input too, in a fixed order,
+            // so a reserved-id collision or removal also changes the hash.
+            foreach (var (type, reserved) in discovered.Where(d => d.Reserved != 0).OrderBy(d => d.Reserved))
+                hashInput.Append(reserved).Append(':').Append(type.FullName).Append('|');
+
+            foreach (var type in auto)
+            {
+                while (IdToType.ContainsKey(next))
+                {
+                    if (next == ushort.MaxValue)
+                        throw new InvalidOperationException("[Liminal] Exceeded maximum packet registry capacity (65535).");
+                    next++;
+                }
+
+                IdToType.Add(next, type);
+                TypeToId.Add(type, next);
+                hashInput.Append(next).Append(':').Append(type.FullName).Append('|');
+
+                LiminalLogger.Log($"[PacketLibrary] Registered packet ID {next} for '{type.FullName}'.", LiminalLogger.LogLevel.Detailed);
+
+                if (next == ushort.MaxValue)
+                {
+                    if (auto.Length > IdToType.Count)
+                        throw new InvalidOperationException("[Liminal] Exceeded maximum packet registry capacity (65535).");
+                }
+                else
+                {
+                    next++;
+                }
+            }
+
+            RegistryHash = ComputeFnv1a(hashInput.ToString());
+
+            LiminalLogger.Log($"[PacketLibrary] Registered {IdToType.Count} packets. RegistryHash={RegistryHash:X8}");
+            return;
+        }
+
+        private static uint ComputeFnv1a(string s)
+        {
+            uint hash = 2166136261;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                hash ^= (byte)(c & 0xFF);
+                hash *= 16777619;
+                hash ^= (byte)(c >> 8);
+                hash *= 16777619;
+            }
+            return hash;
+        }
+
+        /// <summary>
+        /// Traverses all compile-time referenced assemblies starting from the entry or library assembly
+        /// to ensure CoreCLR loads them into the current AppDomain before packet type scanning.
+        /// NOTE: This only discovers assemblies that are directly or indirectly referenced in code
+        /// DLLs not mentioned by any type in the call graph won't be discovered and must be loaded explicitly.
+        /// </summary>
+        private static void ForceLoadAllReferencedAssemblies()
+        {
+            var visited = new HashSet<string>();
+            void Walk(Assembly asm)
+            {
+                if (asm == null || asm.IsDynamic || asm.FullName == null || !visited.Add(asm.FullName)) return;
+                foreach (var refName in asm.GetReferencedAssemblies())
+                {
+                    try { Walk(Assembly.Load(refName)); }
+                    catch { /* native/platform assemblies, safe to skip */ }
+                }
+            }
+
+            var entry = Assembly.GetEntryAssembly()
+                     ?? Assembly.GetCallingAssembly()
+                     ?? typeof(LiminalPacketLibrary).Assembly;
+
+            Walk(entry);
+        }
+
+        /// <returns>0 if T is not a registered packet 0 is never a valid packet id.</returns>
+        public static ushort GetId<T>() => TypeToId.TryGetValue(typeof(T), out var id) ? id : (ushort)0;
+        public static bool TryGetType(ushort id, out Type type) => IdToType.TryGetValue(id, out type);
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalSession.cs =====
+using System;
+using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.Threading;
+
+namespace Liminal.Net.Core
+{
+    public sealed class LiminalSession : IDisposable
+    {
+        public ushort Id { get; }
+
+        private int _disposed = 0;
+
+        internal readonly object SendLock = new();
+        internal readonly object ReceiveLock = new();
+
+        internal readonly LiminalNativeBuffer RawSendBuffer;
+        internal int RawSendCursor = 0;
+
+        internal readonly LiminalNativeBuffer SendBuffer;
+
+        internal readonly ConcurrentQueue<InboundPacket> InboundQueue = new();
+
+        // Staging buffers for the Ping-Pong transformation pipeline
+        internal readonly LiminalNativeBuffer InboundStagingA;
+        internal readonly LiminalNativeBuffer InboundStagingB;
+
+        internal readonly LiminalNativeBuffer OutboundStagingA;
+        internal readonly LiminalNativeBuffer OutboundStagingB;
+
+        public LiminalSession(ushort id, int bufferSize)
+        {
+            Id = id;
+            RawSendBuffer = new LiminalNativeBuffer(bufferSize);
+            SendBuffer = new LiminalNativeBuffer(bufferSize);
+
+            InboundStagingA = new LiminalNativeBuffer(bufferSize);
+            InboundStagingB = new LiminalNativeBuffer(bufferSize);
+
+            OutboundStagingA = new LiminalNativeBuffer(bufferSize);
+            OutboundStagingB = new LiminalNativeBuffer(bufferSize);
+        }
+
+        public bool IsDisposed()
+        {
+            return Volatile.Read(ref _disposed) == 1;
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
+
+            lock (SendLock)
+            {
+                RawSendBuffer.ManualDispose();
+                SendBuffer.ManualDispose();
+                OutboundStagingA.ManualDispose();
+                OutboundStagingB.ManualDispose();
+            }
+
+            lock (ReceiveLock)
+            {
+                InboundStagingA.ManualDispose();
+                InboundStagingB.ManualDispose();
+            }
+        }
+    }
+}
+
+public readonly struct InboundPacket
+{
+    public readonly ushort PacketId;
+    public readonly byte[] BackingBuffer;
+    public readonly int Length;
+
+    public InboundPacket(ushort packetId, byte[] backingBuffer, int length)
+    {
+        PacketId = packetId;
+        BackingBuffer = backingBuffer;
+        Length = length;
+    }
+
+    public ReadOnlyMemory<byte> AsMemory() => new ReadOnlyMemory<byte>(BackingBuffer, 0, Length);
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalSessionManager.cs =====
+using Liminal.Net.Interfaces;
+using System;
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+
+namespace Liminal.Net.Core
+{
+    public class LiminalSessionManager : IDisposable
+    {
+        private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
+        private readonly ConcurrentQueue<(ushort SenderId, InboundPacket Packet)> _loopbackQueue = new();
+        private readonly ILiminalTransport _transport;
+        private readonly LiminalTransportConfig _config;
+        private readonly LiminalPacketFramerPipeline _pipeline;
+        private readonly ArrayPool<byte> _privatePool;
+        private volatile bool _sessionManagerDisposed;
+
+        private readonly LiminalPacketInterpreter _interpreter;
+
+        private const bool DisconnectClientOnInboundOverflow = true;
+
+        public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
+        {
+            _transport = transport;
+            _config = config;
+            _pipeline = pipeline;
+            _interpreter = interpreter;
+
+            _privatePool = ArrayPool<byte>.Create(config.MaxPacketSizePerBatch, 50);
+            _loopbackQueue = new ConcurrentQueue<(ushort SenderId, InboundPacket Packet)>();
+
+            _transport.OnMessageReceivedReliable += HandleReliableMessage;
+            _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
+            _transport.OnClientConnected += HandleClientConnected;
+            _transport.OnClientDisconnected += HandleClientDisconnected;
+            _transport.OnLocalClientConnected += HandleLocalConnection;
+            _transport.OnClientKicked += HandleClientDisconnected;
+            _interpreter.OnSendRequest += BufferPacket;
+            _transport.OnShutdown += Dispose;
+        }
+
+        #region Receive Path (Background Threads)
+
+        private void HandleReliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
+        private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
+
+        private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData)
+        {
+            if (_sessionManagerDisposed || !_sessions.TryGetValue(ownerId, out var session)) return;
+
+            try
+            {
+                lock (session.ReceiveLock)
+                {
+                    if (session.IsDisposed()) return;
+
+                    var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
+                    if (processedBatch.IsEmpty) return;
+
+                    int offset = 0;
+                    while (offset + 4 <= processedBatch.Length)
+                    {
+                        if (session.InboundQueue.Count >= _config.MaxPacketCount)
+                        {
+                            LiminalLogger.LogWarning($"[Security] Client {ownerId} exceeded InboundQueue capacity. Dropping connection.");
+
+                            if (_transport.IsServer)
+                            {
+                                _transport.Kick(ownerId);
+                            }
+                            else
+                            {
+                                if (DisconnectClientOnInboundOverflow)
+                                    _transport.Disconnect();
+                            }
+                            return;
+                        }
+
+                        int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
+                        if (totalLen <= 0 || offset + 4 + totalLen > processedBatch.Length) break;
+
+                        ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
+                        int payloadLen = totalLen - 2;
+
+                        byte[] rentedBuffer = _privatePool.Rent(payloadLen);
+                        processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
+
+                        session.InboundQueue.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen));
+
+                        offset += 4 + totalLen;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                LiminalLogger.LogError($"[SessionManager] Error processing inbound packet: {e}");
+
+                if (_transport.IsServer)
+                {
+                    _transport.Kick(ownerId);
+                }
+                else
+                {
+                    _transport.Disconnect();
+                }
+            }
+        }
+
+        #endregion
+
+        #region Write Path (Game Thread)
+
+        public void BufferPacket(ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
+        {
+            if (_sessionManagerDisposed) return;
+
+            if (!_sessions.TryGetValue(targetId, out var session))
+            {
+                if (targetId == _transport.LocalClientId)
+                {
+                    if (_loopbackQueue.Count >= _config.MaxPacketCount)
+                    {
+                        LiminalLogger.LogError($"[SessionManager] Loopback queue overflow for local client. Dropping self-packet.");
+                        return;
+                    }
+
+                    byte[] rentedBuffer = _privatePool.Rent(payload.Length);
+                    payload.CopyTo(rentedBuffer);
+
+                    var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
+
+                    _loopbackQueue.Enqueue((targetId, packet));
+                    return;
+                }
+
+                LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
+                return;
+            }
+
+            int frameSize = 4 + 2 + payload.Length;
+
+            lock (session.SendLock)
+            {
+                if (session.IsDisposed()) return;
+
+                if (session.RawSendCursor + frameSize > session.RawSendBuffer.Memory.Length)
+                {
+                    LiminalLogger.LogError(
+                        $"[Manager] FATAL: Outbound send buffer exceeded for Session {targetId} " +
+                        $"({session.RawSendCursor + frameSize}b > {session.RawSendBuffer.Memory.Length}b). " +
+                        $"Kicking client to prevent state desync. Increase MaxPacketSizePerBatch or throttle outgoing packets.");
+
+                    session.RawSendCursor = 0;
+
+                    if (_transport.IsServer)
+                    {
+                        _transport.Kick(targetId);
+                    }
+                    else
+                    {
+                        _transport.Disconnect();
+                    }
+
+                    return;
+                }
+
+                // [Len][ID][Payload]
+                Span<byte> dest = session.RawSendBuffer.GetSpan().Slice(session.RawSendCursor);
+                BinaryPrimitives.WriteInt32LittleEndian(dest.Slice(0, 4), payload.Length + 2);
+                BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(4, 2), packetId);
+                payload.CopyTo(dest.Slice(6));
+
+                session.RawSendCursor += frameSize;
+            }
+        }
+
+        public void Flush()
+        {
+            if (_sessionManagerDisposed)
+            {
+                RaiseShutdown();
+
+                return;
+            }
+
+            foreach (var session in _sessions.Values)
+            {
+                try
+                {
+                    FlushSession(session);
+                }
+                catch
+                {
+                    LiminalLogger.LogError($"[SessionManager] Error flushing session {session.Id}");
+                    _transport.Kick(session.Id);
+
+                    continue;
+                }
+            }
+        }
+
+        private void FlushSession(LiminalSession session)
+        {
+            lock (session.SendLock)
+            {
+                if (session.RawSendCursor == 0) return;
+                if (session.IsDisposed()) return;
+
+                // Pipeline handles the messy transform logic
+                int bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
+                session.RawSendCursor = 0;
+
+                if (bytesToSend > session.SendBuffer.Memory.Length)
+                {
+                    LiminalLogger.LogError($"[SessionManager] Pipeline output ({bytesToSend}b) exceeds buffer size! Dropping packet.");
+                    return;
+                }
+
+                if (bytesToSend > 0)
+                {
+                    _transport.SendReliable(session.SendBuffer.GetSpan().Slice(0, bytesToSend), session.Id);
+                }
+            }
+        }
+
+        #endregion
+
+        #region Polling Logic (Game Thread)
+        public void Poll()
+        {
+            if (_sessionManagerDisposed)
+            {
+                RaiseShutdown();
+
+                return;
+            }
+
+            //VIRTUAL LOOPBACK Self Sends
+            while (!_loopbackQueue.IsEmpty && _loopbackQueue.TryDequeue(out var loopbackItem))
+            {
+                var senderId = loopbackItem.SenderId;
+                var packet = loopbackItem.Packet;
+
+                try
+                {
+                    _interpreter.Dispatch(packet.PacketId, senderId, packet.AsMemory());
+                }
+                finally
+                {
+                    _privatePool.Return(packet.BackingBuffer);
+                }
+            }
+
+            foreach (var session in _sessions.Values)
+            {
+                if (session.IsDisposed()) continue;
+                if (session.InboundQueue.IsEmpty) continue;
+
+                while (session.InboundQueue.TryDequeue(out var packet))
+                {
+                    try
+                    {
+                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                        continue;
+                    }
+                    finally
+                    {
+                        _privatePool.Return(packet.BackingBuffer);
+                    }
+                }
+            }
+
+            ProcessPendingDisconnects();
+        }
+
+        #endregion
+
+        #region Lifecycle Handlers (Standard)
+        private void HandleLocalConnection(ushort clientId)
+        {
+            if (!_sessionManagerDisposed)
+            {
+                _sessions.TryAdd(ILiminalTransport.SERVER_ID, new LiminalSession(ILiminalTransport.SERVER_ID, _config.MaxPacketSizePerBatch));
+                LiminalLogger.Log($"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
+            }
+        }
+
+        private void HandleClientConnected(ushort id)
+        {
+            if (!_sessionManagerDisposed) _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
+        }
+
+        private readonly ConcurrentQueue<ushort> _pendingDisconnects = new();
+        private void HandleClientDisconnected(ushort id)
+        {
+            _pendingDisconnects.Enqueue(id);
+
+        }
+
+        private void ProcessPendingDisconnects()
+        {
+            while (_pendingDisconnects.TryDequeue(out var id))
+            {
+                if (_sessions.TryRemove(id, out var session))
+                {
+                    session.Dispose();
+
+                    while (session.InboundQueue.TryDequeue(out var packet))
+                    {
+                        _privatePool.Return(packet.BackingBuffer);
+                    }
+                }
+            }
+        }
+
+        private void RaiseShutdown()
+        {
+            if (disposed) return;
+            disposed = true;
+
+            _transport.OnMessageReceivedReliable -= HandleReliableMessage;
+            _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;
+            _transport.OnClientConnected -= HandleClientConnected;
+            _transport.OnClientDisconnected -= HandleClientDisconnected;
+            _transport.OnLocalClientConnected -= HandleLocalConnection;
+            _transport.OnClientKicked -= HandleClientDisconnected;
+            _interpreter.OnSendRequest -= BufferPacket;
+            _transport.OnShutdown -= Dispose;
+
+            while (_loopbackQueue.TryDequeue(out var loopbackItem))
+            {
+                _privatePool.Return(loopbackItem.Packet.BackingBuffer);
+            }
+
+            foreach (var session in _sessions.Values)
+            {
+                session.Dispose();
+
+                while (session.InboundQueue.TryDequeue(out var packet))
+                {
+                    _privatePool.Return(packet.BackingBuffer);
+                }
+            }
+
+            _sessions.Clear();
+            _pendingDisconnects.Clear();
+        }
+
+        private bool disposed = false;
+        public void Dispose()
+        {
+            if (_sessionManagerDisposed) return;
+            _sessionManagerDisposed = true;
+        }
+        #endregion
+
+        #region Test Helpers
+        public int GetActiveSessionCount() => _sessions.Count;
+        #endregion
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalTicker.cs =====
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+namespace Liminal.Net.Core
+{
+    public class LiminalTicker
+    {
+        private readonly LiminalTransportConfig _config;
+        private readonly Stopwatch _stopwatch = new();
+
+        public event Action OnTick;
+
+        private volatile bool _isRunning;
+        private Thread _tickThread;
+
+        public LiminalTicker(LiminalTransportConfig config)
+        {
+            _config = config;
+        }
+
+        public void Start()
+        {
+            if (_isRunning) return;
+            _isRunning = true;
+
+            _tickThread = new Thread(RunLoop)
+            {
+                Name = "Liminal Network Ticker",
+                IsBackground = true,
+                Priority = ThreadPriority.Highest // Bumped priority for stability
+            };
+            _tickThread.Start();
+        }
+
+        public void Stop()
+        {
+            if (!_isRunning) return;
+            _isRunning = false;
+
+            if (_tickThread != null && _tickThread.IsAlive)
+            {
+                if (!_tickThread.Join(500))
+                {
+                    LiminalLogger.LogWarning("[Ticker] Tick thread did not stop gracefully!");
+                }
+            }
+            _tickThread = null;
+        }
+
+        private void RunLoop()
+        {
+            long targetTickTicks = Stopwatch.Frequency / _config.TickRate;
+
+            _stopwatch.Start();
+            long nextTick = _stopwatch.ElapsedTicks;
+
+            while (_isRunning)
+            {
+                long currentTicks = _stopwatch.ElapsedTicks;
+
+                if (currentTicks >= nextTick)
+                {
+                    try
+                    {
+                        OnTick?.Invoke();
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[Ticker] Crash: {ex}");
+                    }
+
+                    nextTick += targetTickTicks;
+
+                    if (currentTicks > nextTick + (targetTickTicks * 3))
+                    {
+                        nextTick = currentTicks + targetTickTicks;
+                    }
+                }
+                else
+                {
+                    long ticksRemaining = nextTick - currentTicks;
+
+                    long msRemaining = ticksRemaining * 1000 / Stopwatch.Frequency;
+
+                    if (msRemaining > 16)
+                    {
+                        Thread.Sleep(1);
+                    }
+                    else
+                    {
+                        Thread.SpinWait(10);
+                    }
+                }
+            }
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalTransportConfig.cs =====
+using Liminal.Net.Interfaces;
+using System.Collections.Generic;
+
+namespace Liminal.Net.Core
+{
+    public class LiminalTransportConfig
+    {
+        /// <summary>
+        /// The default host
+        /// </summary>
+        public string Default_Host = "127.0.0.1";
+        
+        /// <summary>
+        /// The default port
+        /// </summary>
+        public int Default_Port = 7777;
+
+        /// <summary>
+        /// Specifies the maximum time, in seconds, to wait for a connection to be established before timing out.
+        /// </summary>
+        public float ConnectionTimeout = 5.0f;
+
+        /// <summary>
+        /// Specifies the maximum time, in seconds, to wait for a response before timing out.
+        /// </summary>
+        public float ReceiveResponseTimeout = 50.0f;
+
+        /// <summary>
+        /// Specifies the maximum time, in seconds, to wait for a response before timing out.
+        /// </summary>
+        public float SendResponseTimeout = 10.0f;
+
+        /// <summary>
+        /// Specifies the maximum time, in seconds, to wait for a handshake to complete before timing out.
+        /// </summary>
+        public float HandshakeTimeout = 5.0f;
+
+        /// <summary>
+        /// The number of ticks per second
+        /// </summary>
+        public uint TickRate = 30;
+
+        /// <summary>
+        /// The maximum size of a packet buffer that will be sent in a tick
+        /// Exceeding this size will cause a packet drop with a warning
+        /// </summary>
+        public ushort MaxPacketSizePerBatch = ushort.MaxValue;
+
+        /// <summary>
+        /// The maximum size of a handshake
+        /// </summary>
+        public ushort MaxHandshakeSize = 256;
+
+        /// <summary>
+        /// The version of the transport
+        /// </summary>
+        public ushort Version = 1;
+        
+        /// <summary>
+        /// The maximum number of packets that will be held in the inbound queue per connection
+        /// </summary>
+        public int MaxPacketCount = 50;
+
+        /// <summary>
+        /// The maximum number of connections that will be allowed
+        /// </summary>
+        public int MaxConnectionCount = 10;
+
+        public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
+
+        public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();
+
+        public ILiminalTransportFramingProvider TransportFramingProvider { get; set; } = new DefaultTransportFramingProvider();
+
+        public ILiminalClientIdResolver ClientIdResolver;
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\LiminalTransportHeaderWrapper.cs =====
+using Liminal.Net.Interfaces;
+using System;
+using System.Buffers.Binary;
+using System.Diagnostics;
+
+namespace Liminal.Net.Core
+{
+    [Flags]
+    public enum TransportFlags : byte
+    {
+        Unreliable = 0,
+        Reliable = 1 << 0,
+        Fragmented = 1 << 1
+    }
+
+    public enum HeaderReadResult
+    {
+        Success,
+        Incomplete, 
+        Malformed  
+    }
+
+    public static class LiminalTransportHeader
+    {
+        public const int BaseHeaderSize = 5; // 1 byte Flags + 4 bytes Length
+
+        public static int GetHeaderSize<TContext>(ILiminalTransportFramingProvider<TContext> framing = null)
+                    where TContext : struct
+        {
+            return BaseHeaderSize + (framing?.CustomHeaderSize ?? 0);
+        }
+
+        /// <summary>
+        /// Writes both Base and Custom headers into the target span.
+        /// Returns the exact number of header bytes written.
+        /// </summary>
+        public static int WriteHeader<TContext>(Span<byte> destination, TransportFlags flags, int rawPayloadLength, in TContext framingContext, ILiminalTransportFramingProvider<TContext> framing = null) 
+            where TContext : struct
+        {
+            int customSize = framing?.CustomHeaderSize ?? 0;
+            int totalFramedPayload = customSize + rawPayloadLength;
+
+            //Base Header
+            destination[0] = (byte)flags;
+            BinaryPrimitives.WriteInt32LittleEndian(destination.Slice(1, 4), totalFramedPayload);
+
+            //Custom Header
+            if (customSize > 0 && framing != null)
+            {
+                framing.WriteCustomHeader(destination.Slice(BaseHeaderSize, customSize), in framingContext);
+            }
+
+            return BaseHeaderSize + customSize;
+        }
+
+        /// <summary>
+        /// Reads and validates the header from the stream.
+        /// Outputs flags, total header length, and the actual raw payload length.
+        /// </summary>
+        public static HeaderReadResult TryReadHeader<TContext>(ReadOnlySpan<byte> source, ILiminalTransportFramingProvider<TContext> framing, out TransportFlags flags, out int rawPayloadLength, out TContext framingContext)
+            where TContext : struct
+        {
+            flags = TransportFlags.Unreliable;
+            rawPayloadLength = 0;
+            framingContext = default;
+
+            int headerSize = GetHeaderSize(framing);
+
+            if (source.Length < BaseHeaderSize)
+            {
+                return HeaderReadResult.Incomplete;
+            }
+
+            flags = (TransportFlags)source[0];
+            int totalFramedPayload = BinaryPrimitives.ReadInt32LittleEndian(source.Slice(1, 4));
+
+            int customSize = framing?.CustomHeaderSize ?? 0;
+
+            if (totalFramedPayload < customSize)
+            {
+                return HeaderReadResult.Malformed;
+            }
+
+            if (source.Length < headerSize)
+            {
+                return HeaderReadResult.Incomplete;
+            }
+
+            if (customSize > 0 && framing != null)
+            {
+                var customSpan = source.Slice(BaseHeaderSize, customSize);
+                if (!framing.TryReadCustomHeader(customSpan, out framingContext))
+                {
+                    return HeaderReadResult.Malformed;
+                }
+            }
+
+            rawPayloadLength = totalFramedPayload - customSize;
+            return HeaderReadResult.Success;
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\PacketHeader.cs =====
+using System;
+
+namespace Liminal.Net.Core
+{
+    [AttributeUsage(AttributeTargets.Struct, Inherited = false, AllowMultiple = false)]
+    public sealed class LiminalPacketAttribute : Attribute
+    {
+        /// <summary>
+        /// Leave 0 (default) for every normal packet those get an automatic,
+        /// deterministic sequential id from reflection based discovery.
+        /// </summary>
+        public ushort ReservedId { get; init; } = 0;
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Core\TcpHandshakePipeline.cs =====
+using Liminal.Net.BasePackets;
+using Liminal.Net.Interfaces;
+using MessagePack;
+using System;
+using System.Buffers.Binary;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Liminal.Net.Core
+{
+    internal class TcpHandshakePipeline
+    {
+        private readonly ILiminalClientIdResolver _resolver;
+        private readonly float _timeoutSeconds;
+        private readonly int _maxHandshakeSize;
+
+        public TcpHandshakePipeline(ILiminalClientIdResolver resolver,int maxHandshakeSize = 256, float timeoutS = 5)
+        {
+            _resolver = resolver;
+            _timeoutSeconds = timeoutS;
+            _maxHandshakeSize = maxHandshakeSize;
+        }
+
+        public virtual async Task<ushort> TryVerifyClientAsync(TcpClient client, ushort serverVersion)
+        {
+            try
+            {
+                var stream = client.GetStream();
+                TimeSpan timeout = TimeSpan.FromSeconds(_timeoutSeconds);
+
+                using var cts = new CancellationTokenSource(timeout);
+
+                byte[] header = new byte[8];
+
+                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+
+                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+
+                ushort firstPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>();
+
+                if (length <= 0 || length > _maxHandshakeSize || packetId != firstPacketId)
+                {
+                    return Drop(client, $"Security Violation: ID {packetId}, Length {length}");
+                }
+
+                byte[] payload = new byte[length];
+                await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
+
+                var clientInfo = DeserializeSafe<ConnectionHandshakePacketClient>(payload, out bool success);
+                if (!success) return Drop(client, "Malformed Packet 1");
+
+                if (clientInfo.ClientVersion != serverVersion)
+                    return Drop(client, $"Version Mismatch: {clientInfo.ClientVersion}");
+
+                if (clientInfo.PacketRegistryHash != LiminalPacketLibrary.RegistryHash)
+                {
+                    LiminalLogger.LogWarning(
+                        $"[Handshake] Packet registry mismatch with {client.Client.RemoteEndPoint}: " +
+                        $"client={clientInfo.PacketRegistryHash:X8} server={LiminalPacketLibrary.RegistryHash:X8}.");
+
+                    return Drop(client, "Packet Registry Mismatch");
+                }
+
+                ushort assignedId = _resolver.ResolveId(payload);
+                //For encrypted stuff we maybe reassign a cookie or something
+
+                assignedId = assignedId == 0 ? _resolver.GenerateClientId() : assignedId;
+                if (assignedId == 0)
+                {
+                    return Drop(client, "Unable to Assign Client ID");
+                }
+
+                var serverResponse = new ConnectionHandshakePacketServer
+                {
+                    ServerVersion = serverVersion,
+                    AssignedClientID = assignedId,
+                    PacketRegistryHash = LiminalPacketLibrary.RegistryHash
+                };
+
+                ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
+
+                await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token);
+
+                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+
+                ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
+                if (packetId != thirdPacketId || length > _maxHandshakeSize || length <= 0)
+                    return Drop(client, $"Protocol Violation: Expected ACK (ID 3) under {_maxHandshakeSize} bytes.");
+
+                byte[] ackPayload = new byte[length];
+                await stream.ReadExactlyAsync(ackPayload, 0, length, cts.Token);
+
+                var ack = DeserializeSafe<ConnectionHandshakeClientAck>(ackPayload, out success);
+                if (!success || !ack.Ack) return Drop(client, "Client Rejected ID/ACK");
+
+                if(ack.ClientID != assignedId) return Drop(client, "Client Rejected Wrong ID/ACK");
+
+                return assignedId;
+            }
+            catch (OperationCanceledException) { return Drop(client, "Handshake Timeout"); }
+            catch (Exception ex) { return Drop(client, $"Fatal Handshake Error: {ex.Message}"); }
+        }
+
+        public virtual async Task<ushort> TryConnectToServerAsync(TcpClient client, ushort clientVersion)
+        {
+            try
+            {
+                var stream = client.GetStream();
+                TimeSpan timeout = TimeSpan.FromSeconds(_timeoutSeconds);
+                using var cts = new CancellationTokenSource(timeout);
+
+                ushort firstPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>();
+
+                var clientInfo = new ConnectionHandshakePacketClient
+                {
+                    ClientVersion = clientVersion,
+                    PacketRegistryHash = LiminalPacketLibrary.RegistryHash
+                };
+
+                await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token);
+                LiminalLogger.Log("[Handshake] Sent client info to server.");
+
+                byte[] header = new byte[8];
+                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+
+                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+
+                ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
+                if (packetId != secondPacketId || length <= 0 || length > _maxHandshakeSize)
+                {
+                    return Drop(client, $"Unexpected Server Response. ID: {packetId}, Len: {length}");
+                }
+
+                byte[] payload = new byte[length];
+                await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
+
+                var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload, out bool success);
+
+                if (!success)
+                    return Drop(client, "Malformed Server Response.");
+
+                if (serverResponse.ServerVersion != clientVersion)
+                    return Drop(client, $"Server Version Mismatch: {serverResponse.ServerVersion}");
+
+                if (serverResponse.PacketRegistryHash != LiminalPacketLibrary.RegistryHash)
+                    return Drop(client, "Server Packet Registry Mismatch");
+
+                ushort assignedId = serverResponse.AssignedClientID;
+                LiminalLogger.Log($"[Handshake] Server assigned ID: {assignedId}");
+
+                ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
+                var ack = new ConnectionHandshakeClientAck
+                {
+                    ClientID = assignedId,
+                    Ack = true
+                };
+                await SendPacketAsync(stream, thirdPacketId, ack, cts.Token);
+
+                return assignedId;
+            }
+            catch (OperationCanceledException)
+            {
+                return Drop(client, "Connection attempt timed out.");
+            }
+            catch (Exception ex)
+            {
+                return Drop(client, $"Connection failed: {ex.Message}");
+            }
+        }
+
+        private T DeserializeSafe<T>(byte[] data, out bool success)
+        {
+            try
+            {
+                var options = MessagePackSerializerOptions.Standard
+                    .WithSecurity(MessagePackSecurity.UntrustedData);
+                
+                success = true;
+                return MessagePackSerializer.Deserialize<T>(data, options);
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogWarning($"[Security] Deserialization failure for {typeof(T).Name}: {ex.Message}");
+                success = false;
+                return default;
+            }
+        }
+
+        private ushort Drop(TcpClient client, string reason)
+        {
+            LiminalLogger.LogWarning($"[Handshake] Dropping {client.Client.RemoteEndPoint}: {reason}");
+
+            try
+            {
+                client.Client.LingerState = new LingerOption(true, 0); // Force RST
+                client.Close();
+            }
+            catch {  }
+
+            return 0;
+        }
+
+        private async Task SendPacketAsync<T>(NetworkStream stream, int id, T packet, CancellationToken token)
+        {
+            byte[] body = MessagePackSerializer.Serialize(packet);
+            byte[] full = new byte[8 + body.Length];
+
+            BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(0, 4), body.Length);
+            BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(4, 4), id);
+            body.CopyTo(full.AsSpan(8));
+
+            await stream.WriteAsync(full, token);
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Interfaces\ILiminalClientIdResolver.cs =====
+using Liminal.Net.Core;
+using System;
+
+namespace Liminal.Net.Interfaces
+{
+    public interface ILiminalClientIdResolver
+    {
+        public void Initialize(ILiminalTransport transport);
+
+        /// <summary>
+        /// Resolves the client id from the payload 
+        /// NOTE: It can only read from plain text part of the payload
+        /// if the payload is encrypted, you need your own logic
+        /// </summary>
+        /// <param name="payload">The payload</param>
+        /// <returns>The client id</returns>
+        public ushort ResolveId(Span<byte> payload);
+
+        /// <summary>
+        /// Creates a new client id
+        /// </summary>
+        /// <returns>The client id</returns>
+        public ushort GenerateClientId();
+
+        public void ConfirmRegistration(ushort targetId);
+
+        public void ResetResolver();
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Interfaces\ILiminalInboundTransformer.cs =====
+using Liminal.Net.Core;
+using System;
+
+namespace Liminal.Net.Interfaces
+{
+    public interface ILiminalInboundTransformer
+    {
+        /// <summary>
+        /// Processes data from the input span and writes the result to the output span.
+        /// </summary>
+        /// <returns>The length of the transformed data.</returns>
+        
+        public int TransformInbound(ReadOnlySpan<byte> input, Span<byte> output, LiminalSession session);
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Interfaces\ILiminalPacketTransformer.cs =====
+using Liminal.Net.Core;
+using System;
+
+namespace Liminal.Net.Interfaces
+{
+    public interface ILiminalOutboundTransformer
+    {
+        /// <summary>
+        /// Processes data from the input span and writes the result to the output span.
+        /// </summary>
+        /// <returns>The length of the transformed data.</returns>
+        public int TransformOutbound(ReadOnlySpan<byte> input, Span<byte> output, LiminalSession session);
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Interfaces\ILiminalTransport.cs =====
+using Liminal.Net.Core;
+using System;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Liminal.Net.Interfaces
+{
+    public delegate void DataReceivedHandler(ReadOnlySpan<byte> data, ushort clientId);
+    public delegate void TransportEventHandler();
+    public delegate void ClientConnectionHandler(ushort clientId);
+
+    public delegate Task<ushort> HandshakeOrchestrator<T>(T connection, LiminalTransportConfig config);
+
+    public interface ILiminalTransport
+    {
+        public ushort LocalClientId { get; }
+
+        public const ushort SERVER_ID = 0;
+
+        public bool IsServer { get; }
+        public bool IsClient { get; }
+
+        public bool IsConnected { get; }
+
+        #region Connection State
+        public bool IsClientConnected(ushort clientId);
+        public int ConnectedClientCount { get; }
+        #endregion
+
+        #region Initialization
+        public void InitializeTransport(LiminalTransportConfig config);
+        #endregion
+
+        #region Connection
+        public void StartServer(string ip, int port);
+        public void StartClient(string ip, int port);
+        #endregion
+
+        #region Disconnection
+        /// <summary>
+        /// Disconnects the transport connection
+        /// </summary>
+        public void Disconnect();
+
+        /// <summary>
+        /// Server Only: Forcibly removes a specific client.
+        /// </summary>
+        public void Kick(ushort clientId);
+
+        /// <summary>
+        /// Shuts down the transport 
+        /// </summary>
+        public void Shutdown();
+        #endregion
+
+        #region Sending
+        public void SendReliable(Span<byte> data, ushort clientId);
+        public void SendUnreliable(Span<byte> data, ushort clientId);
+        #endregion
+
+        #region Events
+        public event DataReceivedHandler OnMessageReceivedReliable;
+        public event DataReceivedHandler OnMessageReceivedUnreliable;
+
+        public event TransportEventHandler OnServerStarted;
+        public event TransportEventHandler OnShutdown;
+        public event TransportEventHandler OnHandshakeInitialized;
+
+        public event ClientConnectionHandler OnLocalClientConnected;    // When this instance connects to a server
+        public event ClientConnectionHandler OnLocalClientDisconnected; // When this instance's local connection drops
+        public event ClientConnectionHandler OnClientConnected;         // When a remote client joins this server
+        public event ClientConnectionHandler OnClientDisconnected;
+        public event ClientConnectionHandler OnClientKicked;
+        #endregion
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Interfaces\ILiminalTransportFramingProvider.cs =====
+using Liminal.Net.Transports;
+using System;
+
+namespace Liminal.Net.Interfaces
+{
+    public interface ILiminalTransportFramingProvider
+    {
+        int CustomHeaderSize { get; }
+    }
+
+    public interface ILiminalTransportFramingProvider<TContext> : ILiminalTransportFramingProvider where TContext : struct
+    {
+        /// <summary>
+        /// Writes custom metadata into the segment immediately after the base header.
+        /// </summary>
+        void WriteCustomHeader(Span<byte> destination, in TContext context);
+
+        /// <summary>
+        /// Reads and validates the custom metadata segment.
+        /// </summary>
+        bool TryReadCustomHeader(ReadOnlySpan<byte> source, out TContext context);
+    }
+
+    public sealed class DefaultTransportFramingProvider : ILiminalTransportFramingProvider<EmptyFramingContext>
+    {
+        public int CustomHeaderSize => 0;
+        public void WriteCustomHeader(Span<byte> destination, in EmptyFramingContext context) { }
+
+        public bool TryReadCustomHeader(ReadOnlySpan<byte> source, out EmptyFramingContext context)
+        {
+            context = default;
+            return true;
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Misc\LiminalAtomicHelpers.cs =====
+using System;
+using System.Threading;
+
+namespace Liminal.Net.Misc
+{
+    public static class LiminalAtomicHelpers
+    {
+        #region Atomic Helper Methods
+        public static void SafeAdd<TDelegate>(ref TDelegate field, TDelegate value) where TDelegate : Delegate
+        {
+            TDelegate current = field;
+            while (true)
+            {
+                TDelegate combined = (TDelegate)Delegate.Combine(current, value);
+                TDelegate original = Interlocked.CompareExchange(ref field, combined, current);
+                if (original == current) break;
+                current = original;
+            }
+        }
+        public static void SafeRemove<TDelegate>(ref TDelegate field, TDelegate value) where TDelegate : Delegate
+        {
+            TDelegate current = field;
+            while (true)
+            {
+                TDelegate removed = (TDelegate)Delegate.Remove(current, value);
+                TDelegate original = Interlocked.CompareExchange(ref field, removed, current);
+                if (original == current) break;
+                current = original;
+            }
+        }
+        #endregion
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\obj\Debug\net8.0\.NETCoreApp,Version=v8.0.AssemblyAttributes.cs =====
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETCoreApp,Version=v8.0", FrameworkDisplayName = ".NET 8.0")]
+
+===== F:\Projects\Liminal.Net\Liminal.Net\obj\Debug\net8.0\Liminal.Net.AssemblyInfo.cs =====
+//------------------------------------------------------------------------------
+// <auto-generated>
+//     This code was generated by a tool.
+//
+//     Changes to this file may cause incorrect behavior and will be lost if
+//     the code is regenerated.
+// </auto-generated>
+//------------------------------------------------------------------------------
+
+using System;
+using System.Reflection;
+
+[assembly: System.Reflection.AssemblyCompanyAttribute("Liminal.Net")]
+[assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
+[assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+a9ca624face00cb4ad7b0f599e34b0c60b2f1527")]
+[assembly: System.Reflection.AssemblyProductAttribute("Liminal.Net")]
+[assembly: System.Reflection.AssemblyTitleAttribute("Liminal.Net")]
+[assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
+
+// Generated by the MSBuild WriteCodeFragment class.
+
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Program.cs =====
+using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.Core;
+using Liminal.Net.Test;
+using Liminal.Net.Transports;
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Liminal.Net
+{
+    public static class Program
+    {
+        private static LiminalNetworkManager _manager;
+        private static ChatPacket? _lastPacket;
+        private static ushort _lastTargetId;
+        private static CancellationTokenSource _spamCts;
+        private static readonly PacketMonitor _monitor = new PacketMonitor();
+        private static long _totalSent = 0;
+
+        public static void Main()
+        {
+            Console.Title = "Liminal.Net Console";
+            LiminalLogger.Log("Initializing...");
+
+            var config = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = 7777,
+                TickRate = 10,
+                MaxPacketSizePerBatch = 4096,
+                InboundPacketProcessors = new(),
+                OutboundPacketProcessors = new(),
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new TcpTransport();
+            _manager = new LiminalNetworkManager(transport, config);
+            _manager.Interpreter.Subscribe<ChatPacket>(OnChatReceived, "Program");
+            _manager.Interpreter.Subscribe<FilePacket>(OnFileReceived, "Program");
+
+            Console.WriteLine("Commands: host, server, connect, send {t} {id}, sendfile {file} {id}, spam {pps}, stopspam, reset, disconnect, kick {id}");
+
+            bool running = true;
+            string inputBuffer = "";
+
+            while (running)
+            {
+                if (_manager.Role != NetworkRole.None)
+                {
+                    _manager.ManualPoll();
+                }
+
+                if (Console.KeyAvailable)
+                {
+                    var key = Console.ReadKey(intercept: true);
+                    if (key.Key == ConsoleKey.Enter)
+                    {
+                        Console.WriteLine();
+                        ProcessCommand(inputBuffer, config);
+                        inputBuffer = "";
+                    }
+                    else if (key.Key == ConsoleKey.Backspace && inputBuffer.Length > 0)
+                    {
+                        inputBuffer = inputBuffer[..^1];
+                        Console.Write("\b \b");
+                    }
+                    else if (key.Key == ConsoleKey.Escape)
+                    {
+                        running = false;
+                    }
+                    else if (key.Key != ConsoleKey.Backspace && key.Key != ConsoleKey.Enter)
+                    {
+                        inputBuffer += key.KeyChar;
+                        Console.Write(key.KeyChar);
+                    }
+                }
+
+                _monitor.UpdateTitle(_totalSent);
+            }
+
+            _manager.Shutdown();
+        }
+
+        private static void ProcessCommand(string input, LiminalTransportConfig config)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return;
+            string[] args = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            string cmd = args[0].ToLower();
+
+            switch (cmd)
+            {
+                case "host": _manager.StartHost(); break;
+                case "server": _manager.StartServer(config.Default_Host, config.Default_Port); break;
+                case "connect": _manager.StartClient(config.Default_Host, config.Default_Port); break;
+                case "disconnect":
+                    StopSpam();
+                    _manager.Disconnect();
+                    break;
+                case "send": HandleSendCommand(args); break;
+                case "sendfile": HandleSendFileCommand(args); break;
+                case "spam": HandleSpamCommand(args); break;
+                case "stopspam": StopSpam(); break;
+                case "kick": HandleKickCommand(args); break;
+                case "reset":
+                    _monitor.Reset();
+                    Interlocked.Exchange(ref _totalSent, 0);
+                    Console.WriteLine("Counters reset.");
+                    break;
+                case "localid":
+                    Console.WriteLine($"Local ID: {_manager.Transport.LocalClientId}");
+                    break;
+            }
+        }
+
+        private static void StopSpam()
+        {
+            if (_spamCts != null)
+            {
+                _spamCts.Cancel();
+                _spamCts.Dispose();
+                _spamCts = null;
+                Console.WriteLine("Spam Task Terminated.");
+            }
+        }
+
+        private static void HandleKickCommand(string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Console.WriteLine("Usage: kick {targetid}");
+                return;
+            }
+
+            if (ushort.TryParse(args[1], out ushort targetId))
+            {
+                _manager.Transport.Kick(targetId);
+                Console.WriteLine($"Kicked client {targetId}.");
+            }
+            else
+            {
+                Console.WriteLine("Invalid target ID.");
+            }
+        }
+
+        private static void HandleSendCommand(string[] args)
+        {
+            if (args.Length < 3) return;
+            if (ushort.TryParse(args[^1], out ushort targetId))
+            {
+                string message = string.Join(" ", args[1..^1]);
+                _lastPacket = new ChatPacket { Message = message };
+                _lastTargetId = targetId;
+                _manager.Interpreter.SendCommand(targetId, _lastPacket.Value);
+                Interlocked.Increment(ref _totalSent);
+            }
+        }
+
+        private static void HandleSendFileCommand(string[] args)
+        {
+            if (args.Length < 3)
+            {
+                Console.WriteLine("Usage: sendfile {filename} {targetid}");
+                return;
+            }
+
+            string fileName = args[1];
+            if (!ushort.TryParse(args[2], out ushort targetId))
+            {
+                Console.WriteLine("Invalid target ID.");
+                return;
+            }
+
+            string filePath = Path.Combine(Environment.CurrentDirectory, fileName);
+
+            if (!File.Exists(filePath))
+            {
+                Console.WriteLine($"File not found: {filePath}");
+                return;
+            }
+
+            try
+            {
+                byte[] fileData = File.ReadAllBytes(filePath);
+
+                var packet = new FilePacket
+                {
+                    FileName = Path.GetFileName(filePath),
+                    Data = fileData
+                };
+
+                _manager.Interpreter.SendCommand(targetId, packet);
+                Interlocked.Increment(ref _totalSent);
+
+                Console.WriteLine($"Sent file '{packet.FileName}' ({fileData.Length} bytes) to {targetId}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to send file: {ex.Message}");
+            }
+        }
+
+        private static void HandleSpamCommand(string[] args)
+        {
+            if (!_lastPacket.HasValue || args.Length < 2 || !int.TryParse(args[1], out int rate)) return;
+
+            StopSpam();
+            _spamCts = new CancellationTokenSource();
+            var token = _spamCts.Token;
+
+            long frequency = Stopwatch.Frequency;
+            long ticksPerPacket = frequency / rate;
+
+            Task.Run(() =>
+            {
+                Console.WriteLine($"Spamming {rate}/s to {_lastTargetId} (High Precision Mode)...");
+                try
+                {
+                    long nextPacketTime = Stopwatch.GetTimestamp();
+
+                    while (!token.IsCancellationRequested && _manager.Role != NetworkRole.None)
+                    {
+                        long currentTime = Stopwatch.GetTimestamp();
+
+                        if (currentTime >= nextPacketTime)
+                        {
+                            _manager.Interpreter.SendCommand(_lastTargetId, _lastPacket.Value);
+                            Interlocked.Increment(ref _totalSent);
+
+                            nextPacketTime += ticksPerPacket;
+
+                            if (currentTime > nextPacketTime + (ticksPerPacket * 5))
+                            {
+                                nextPacketTime = currentTime + ticksPerPacket;
+                            }
+                        }
+                        else
+                        {
+                            long ticksRemaining = nextPacketTime - currentTime;
+
+                            if (ticksRemaining > (frequency / 64))
+                            {
+                                Thread.Sleep(1);
+                            }
+                            else
+                            {
+                                Thread.SpinWait(10);
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Spam error: " + ex.Message);
+                }
+            }, token);
+        }
+
+        private static void OnChatReceived(ChatPacket packet, ushort senderId)
+        {
+            _monitor.RecordPacket();
+            if (_monitor.GetCurrentPPS() < 3)
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"\n[MSG] {senderId}: {packet.Message}");
+                Console.ResetColor();
+            }
+        }
+
+        private static void OnFileReceived(FilePacket packet, ushort senderId)
+        {
+            _monitor.RecordPacket();
+            try
+            {
+                string saveDir = Path.Combine(Environment.CurrentDirectory, "ReceivedFiles");
+                Directory.CreateDirectory(saveDir);
+
+                string savePath = Path.Combine(saveDir, packet.FileName);
+                File.WriteAllBytes(savePath, packet.Data);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\n[FILE] Received '{packet.FileName}' ({packet.Data.Length} bytes) from {senderId}. Saved to /ReceivedFiles/");
+                Console.ResetColor();
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\n[FILE ERROR] Failed to save received file: {ex.Message}");
+                Console.ResetColor();
+            }
+        }
+    }
+
+    public class PacketMonitor
+    {
+        private readonly ConcurrentQueue<DateTime> _arrivalTimes = new ConcurrentQueue<DateTime>();
+        private long _totalReceived = 0;
+
+        public void RecordPacket()
+        {
+            _arrivalTimes.Enqueue(DateTime.Now);
+            Interlocked.Increment(ref _totalReceived);
+        }
+
+        public void Reset()
+        {
+            Interlocked.Exchange(ref _totalReceived, 0);
+            while (_arrivalTimes.TryDequeue(out _)) { }
+        }
+
+        public int GetCurrentPPS()
+        {
+            DateTime cutoff = DateTime.Now.AddSeconds(-1);
+            while (_arrivalTimes.TryPeek(out DateTime time) && time < cutoff) _arrivalTimes.TryDequeue(out _);
+            return _arrivalTimes.Count;
+        }
+
+        public void UpdateTitle(long sentByMe)
+        {
+            int pps = GetCurrentPPS();
+            long recv = Interlocked.Read(ref _totalReceived);
+
+            Console.Title = $"PPS: {pps} | Sent: {sentByMe} | Recv: {recv}";
+        }
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Test\TestPackets.cs =====
+using Liminal.Net.Core;
+using MessagePack;
+
+namespace Liminal.Net.Test
+{
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct ChatPacket
+    {
+        [Key(0)]
+        public string Message;
+    }
+    [LiminalPacket]
+    [MessagePackObject]
+    public struct FilePacket
+    {
+        [Key(0)]
+        public string FileName;
+
+        [Key(1)]
+        public byte[] Data;
+    }
+}
+
+===== F:\Projects\Liminal.Net\Liminal.Net\Transports\TcpTransport.cs =====
+using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
+using Liminal.Net.Misc;
+using System;
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Liminal.Net.Transports
+{
+    //Example empty framing context
+    public readonly struct EmptyFramingContext { }
+    public class TcpTransport : TcpTransport<EmptyFramingContext> { }
+
+    /// <summary>
+    /// It uses tcp by default
+    /// </summary>
+    public class TcpTransport<TContext> : ILiminalTransport where TContext : struct
+    {
+        protected volatile ushort _localClientId = 0;
+        public ushort LocalClientId => _localClientId;
+
+        protected volatile bool _isConnected = false;
+        public bool IsConnected => _isConnected;
+
+        protected volatile bool _isServer = false;
+        public bool IsServer => _isServer;
+
+        protected volatile bool _isClient = false;
+        public bool IsClient => _isClient;
+
+        protected TcpListener _listener;
+
+        public HandshakeOrchestrator<TcpClient> ServerHandshaker { get; set; } = DefaultHandshakes.ServerTcpHandshake;
+        public HandshakeOrchestrator<TcpClient> ClientHandshaker { get; set; } = DefaultHandshakes.ClientTcpHandshake;
+
+        #region Events
+        protected DataReceivedHandler _onReliable;
+        public event DataReceivedHandler OnMessageReceivedReliable
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onReliable, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onReliable, value);
+        }
+
+        protected DataReceivedHandler _onUnreliable;
+        public event DataReceivedHandler OnMessageReceivedUnreliable
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onUnreliable, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onUnreliable, value);
+        }
+
+        protected TransportEventHandler _onServerStarted;
+        public event TransportEventHandler OnServerStarted
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onServerStarted, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onServerStarted, value);
+        }
+
+        protected TransportEventHandler _onShutdown;
+        public event TransportEventHandler OnShutdown
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onShutdown, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onShutdown, value);
+        }
+
+        protected TransportEventHandler _onHandshakeInitialized;
+        public event TransportEventHandler OnHandshakeInitialized
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onHandshakeInitialized, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onHandshakeInitialized, value);
+        }
+
+        protected ClientConnectionHandler _onLocalClientConnected;
+        public event ClientConnectionHandler OnLocalClientConnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLocalClientConnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLocalClientConnected, value);
+        }
+
+        protected ClientConnectionHandler _onLocalClientDisconnected;
+        public event ClientConnectionHandler OnLocalClientDisconnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLocalClientDisconnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLocalClientDisconnected, value);
+        }
+
+        protected ClientConnectionHandler _onClientConnected;
+        public event ClientConnectionHandler OnClientConnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientConnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientConnected, value);
+        }
+
+        protected ClientConnectionHandler _onClientDisconnected;
+        public event ClientConnectionHandler OnClientDisconnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientDisconnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientDisconnected, value);
+        }
+
+        protected ClientConnectionHandler _onClientKicked;
+        public event ClientConnectionHandler OnClientKicked
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientKicked, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientKicked, value);
+        }
+        #endregion
+
+        protected LiminalTransportConfig _config;
+        public LiminalTransportConfig Config => _config;
+
+        protected ILiminalClientIdResolver _clientIdResolver;
+        public ILiminalClientIdResolver ClientIdResolver => _clientIdResolver;
+
+        internal readonly ConcurrentDictionary<ushort, TcpClient> _sockets = new();
+
+        private int _isShuttingDown = 0;
+
+        public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
+        public int ConnectedClientCount => _sockets.Count;
+
+        /// <summary>
+        /// Lifecycle state for outbound frames. Mutate this directly on the transport if context needs changing.
+        /// </summary>
+        public TContext OutboundContext { get; set; }
+
+        protected ILiminalTransportFramingProvider<TContext> _framing;
+        private int _totalHeaderSize;
+
+        #region Initialization
+        public virtual void InitializeTransport(LiminalTransportConfig config)
+        {
+            _config = config;
+
+            _framing = config.TransportFramingProvider as ILiminalTransportFramingProvider<TContext>;
+
+            _totalHeaderSize = LiminalTransportHeader.GetHeaderSize(_framing);
+
+            _clientIdResolver = _config.ClientIdResolver;
+            _clientIdResolver?.Initialize(this);
+        }
+
+        public virtual void StartServer(string ip, int port)
+        {
+            IPAddress adress = string.IsNullOrEmpty(ip) ? IPAddress.Any : IPAddress.Parse(ip);
+            _listener = new TcpListener(adress, port);
+            _listener.Start(100);
+
+            _isServer = true;
+            _isConnected = true;
+            _onServerStarted?.Invoke();
+
+            _ = Task.Run(() => AcceptConnectionsAsync(_listener));
+            LiminalLogger.Log($"Server started on {ip}:{port}");
+        }
+
+        public virtual void StartClient(string ip, int port)
+        {
+            try
+            {
+                TcpClient client = new TcpClient();
+                client.NoDelay = true;
+
+                _isClient = true;
+
+                _ = Task.Run(() => TryToConnectAsync(client, (ip,port)));
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Transport] Client connection failed: {ex.Message}");
+            }
+        }
+        #endregion
+
+        #region Shutdown & Disconnect & Kick
+        public virtual void Disconnect()
+        {
+            if (_isServer)
+            {
+                LiminalLogger.Log("[Transport] Server initiated Shutdown.");
+                Shutdown();
+                return;
+            }
+
+            if (!_isServer && _isConnected)
+            {
+                _onLocalClientDisconnected?.Invoke(_localClientId);
+
+                Shutdown();
+                LiminalLogger.Log($"[Transport] Disconnected from server.");
+            }
+        }
+        public virtual void Kick(ushort clientId)
+        {
+            if (!_isServer) return;
+
+            // Dedicated server self target check
+            if (clientId == ILiminalTransport.SERVER_ID)
+            {
+                LiminalLogger.LogError("[Transport] Attempted to kick Server ID (0). Internal server error.");
+                return;
+            }
+
+            // Host client self target check
+            if (clientId == LocalClientId && LocalClientId != ILiminalTransport.SERVER_ID)
+            {
+                LiminalLogger.LogWarning($"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
+                Shutdown();
+                return;
+            }
+
+            if (_sockets.TryGetValue(clientId, out var clientSocket))
+            {
+                _onClientKicked?.Invoke(clientId);
+                try { clientSocket.Close(); } catch { }
+                LiminalLogger.Log($"[Transport] Kicked client {clientId}.");
+            }
+            else
+            {
+                LiminalLogger.LogError($"[Transport] Couldn't find socket for client {clientId}");
+            }
+        }
+        public virtual void Shutdown()
+        {
+            if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+            {
+                return; // Already shutting down
+            }
+            try
+            {
+                _isConnected = false;
+                _isServer = false;
+                _isClient = false;
+                _localClientId = 0;
+
+                foreach (var id in _sockets.Keys)
+                {
+                    if (_sockets.TryRemove(id, out var clientSocket))
+                    {
+                        try
+                        {
+                            clientSocket.Close();
+                        }
+                        catch { }
+
+                        LiminalLogger.Log($"[Transport] Client {id} cleared.");
+                    }
+                }
+                if (_listener != null)
+                {
+                    try
+                    {
+                        _listener.Stop();
+                    }
+                    catch { }
+                    _listener = null;
+                }
+                _onShutdown?.Invoke();
+
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _isShuttingDown, 0);
+                Volatile.Write(ref _totalConnections, 0);
+            }
+        }
+        #endregion
+
+        #region Sending
+        private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
+        public virtual void SendReliable(Span<byte> data, ushort targetId)
+        {
+            SendInternal(data, targetId, TransportFlags.Reliable);
+        }
+
+        /// <summary>
+        /// TCP is a reliable transport it will default to SendReliable
+        /// </summary>
+        public virtual void SendUnreliable(Span<byte> data, ushort targetId)
+        {
+            SendInternal(data, targetId, TransportFlags.Unreliable);
+        }
+
+        protected virtual void SendInternal(Span<byte> data, ushort targetId, TransportFlags flags)
+        {
+            int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
+            int totalSize = headerSize + data.Length;
+
+            TContext contextSnapshot = OutboundContext;
+
+            var rentedBuffer = _sendBytePool.Rent(totalSize);
+            try
+            {
+                if (_sockets.TryGetValue(targetId, out var socket))
+                {
+
+                    Span<byte> fullPacket = rentedBuffer.AsSpan(0, totalSize);
+
+                    LiminalTransportHeader.WriteHeader(fullPacket, flags, data.Length, in contextSnapshot, _framing);
+
+                    data.CopyTo(fullPacket.Slice(headerSize));
+
+                    try
+                    {
+                        socket.GetStream().Write(fullPacket);
+                    }
+                    catch (Exception ex) when (ex is ObjectDisposedException || ex is InvalidOperationException || ex is IOException || ex is SocketException)
+                    {
+                        LiminalLogger.LogWarning($"[Transport] Failed to write to {targetId}, socket closed concurrently.");
+
+                        if (IsServer) Kick(targetId);
+                        else Shutdown();
+                    }
+                }
+                else
+                {
+                    LiminalLogger.LogError($"[Transport] Couldn't find socket for client {targetId}");
+                    if (IsServer) Kick(targetId);
+                    else Shutdown();
+                }
+            }
+            finally
+            {
+                _sendBytePool.Return(rentedBuffer);
+            }
+        }
+
+        protected async Task TryToConnectAsync(TcpClient client, (string ip, int port) connectionInfo)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
+
+                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, cts.Token);
+
+                _onHandshakeInitialized?.Invoke();
+
+                // Run the orchestrator
+                _localClientId = await ClientHandshaker(client, _config);
+
+                if (_localClientId != 0)
+                {
+                    _isConnected = true;
+
+                    PromoteLocalClient(_localClientId, client);
+                }
+                else
+                {
+                    client.Close();
+                    _onLocalClientDisconnected?.Invoke(0);
+
+                    Shutdown();
+                }
+            }
+            catch (Exception ex)
+            {
+                try { client.Close(); } catch { } 
+                LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
+                Shutdown();
+            }
+        }
+        #endregion
+
+        #region Receiving
+
+        private int _totalConnections = 0;
+        protected async Task AcceptConnectionsAsync(TcpListener listener)
+        {
+            while (IsConnected && _isServer && listener == _listener)
+            {
+                TcpClient client = null;
+                bool counted = false;  
+                bool handedOff = false; 
+
+                try
+                {
+                    client = await listener.AcceptTcpClientAsync();
+                    client.NoDelay = true;
+
+                    int total = Interlocked.Increment(ref _totalConnections);
+                    counted = true;
+
+                    if (total > _config.MaxConnectionCount)
+                    {
+                        LiminalLogger.LogWarning($"[Transport] Max connection count reached ({_config.MaxConnectionCount}). Disconnecting client.");
+                        continue; 
+                    }
+
+                    var acceptedClient = client;
+
+                    _ = Task.Run(async () =>
+                    {
+                        bool promoted = false;
+                        try
+                        {
+                            _onHandshakeInitialized?.Invoke();
+                            ushort finalId = await ServerHandshaker(acceptedClient, _config);
+
+                            if (finalId != 0)
+                            {
+                                PromoteClient(finalId, acceptedClient);
+                                promoted = true;
+                            }
+                            else
+                            {
+                                try { acceptedClient.Close(); } catch { }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError($"[Transport] Handshake error: {ex.Message}");
+                            try { acceptedClient.Close(); } catch { }
+                        }
+                        finally
+                        {
+                            if (!promoted)
+                            {
+                                Interlocked.Decrement(ref _totalConnections);
+                            }
+                        }
+                    });
+
+                    handedOff = true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (SocketException ex)
+                {
+                    if (!_isConnected || !_isServer || listener != _listener) break;
+                    LiminalLogger.LogError($"[Transport] Accept Socket Error: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    if (!_isConnected) break;
+                    LiminalLogger.LogError($"[Transport] Accept error: {ex.Message}");
+                }
+                finally
+                {
+                    if (client != null && !handedOff)
+                    {
+                        if (counted) Interlocked.Decrement(ref _totalConnections);
+                        try { client.Close(); } catch { }
+                    }
+                }
+            }
+        }
+
+        private void PromoteClient(ushort clientId, TcpClient client)
+        {
+            client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
+
+            _sockets.AddOrUpdate(clientId, client, (key, old) =>
+            {
+                LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
+                try { old.Close(); } catch { }
+
+                Interlocked.Decrement(ref _totalConnections);
+
+                return client;
+            });
+
+            _clientIdResolver.ConfirmRegistration(clientId);
+
+            _onClientConnected?.Invoke(clientId);
+
+            _ = Task.Run(async () => ReceiveLoop(clientId, client));
+
+            LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
+        }
+        private void PromoteLocalClient(ushort assignedId, TcpClient client)
+        {
+            client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
+
+            _sockets[ILiminalTransport.SERVER_ID] = client;
+
+            _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client));
+
+            _onLocalClientConnected?.Invoke(assignedId);
+
+            LiminalLogger.Log($"[Transport] Successfully connected to server. Local ID: {assignedId}");
+        }
+
+        private async Task ReceiveLoop(ushort incomingId, TcpClient client)
+        {
+            using var ingestBuffer = new LiminalNativeBuffer(_config.MaxPacketSizePerBatch * 2);
+            var stream = client.GetStream();
+            int bytesInBuffer = 0;
+
+            using var readCts = new CancellationTokenSource();
+            try
+            {
+                client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            }
+            catch
+            {
+                LiminalLogger.LogWarning($"[Transport] Failed to set keep alive on socket.");
+            }
+
+            try
+            {
+                while (client.Connected && _isConnected)
+                {
+                    int remainingSpace = ingestBuffer.Memory.Length - bytesInBuffer;
+                    if (remainingSpace <= 0)
+                    {
+                        LiminalLogger.LogError($"[Transport] Buffer overflow on {incomingId}");
+                        break;
+                    }
+
+                    Memory<byte> receiveTarget = ingestBuffer.Memory.Slice(bytesInBuffer, remainingSpace);
+
+                    int read = 0;
+
+                    if (_config.ReceiveResponseTimeout > 0)
+                    {
+                        readCts.CancelAfter(TimeSpan.FromSeconds(_config.ReceiveResponseTimeout));
+                        read = await stream.ReadAsync(receiveTarget, readCts.Token);
+
+                        // Pause timer while parsing packets
+                        if (!readCts.IsCancellationRequested)
+                        {
+                            readCts.CancelAfter(Timeout.InfiniteTimeSpan);
+                        }
+                    }
+                    else
+                    {
+                        read = await stream.ReadAsync(receiveTarget);
+                    }
+
+                    if (read <= 0) break;
+
+                    bytesInBuffer += read;
+
+#if NET9_0_OR_GREATER
+                    Span<byte> bufferSpan = ingestBuffer.GetSpan();
+                    int offset = 0;
+                    int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
+
+                    while (bytesInBuffer - offset >= LiminalTransportHeader.BaseHeaderSize)
+                    {
+                        var currentSlice = bufferSpan.Slice(offset, bytesInBuffer - offset);
+
+                        var result = LiminalTransportHeader.TryReadHeader(currentSlice, _framing, out var flags, out int payloadLength, out TContext framingContext);
+
+                        if (result == HeaderReadResult.Incomplete)
+                        {
+                            //Not enough bytes yet
+                            break;
+                        }
+
+                        if (result == HeaderReadResult.Malformed)
+                        {
+                            LiminalLogger.LogError($"[Transport] Malformed frame header received from {incomingId}. Kicking connection.");
+                            Kick(incomingId);
+                            return;
+                        }
+
+                        if (payloadLength < 0 || payloadLength > _config.MaxPacketSizePerBatch)
+                        {
+                            LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
+                            Kick(incomingId);
+                            return;
+                        }
+
+                        int totalFrameSize = headerSize + payloadLength;
+                        if (bytesInBuffer - offset < totalFrameSize)
+                        {
+                            //waiting on the remaining payload bytes
+                            break;
+                        }
+
+                        var payloadSpan = bufferSpan.Slice(offset + headerSize, payloadLength);
+
+                        if ((flags & TransportFlags.Fragmented) != 0)
+                        {
+                            // Route to Fragmentor
+                        }
+                        else if ((flags & TransportFlags.Reliable) != 0)
+                        {
+                            _onReliable?.Invoke(payloadSpan, incomingId);
+                        }
+                        else
+                        {
+                            _onUnreliable?.Invoke(payloadSpan, incomingId);
+                        }
+
+                        offset += totalFrameSize;
+                    }
+
+                    if (offset > 0)
+                    {
+                        int remaining = bytesInBuffer - offset;
+                        if (remaining > 0)
+                        {
+                            bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan.Slice(0, remaining));
+                        }
+                        bytesInBuffer = remaining;
+                    }
+#else
+                    ProcessIngestBufferSynchronous(incomingId, ingestBuffer, ref bytesInBuffer);
+
+                    // If the connection was kicked inside the sync method, exit the receive loop
+                    if (!IsClientConnected(incomingId) && incomingId != ILiminalTransport.SERVER_ID)
+                    {
+                        return;
+                    }
+#endif
+                }
+            }
+            catch (OperationCanceledException) when (readCts.IsCancellationRequested)
+            {
+                LiminalLogger.LogWarning($"[Transport] Client {incomingId} timed out (exceeded {_config.ReceiveResponseTimeout}s).");
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException || ex is IOException || ex is SocketException)
+            {
+                if (_sockets.ContainsKey(incomingId) && _isConnected && _isShuttingDown == 0)
+                {
+                    LiminalLogger.LogWarning($"[Transport] Client {incomingId} connection dropped: {ex.Message}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Transport] Unexpected error in receive loop for {incomingId}: {ex}");
+            }
+            finally
+            {
+                if (_isShuttingDown == 0)
+                {
+                    bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets)
+                                .Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
+
+                    try { client.Close(); } catch { LiminalLogger.LogWarning($"[Transport] Failed to close socket for client {incomingId}."); }
+
+                    if (incomingId != ILiminalTransport.SERVER_ID)
+                    {
+                        if (removed)
+                        {
+                            Interlocked.Decrement(ref _totalConnections);
+
+                            _onClientDisconnected?.Invoke(incomingId);
+                            LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
+                        }
+                    }
+                    else if (!_isServer)
+                    {
+                        LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
+                        _onLocalClientDisconnected?.Invoke(_localClientId);
+                        Shutdown();
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Helper class to help us migrate for previous versions of C#
+        /// </summary>
+        private void ProcessIngestBufferSynchronous(ushort incomingId, LiminalNativeBuffer ingestBuffer, ref int bytesInBuffer)
+        {
+            Span<byte> bufferSpan = ingestBuffer.GetSpan();
+            int offset = 0;
+            int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
+
+            while (bytesInBuffer - offset >= LiminalTransportHeader.BaseHeaderSize)
+            {
+                var currentSlice = bufferSpan.Slice(offset, bytesInBuffer - offset);
+
+                var result = LiminalTransportHeader.TryReadHeader(currentSlice, _framing, out var flags, out int payloadLength, out TContext framingContext);
+
+                if (result == HeaderReadResult.Incomplete)
+                {
+                    break;
+                }
+
+                if (result == HeaderReadResult.Malformed)
+                {
+                    LiminalLogger.LogError($"[Transport] Malformed frame header received from {incomingId}. Kicking connection.");
+                    Kick(incomingId);
+                    return;
+                }
+
+                if (payloadLength < 0 || payloadLength > _config.MaxPacketSizePerBatch)
+                {
+                    LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
+                    Kick(incomingId);
+                    return;
+                }
+
+                int totalFrameSize = headerSize + payloadLength;
+                if (bytesInBuffer - offset < totalFrameSize)
+                {
+                    break;
+                }
+
+                var payloadSpan = bufferSpan.Slice(offset + headerSize, payloadLength);
+
+                if ((flags & TransportFlags.Fragmented) != 0)
+                {
+                    // Route to Fragmentor
+                }
+                else if ((flags & TransportFlags.Reliable) != 0)
+                {
+                    _onReliable?.Invoke(payloadSpan, incomingId);
+                }
+                else
+                {
+                    _onUnreliable?.Invoke(payloadSpan, incomingId);
+                }
+
+                offset += totalFrameSize;
+            }
+
+            if (offset > 0)
+            {
+                int remaining = bytesInBuffer - offset;
+                if (remaining > 0)
+                {
+                    bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan.Slice(0, remaining));
+                }
+                bytesInBuffer = remaining;
+            }
+        }
+#endregion
+    }
+}
+

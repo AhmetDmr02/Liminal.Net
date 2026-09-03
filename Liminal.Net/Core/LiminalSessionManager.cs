@@ -38,7 +38,6 @@ namespace Liminal.Net.Core
             _transport.OnLocalClientConnected += HandleLocalConnection;
             _transport.OnClientKicked += HandleClientDisconnected;
             _interpreter.OnSendRequest += BufferPacket;
-            _transport.OnShutdown += Dispose;
         }
 
         #region Receive Path (Background Threads)
@@ -331,7 +330,6 @@ namespace Liminal.Net.Core
             _transport.OnLocalClientConnected -= HandleLocalConnection;
             _transport.OnClientKicked -= HandleClientDisconnected;
             _interpreter.OnSendRequest -= BufferPacket;
-            _transport.OnShutdown -= Dispose;
 
             while (_loopbackQueue.TryDequeue(out var loopbackItem))
             {
