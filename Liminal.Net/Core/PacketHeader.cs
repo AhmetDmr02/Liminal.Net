@@ -5,11 +5,10 @@ namespace Liminal.Net.Core
     [AttributeUsage(AttributeTargets.Struct, Inherited = false, AllowMultiple = false)]
     public sealed class LiminalPacketAttribute : Attribute
     {
-        public int Id { get; }
-
-        public LiminalPacketAttribute(int id)
-        {
-            Id = id;
-        }
+        /// <summary>
+        /// Leave 0 (default) for every normal packet those get an automatic,
+        /// deterministic sequential id from reflection based discovery.
+        /// </summary>
+        public ushort ReservedId { get; init; } = 0;
     }
 }

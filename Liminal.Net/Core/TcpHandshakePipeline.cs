@@ -28,6 +28,7 @@ namespace Liminal.Net.Core
             {
                 var stream = client.GetStream();
                 TimeSpan timeout = TimeSpan.FromSeconds(_timeoutSeconds);
+
                 using var cts = new CancellationTokenSource(timeout);
 
                 byte[] header = new byte[8];
@@ -37,7 +38,9 @@ namespace Liminal.Net.Core
                 int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
-                if (length <= 0 || length > _maxHandshakeSize || packetId != 1)
+                ushort firstPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>();
+
+                if (length <= 0 || length > _maxHandshakeSize || packetId != firstPacketId)
                 {
                     return Drop(client, $"Security Violation: ID {packetId}, Length {length}");
                 }
@@ -51,6 +54,15 @@ namespace Liminal.Net.Core
                 if (clientInfo.ClientVersion != serverVersion)
                     return Drop(client, $"Version Mismatch: {clientInfo.ClientVersion}");
 
+                if (clientInfo.PacketRegistryHash != LiminalPacketLibrary.RegistryHash)
+                {
+                    LiminalLogger.LogWarning(
+                        $"[Handshake] Packet registry mismatch with {client.Client.RemoteEndPoint}: " +
+                        $"client={clientInfo.PacketRegistryHash:X8} server={LiminalPacketLibrary.RegistryHash:X8}.");
+
+                    return Drop(client, "Packet Registry Mismatch");
+                }
+
                 ushort assignedId = _resolver.ResolveId(payload);
                 //For encrypted stuff we maybe reassign a cookie or something
 
@@ -63,16 +75,20 @@ namespace Liminal.Net.Core
                 var serverResponse = new ConnectionHandshakePacketServer
                 {
                     ServerVersion = serverVersion,
-                    AssignedClientID = assignedId
+                    AssignedClientID = assignedId,
+                    PacketRegistryHash = LiminalPacketLibrary.RegistryHash
                 };
 
-                await SendPacketAsync(stream, 2, serverResponse, cts.Token);
+                ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
+
+                await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token);
 
                 await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
                 length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
-                if (packetId != 3 || length > _maxHandshakeSize || length <= 0)
+                ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
+                if (packetId != thirdPacketId || length > _maxHandshakeSize || length <= 0)
                     return Drop(client, $"Protocol Violation: Expected ACK (ID 3) under {_maxHandshakeSize} bytes.");
 
                 byte[] ackPayload = new byte[length];
@@ -97,11 +113,15 @@ namespace Liminal.Net.Core
                 TimeSpan timeout = TimeSpan.FromSeconds(_timeoutSeconds);
                 using var cts = new CancellationTokenSource(timeout);
 
+                ushort firstPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>();
+
                 var clientInfo = new ConnectionHandshakePacketClient
                 {
-                    ClientVersion = clientVersion
+                    ClientVersion = clientVersion,
+                    PacketRegistryHash = LiminalPacketLibrary.RegistryHash
                 };
-                await SendPacketAsync(stream, 1, clientInfo, cts.Token);
+
+                await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token);
                 LiminalLogger.Log("[Handshake] Sent client info to server.");
 
                 byte[] header = new byte[8];
@@ -110,7 +130,8 @@ namespace Liminal.Net.Core
                 int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
-                if (packetId != 2 || length <= 0 || length > _maxHandshakeSize)
+                ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
+                if (packetId != secondPacketId || length <= 0 || length > _maxHandshakeSize)
                 {
                     return Drop(client, $"Unexpected Server Response. ID: {packetId}, Len: {length}");
                 }
@@ -119,21 +140,26 @@ namespace Liminal.Net.Core
                 await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
 
                 var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload, out bool success);
+
                 if (!success)
                     return Drop(client, "Malformed Server Response.");
 
                 if (serverResponse.ServerVersion != clientVersion)
                     return Drop(client, $"Server Version Mismatch: {serverResponse.ServerVersion}");
 
+                if (serverResponse.PacketRegistryHash != LiminalPacketLibrary.RegistryHash)
+                    return Drop(client, "Server Packet Registry Mismatch");
+
                 ushort assignedId = serverResponse.AssignedClientID;
                 LiminalLogger.Log($"[Handshake] Server assigned ID: {assignedId}");
 
+                ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
                 var ack = new ConnectionHandshakeClientAck
                 {
                     ClientID = assignedId,
                     Ack = true
                 };
-                await SendPacketAsync(stream, 3, ack, cts.Token);
+                await SendPacketAsync(stream, thirdPacketId, ack, cts.Token);
 
                 return assignedId;
             }

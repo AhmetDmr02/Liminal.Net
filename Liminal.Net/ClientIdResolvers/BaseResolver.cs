@@ -86,16 +86,16 @@ namespace Liminal.Net.ClientIdResolvers
             LiminalLogger.Log("[Resolver] Resolver reset complete.");
         }
 
+        //if you wanna do for ip swapping logic etc you can do it here
         public ushort ResolveId(Span<byte> payload)
         {
-            if (payload.Length < 4)
-            {
-                return 0;
-            }
+            return 0;
 
-            int resolvedId = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(0, 4));
+            //dummy example
 
-            return (ushort)resolvedId;
+            //int resolvedId = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(0, 4));
+
+            //return (ushort)resolvedId;
         }
 
         /// <summary>

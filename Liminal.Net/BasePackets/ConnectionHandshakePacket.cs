@@ -4,7 +4,7 @@ using MessagePack;
 namespace Liminal.Net.BasePackets
 {
     [MessagePackObject]
-    [LiminalPacket(id: 1)]
+    [LiminalPacket]
     public struct ConnectionHandshakePacketClient
     {
         [Key(0)]
@@ -12,10 +12,13 @@ namespace Liminal.Net.BasePackets
 
         [Key(1)]
         public ushort ClientVersion { get; set; }
+
+        [Key(2)]
+        public uint PacketRegistryHash { get; set; }
     }
 
     [MessagePackObject]
-    [LiminalPacket(id: 2)]
+    [LiminalPacket]
     public struct ConnectionHandshakePacketServer
     {
         [Key(0)]
@@ -23,10 +26,13 @@ namespace Liminal.Net.BasePackets
 
         [Key(1)]
         public ushort AssignedClientID { get; set; }
+
+        [Key(2)] 
+        public uint PacketRegistryHash { get; set; }
     }
 
     [MessagePackObject]
-    [LiminalPacket(id: 3)]
+    [LiminalPacket]
     public struct ConnectionHandshakeClientAck
     {
         [Key(0)]

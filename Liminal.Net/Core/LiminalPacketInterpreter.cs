@@ -99,7 +99,7 @@ namespace Liminal.Net.Core
         public void Subscribe<T>(Action<T, ushort> callback, object subscriber)
         {
             int idInt = LiminalPacketLibrary.GetId<T>();
-            if (idInt == -1)
+            if (idInt == 0)
             {
                 LiminalLogger.LogError($"[Interpreter] Cannot subscribe to {typeof(T).Name}. Missing [LiminalPacket] attribute?");
                 return;
@@ -142,7 +142,12 @@ namespace Liminal.Net.Core
         public void Unsubscribe<T>(object subscriber)
         {
             int idInt = LiminalPacketLibrary.GetId<T>();
-            if (idInt == -1) return;
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot unsubscribe from {typeof(T).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
             ushort packetId = (ushort)idInt;
 
             if (_subscribers.TryGetValue(subscriber, out var subList))
@@ -194,7 +199,12 @@ namespace Liminal.Net.Core
         public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
         {
             int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
-            if (idInt == -1) return;
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send {typeof(TSendStruct).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
 
             var writer = RentWriter();
 
