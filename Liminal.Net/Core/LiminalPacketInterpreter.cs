@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Liminal.Net.Core
 {
@@ -77,47 +78,39 @@ namespace Liminal.Net.Core
             public Delegate Callback;
         }
 
-        private class SubscriptionList
+        private sealed class SubscriptionList
         {
             private readonly List<Subscription> _list = new();
-            private readonly object _lock = new();
-            public bool IsDisposed { get; private set; } = false;
+            public readonly object Lock = new();
+            public bool IsDisposed = false;
 
-            public bool TryAdd(Subscription sub)
+            public int Count => _list.Count;
+
+            public void Add(Subscription sub)
             {
-                lock (_lock)
-                {
-                    if (IsDisposed) return false;
-                    _list.Add(sub);
-                    return true;
-                }
+                _list.Add(sub);
             }
 
             public List<Subscription> DisposeAndClear()
             {
-                lock (_lock)
-                {
-                    IsDisposed = true;
-                    var copy = new List<Subscription>(_list);
-                    _list.Clear();
-                    return copy;
-                }
+                IsDisposed = true;
+                if (_list.Count == 0) return null;
+                var copy = new List<Subscription>(_list);
+                _list.Clear();
+                return copy;
             }
 
             public List<Delegate> RemoveAndGetCallbacks(ushort packetId)
             {
                 var removedCallbacks = new List<Delegate>();
-                lock (_lock)
-                {
-                    if (IsDisposed) return removedCallbacks;
+                if (IsDisposed) return removedCallbacks;
 
-                    for (int i = _list.Count - 1; i >= 0; i--)
+                for (int i = _list.Count - 1; i >= 0; i--)
+                {
+                    if (_list[i].PacketId == packetId)
                     {
-                        if (_list[i].PacketId == packetId)
-                        {
-                            removedCallbacks.Add(_list[i].Callback);
-                            _list.RemoveAt(i);
-                        }
+                        removedCallbacks.Add(_list[i].Callback);
+                        _list.RemoveAt(i);
                     }
                 }
                 return removedCallbacks;
@@ -149,30 +142,33 @@ namespace Liminal.Net.Core
             }
 
             ushort packetId = (ushort)idInt;
+            var subscription = new Subscription { PacketId = packetId, Callback = callback };
+            var spin = new SpinWait();
 
-            var dispatcher = (TypedPacketDispatcher<T>)_handlers.GetOrAdd(packetId, _ => new TypedPacketDispatcher<T>());
-            dispatcher.Add(callback);
-
-            int maxRetries = 100;
-            int attempts = 0;
-
-            while (attempts < maxRetries)
+            while (true)
             {
                 var subList = _subscribers.GetOrAdd(subscriber, _ => new SubscriptionList());
 
-                if (subList.TryAdd(new Subscription { PacketId = packetId, Callback = callback }))
+                lock (subList.Lock)
                 {
-                    LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
-                    return;
+                    if (!subList.IsDisposed)
+                    {
+                        var dispatcher = (TypedPacketDispatcher<T>)_handlers.GetOrAdd(packetId, _ => new TypedPacketDispatcher<T>());
+                        dispatcher.Add(callback);
+
+                        subList.Add(subscription);
+
+                        LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
+                        return;
+                    }
                 }
 
-                attempts++;
-            }
+                // If subList was disposed by UnsubscribeAll or an empty Unsubscribe<T>,
+                // evict the dead instance so the next GetOrAdd generates a fresh one.
+                var entry = new KeyValuePair<object, SubscriptionList>(subscriber, subList);
+                ((ICollection<KeyValuePair<object, SubscriptionList>>)_subscribers).Remove(entry);
 
-            if (attempts >= maxRetries)
-            {
-                dispatcher.Remove(callback);
-                LiminalLogger.LogError($"[Interpreter] Failed to subscribe {subscriber.GetType().Name} to {typeof(T).Name} after {maxRetries} attempts!");
+                spin.SpinOnce();
             }
         }
 
@@ -189,7 +185,21 @@ namespace Liminal.Net.Core
 
             if (_subscribers.TryGetValue(subscriber, out var subList))
             {
-                var callbacksToRemove = subList.RemoveAndGetCallbacks(packetId);
+                List<Delegate> callbacksToRemove;
+                lock (subList.Lock)
+                {
+                    callbacksToRemove = subList.RemoveAndGetCallbacks(packetId);
+
+                    // If all subscriptions are gone, mark disposed and evict under lock
+                    if (subList.Count == 0)
+                    {
+                        subList.IsDisposed = true;
+
+                        var entry = new KeyValuePair<object, SubscriptionList>(subscriber, subList);
+                        ((ICollection<KeyValuePair<object, SubscriptionList>>)_subscribers).Remove(entry);
+                    }
+                }
+
                 foreach (var cb in callbacksToRemove)
                 {
                     RemoveFromHandlers(packetId, cb);
@@ -201,11 +211,18 @@ namespace Liminal.Net.Core
         {
             if (_subscribers.TryRemove(subscriber, out var subList))
             {
-                var subscriptions = subList.DisposeAndClear();
-
-                foreach (var sub in subscriptions)
+                List<Subscription> subscriptions;
+                lock (subList.Lock)
                 {
-                    RemoveFromHandlers(sub.PacketId, sub.Callback);
+                    subscriptions = subList.DisposeAndClear();
+                }
+
+                if (subscriptions != null)
+                {
+                    foreach (var sub in subscriptions)
+                    {
+                        RemoveFromHandlers(sub.PacketId, sub.Callback);
+                    }
                 }
 
                 LiminalLogger.Log($"[Interpreter] Unsubscribed all handlers for {subscriber.GetType().Name}");
@@ -274,11 +291,9 @@ namespace Liminal.Net.Core
 
             try
             {
-
                 MessagePackSerializer.Serialize(writer, packet);
                 var payload = writer.WrittenSpan;
 
-                //Dispatch
                 for (int i = 0; i < targetSessionIds.Length; i++)
                 {
                     OnSendRequest?.Invoke(targetSessionIds[i], (ushort)idInt, payload);

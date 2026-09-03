@@ -69,7 +69,7 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public static async Task TestInterpreterMulticastAndBufferRace()
+        public static async Task TestInterpreterMulticastAndGhostSubscriptionRace()
         {
             var config = new LiminalTransportConfig { MaxPacketSizePerBatch = 4096 };
             var interpreter = new LiminalPacketInterpreter(config);
@@ -83,47 +83,123 @@ namespace Liminal.Net.Tests
 
             byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "RaceSpam" });
 
-            object subscriberA = new object();
-            object subscriberB = new object();
+            interpreter.OnSendRequest += (sessionId, pid, payload) =>
+            {
+                if (payload.Length > 0)
+                {
+                    byte _ = payload[0];
+                }
+            };
 
-            ushort[] targetPool = new ushort[] { 1, 2, 3, 4, 5 };
+            object target = new object();
+            int postUnsubscribeHits = 0;
+            int phaseComplete = 0;
 
-            var t1 = Task.Run(() =>
+            var tSubscribe = Task.Run(() =>
             {
                 for (int i = 0; i < 20; i++)
                 {
-                    interpreter.SendCommand<ChatPacket>(targetPool.AsSpan(0, 3), new ChatPacket { Message = $"Multi_{i}" });
+                    interpreter.Subscribe<ChatPacket>((pkt, sender) =>
+                    {
+                        if (Volatile.Read(ref phaseComplete) == 1)
+                        {
+                            Interlocked.Increment(ref postUnsubscribeHits);
+                        }
+                    }, target);
                 }
             });
 
-            var t2 = Task.Run(() =>
+            var tUnsubscribe = Task.Run(() =>
             {
-                for (int i = 0; i < 20; i++)
+                for (int i = 0; i < 10; i++)
                 {
-                    interpreter.SendCommand(targetPool[i % targetPool.Length], new ChatPacket { Message = $"Uni_{i}" });
+                    interpreter.UnsubscribeAll(target);
                 }
             });
 
-            var t3 = Task.Run(() =>
+            var tDispatch = Task.Run(() =>
             {
-                for (int i = 0; i < 20; i++)
-                {
-                    interpreter.Subscribe<ChatPacket>((pkt, sender) => { }, subscriberA);
-                    if (i % 3 == 0) interpreter.UnsubscribeAll(subscriberA);
-                }
-            });
-
-            var t4 = Task.Run(() =>
-            {
-                interpreter.Subscribe<ChatPacket>((pkt, sender) => { }, subscriberB);
                 for (int i = 0; i < 20; i++)
                 {
                     interpreter.Dispatch(chatPacketId, 1, serializedChat);
                 }
-                interpreter.UnsubscribeAll(subscriberB);
             });
 
-            await Task.WhenAll(t1, t2, t3, t4);
+            var tSend = Task.Run(() =>
+            {
+                ushort[] targets = { 1, 2, 3 };
+                for (int i = 0; i < 15; i++)
+                {
+                    interpreter.SendCommand<ChatPacket>(targets.AsSpan(), new ChatPacket { Message = "Multi" });
+                    interpreter.SendCommand(1, new ChatPacket { Message = "Uni" });
+                }
+            });
+
+            await Task.WhenAll(tSubscribe, tUnsubscribe, tDispatch, tSend);
+
+            interpreter.UnsubscribeAll(target);
+            Volatile.Write(ref phaseComplete, 1);
+
+            for (int i = 0; i < 10; i++)
+            {
+                interpreter.Dispatch(chatPacketId, 1, serializedChat);
+            }
+
+            Microsoft.Coyote.Specifications.Specification.Assert(
+                postUnsubscribeHits == 0,
+                $"GHOST SUBSCRIPTION LEAK: Target received {postUnsubscribeHits} packets after terminal UnsubscribeAll!");
+        }
+
+        [Test]
+        public static async Task HuntGhostSubscriptionRace()
+        {
+            var config = new LiminalTransportConfig();
+            var interpreter = new LiminalPacketInterpreter(config);
+
+            ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
+            if (chatPacketId == 0)
+            {
+                LiminalPacketLibrary.Initialize();
+                chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
+            }
+
+            byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "Boom" });
+
+            object target = new object();
+            int ghostHit = 0;
+            int phaseComplete = 0;
+
+            Action<ChatPacket, ushort> cb1 = (pkt, sender) => { };
+            Action<ChatPacket, ushort> cb2 = (pkt, sender) =>
+            {
+                if (Volatile.Read(ref phaseComplete) == 1)
+                {
+                    Interlocked.Increment(ref ghostHit);
+                }
+            };
+
+            interpreter.Subscribe(cb1, target);
+
+            var t1 = Task.Run(() =>
+            {
+                interpreter.Subscribe(cb2, target);
+            });
+
+            var t2 = Task.Run(() =>
+            {
+                interpreter.UnsubscribeAll(target);
+            });
+
+            await Task.WhenAll(t1, t2);
+
+            interpreter.UnsubscribeAll(target);
+            Volatile.Write(ref phaseComplete, 1);
+
+            interpreter.Dispatch(chatPacketId, 1, serializedChat);
+
+            Microsoft.Coyote.Specifications.Specification.Assert(
+                ghostHit == 0,
+                $"GHOST LEAK CONFIRMED: Ghost callback cb2 survived UnsubscribeAll and was invoked!");
         }
 
         [Test]
