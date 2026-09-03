@@ -71,13 +71,18 @@ namespace Liminal.Net.Core
 
                 foreach (var type in types)
                 {
-                    if (!type.IsValueType || type.IsGenericTypeDefinition)
+                    if (!type.IsValueType)
                     {
-                        LiminalLogger.LogWarning($"[PacketLibrary] Skipping {type.FullName} because it is not a value type or generic type.");
                         continue;
                     }
 
                     var attr = type.GetCustomAttribute<LiminalPacketAttribute>(false);
+                    if (attr != null && (type.IsGenericTypeDefinition))
+                    {
+                        LiminalLogger.LogWarning($"[PacketLibrary] Generic packet type '{type.FullName}' is not supported.");
+                        continue;
+                    }
+
                     if (attr != null) discovered.Add((type, attr.ReservedId));
                 }
             }

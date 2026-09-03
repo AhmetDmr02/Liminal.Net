@@ -1804,6 +1804,63 @@ namespace Liminal.Net.Tests
             Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
         }
 
+        [Test]
+        public void Test42_MulticastSend_SinglePayloadFannedOutToAllTargets()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+            var c3 = CreateAndStartClient();
+
+            Assert.That(SpinWait.SpinUntil(() =>
+                c1.Transport.IsConnected && c2.Transport.IsConnected && c3.Transport.IsConnected, 3000), Is.True);
+
+            ushort id1 = c1.localID;
+            ushort id2 = c2.localID;
+            ushort id3 = c3.localID;
+
+            Assert.That(id1, Is.Not.EqualTo(0));
+            Assert.That(id2, Is.Not.EqualTo(0));
+            Assert.That(id3, Is.Not.EqualTo(0));
+
+            int c1ReceivedCount = 0;
+            int c2ReceivedCount = 0;
+            int c3ReceivedCount = 0;
+
+            string c1Message = null;
+            string c2Message = null;
+
+            c1.Interpreter.Subscribe<ChatPacket>((pkt, sender) =>
+            {
+                Interlocked.Increment(ref c1ReceivedCount);
+                c1Message = pkt.Message;
+            }, this);
+
+            c2.Interpreter.Subscribe<ChatPacket>((pkt, sender) =>
+            {
+                Interlocked.Increment(ref c2ReceivedCount);
+                c2Message = pkt.Message;
+            }, this);
+
+            c3.Interpreter.Subscribe<ChatPacket>((pkt, sender) =>
+            {
+                Interlocked.Increment(ref c3ReceivedCount);
+            }, this);
+
+            Span<ushort> targets = stackalloc ushort[] { id1, id2 };
+            _serverManager.Interpreter.SendCommand(targets, new ChatPacket { Message = "Multicast_Payload" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1ReceivedCount == 1, 2000), Is.True, "Client 1 missed multicast packet.");
+            Assert.That(SpinWait.SpinUntil(() => c2ReceivedCount == 1, 2000), Is.True, "Client 2 missed multicast packet.");
+            Assert.That(c1Message, Is.EqualTo("Multicast_Payload"));
+            Assert.That(c2Message, Is.EqualTo("Multicast_Payload"));
+
+            Thread.Sleep(200);
+            Assert.That(c3ReceivedCount, Is.EqualTo(0), "Client 3 received a packet it was not targeted for.");
+        }
         #endregion
     }
 }

@@ -8,30 +8,73 @@ namespace Liminal.Net.Core
     public class LiminalPacketInterpreter
     {
         private readonly ConcurrentBag<LiminalNativeBufferWriter> _writerPool = new();
-        private readonly ConcurrentDictionary<ushort, PacketEvent> _handlers = new();
+        private readonly ConcurrentDictionary<ushort, IPacketDispatcher> _handlers = new();
         private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
         private readonly LiminalTransportConfig _config;
 
-        private class PacketEvent
+        private interface IPacketDispatcher
         {
-            public Action<ReadOnlyMemory<byte>, ushort> Handler;
+            void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options);
+            void RemoveUntyped(Delegate callback);
+        }
+
+        private sealed class TypedPacketDispatcher<T> : IPacketDispatcher
+        {
+            private Action<T, ushort> _callbacks;
             private readonly object _lock = new();
 
-            public void Add(Action<ReadOnlyMemory<byte>, ushort> action)
+            public void Add(Action<T, ushort> callback)
             {
-                lock (_lock) { Handler += action; }
+                lock (_lock) { _callbacks += callback; }
             }
 
-            public void Remove(Action<ReadOnlyMemory<byte>, ushort> action)
+            public void Remove(Action<T, ushort> callback)
             {
-                lock (_lock) { Handler -= action; }
+                lock (_lock) { _callbacks -= callback; }
+            }
+
+            public void RemoveUntyped(Delegate callback)
+            {
+                if (callback is Action<T, ushort> typedCallback)
+                {
+                    Remove(typedCallback);
+                }
+            }
+
+            public void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options)
+            {
+                Action<T, ushort> targets;
+                lock (_lock) { targets = _callbacks; }
+
+                if (targets == null) return;
+
+                T packet = DeserializeSafe(rawData, options, out bool success);
+                if (success)
+                {
+                    targets(packet, sender);
+                }
+            }
+
+            private static T DeserializeSafe(ReadOnlyMemory<byte> data, MessagePackSerializerOptions options, out bool success)
+            {
+                try
+                {
+                    success = true;
+                    return MessagePackSerializer.Deserialize<T>(data, options);
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogWarning($"[Security] Malformed packet {typeof(T).Name}: {ex.Message}");
+                    success = false;
+                    return default;
+                }
             }
         }
 
         private struct Subscription
         {
             public ushort PacketId;
-            public Action<ReadOnlyMemory<byte>, ushort> Wrapper;
+            public Delegate Callback;
         }
 
         private class SubscriptionList
@@ -61,23 +104,23 @@ namespace Liminal.Net.Core
                 }
             }
 
-            public List<Action<ReadOnlyMemory<byte>, ushort>> RemoveAndGetWrappers(ushort packetId)
+            public List<Delegate> RemoveAndGetCallbacks(ushort packetId)
             {
-                var removedWrappers = new List<Action<ReadOnlyMemory<byte>, ushort>>();
+                var removedCallbacks = new List<Delegate>();
                 lock (_lock)
                 {
-                    if (IsDisposed) return removedWrappers;
+                    if (IsDisposed) return removedCallbacks;
 
                     for (int i = _list.Count - 1; i >= 0; i--)
                     {
                         if (_list[i].PacketId == packetId)
                         {
-                            removedWrappers.Add(_list[i].Wrapper);
+                            removedCallbacks.Add(_list[i].Callback);
                             _list.RemoveAt(i);
                         }
                     }
                 }
-                return removedWrappers;
+                return removedCallbacks;
             }
         }
 
@@ -107,14 +150,8 @@ namespace Liminal.Net.Core
 
             ushort packetId = (ushort)idInt;
 
-            Action<ReadOnlyMemory<byte>, ushort> wrapper = (ReadOnlyMemory<byte> rawData, ushort sender) =>
-            {
-                T packet = DeserializeSafe<T>(rawData, out bool success);
-                if (success) callback(packet, sender);
-            };
-
-            var packetEvent = _handlers.GetOrAdd(packetId, _ => new PacketEvent());
-            packetEvent.Add(wrapper);
+            var dispatcher = (TypedPacketDispatcher<T>)_handlers.GetOrAdd(packetId, _ => new TypedPacketDispatcher<T>());
+            dispatcher.Add(callback);
 
             int maxRetries = 100;
             int attempts = 0;
@@ -123,7 +160,7 @@ namespace Liminal.Net.Core
             {
                 var subList = _subscribers.GetOrAdd(subscriber, _ => new SubscriptionList());
 
-                if (subList.TryAdd(new Subscription { PacketId = packetId, Wrapper = wrapper }))
+                if (subList.TryAdd(new Subscription { PacketId = packetId, Callback = callback }))
                 {
                     LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
                     return;
@@ -134,7 +171,7 @@ namespace Liminal.Net.Core
 
             if (attempts >= maxRetries)
             {
-                RemoveFromHandlers(packetId, wrapper);
+                dispatcher.Remove(callback);
                 LiminalLogger.LogError($"[Interpreter] Failed to subscribe {subscriber.GetType().Name} to {typeof(T).Name} after {maxRetries} attempts!");
             }
         }
@@ -152,10 +189,10 @@ namespace Liminal.Net.Core
 
             if (_subscribers.TryGetValue(subscriber, out var subList))
             {
-                var wrappersToRemove = subList.RemoveAndGetWrappers(packetId);
-                foreach (var wrapper in wrappersToRemove)
+                var callbacksToRemove = subList.RemoveAndGetCallbacks(packetId);
+                foreach (var cb in callbacksToRemove)
                 {
-                    RemoveFromHandlers(packetId, wrapper);
+                    RemoveFromHandlers(packetId, cb);
                 }
             }
         }
@@ -168,7 +205,7 @@ namespace Liminal.Net.Core
 
                 foreach (var sub in subscriptions)
                 {
-                    RemoveFromHandlers(sub.PacketId, sub.Wrapper);
+                    RemoveFromHandlers(sub.PacketId, sub.Callback);
                 }
 
                 LiminalLogger.Log($"[Interpreter] Unsubscribed all handlers for {subscriber.GetType().Name}");
@@ -181,11 +218,11 @@ namespace Liminal.Net.Core
             _subscribers.Clear();
         }
 
-        private void RemoveFromHandlers(ushort packetId, Action<ReadOnlyMemory<byte>, ushort> wrapper)
+        private void RemoveFromHandlers(ushort packetId, Delegate callback)
         {
-            if (_handlers.TryGetValue(packetId, out var packetEvent))
+            if (_handlers.TryGetValue(packetId, out var dispatcher))
             {
-                packetEvent.Remove(wrapper);
+                dispatcher.RemoveUntyped(callback);
             }
         }
 
@@ -205,7 +242,6 @@ namespace Liminal.Net.Core
                 return;
             }
 
-
             var writer = RentWriter();
 
             try
@@ -223,22 +259,53 @@ namespace Liminal.Net.Core
             }
         }
 
+        public void SendCommand<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        {
+            if (targetSessionIds.IsEmpty) return;
+
+            int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send {typeof(TSendStruct).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            var writer = RentWriter();
+
+            try
+            {
+
+                MessagePackSerializer.Serialize(writer, packet);
+                var payload = writer.WrittenSpan;
+
+                //Dispatch
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                {
+                    OnSendRequest?.Invoke(targetSessionIds[i], (ushort)idInt, payload);
+                }
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send! {ex.InnerException?.Message}");
+            }
+            finally
+            {
+                _writerPool.Add(writer);
+            }
+        }
+
         public void Dispatch(ushort packetId, ushort sender, ReadOnlyMemory<byte> rawData)
         {
-            if (_handlers.TryGetValue(packetId, out var packetEvent))
+            if (_handlers.TryGetValue(packetId, out var dispatcher))
             {
-                var currentHandler = packetEvent.Handler;
-
-                if (currentHandler != null)
+                try
                 {
-                    try
-                    {
-                        currentHandler(rawData, sender);
-                    }
-                    catch (Exception ex)
-                    {
-                        LiminalLogger.LogError($"[Interpreter] Error in handler for ID {packetId}: {ex}");
-                    }
+                    dispatcher.Dispatch(rawData, sender, _options);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Interpreter] Error in handler for ID {packetId}: {ex}");
                     return;
                 }
             }
@@ -246,20 +313,6 @@ namespace Liminal.Net.Core
             LiminalLogger.LogWarning($"[Interpreter] Unhandled Packet ID {packetId}");
         }
 
-        private T DeserializeSafe<T>(ReadOnlyMemory<byte> data, out bool success)
-        {
-            try
-            {
-                var options = MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
-                success = true;
-                return MessagePackSerializer.Deserialize<T>(data, options);
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogWarning($"[Security] Malformed packet {typeof(T).Name}: {ex.Message}");
-                success = false;
-                return default;
-            }
-        }
+        private readonly MessagePackSerializerOptions _options = MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
     }
 }
