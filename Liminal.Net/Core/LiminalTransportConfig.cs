@@ -66,6 +66,11 @@ namespace Liminal.Net.Core
         /// </summary>
         public int MaxConnectionCount = 10;
 
+        /// <summary>
+        /// The number of seconds to wait for a client to disconnect before forcing a kick
+        /// </summary>
+        public int WaitForKickGracePeriod = 10;
+
         public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
 
         public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();

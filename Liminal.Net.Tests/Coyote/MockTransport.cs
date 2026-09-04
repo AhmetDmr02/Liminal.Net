@@ -13,6 +13,8 @@ namespace Liminal.Net.Tests
         public bool IsConnected => true;
         public int ConnectedClientCount => 1;
 
+        public LiminalTransportConfig Config => conf;
+
         public event DataReceivedHandler? OnMessageReceivedReliable;
         public event DataReceivedHandler? OnMessageReceivedUnreliable;
         public event TransportEventHandler? OnServerStarted;
@@ -24,7 +26,10 @@ namespace Liminal.Net.Tests
         public event ClientConnectionHandler? OnClientDisconnected;
         public event ClientConnectionHandler? OnClientKicked;
 
-        public void InitializeTransport(LiminalTransportConfig config) { }
+        private LiminalTransportConfig conf;
+        public void InitializeTransport(LiminalTransportConfig config) {
+            conf = config;
+        }
         public void StartServer(string ip, int port) { }
         public void StartClient(string ip, int port) { }
         public void Disconnect() { }

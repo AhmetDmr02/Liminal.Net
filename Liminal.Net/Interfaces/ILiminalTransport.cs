@@ -23,6 +23,8 @@ namespace Liminal.Net.Interfaces
 
         public bool IsConnected { get; }
 
+        public LiminalTransportConfig Config { get; }
+
         #region Connection State
         public bool IsClientConnected(ushort clientId);
         public int ConnectedClientCount { get; }

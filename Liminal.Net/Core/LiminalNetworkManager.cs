@@ -31,6 +31,8 @@ namespace Liminal.Net.Core
         private LiminalPacketFramerPipeline _pipeline;
         private LiminalTicker _ticker;
 
+        public DisconnectReasonCoordinator DisconnectCoordinator { get; private set; }
+
         public ushort localID => _transport.LocalClientId;
 
         public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config)
@@ -67,6 +69,7 @@ namespace Liminal.Net.Core
 
             _pipeline = new LiminalPacketFramerPipeline(_config);
             SessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
+            DisconnectCoordinator = new DisconnectReasonCoordinator(_transport, Interpreter);
 
             _ticker = new LiminalTicker(_config);
         }
@@ -78,6 +81,8 @@ namespace Liminal.Net.Core
 
             // Last flush to trigger internal dispose
             SessionManager?.Flush();
+
+            DisconnectCoordinator?.Dispose();
 
             //We actually wanna keep subscriptions around
             //Interpreter?.ClearAllHandlers();
