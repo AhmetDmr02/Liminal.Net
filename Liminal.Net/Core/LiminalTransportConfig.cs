@@ -64,7 +64,7 @@ namespace Liminal.Net.Core
         /// <summary>
         /// The maximum number of connections that will be allowed
         /// </summary>
-        public int MaxConnectionCount = 10;
+        public int MaxConnectionCount = 1;
 
         /// <summary>
         /// The number of seconds to wait for a client to disconnect before forcing a kick

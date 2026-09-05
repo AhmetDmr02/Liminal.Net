@@ -1271,7 +1271,9 @@ namespace Liminal.Net.Tests
             rawClient.NoDelay = true;
             rawClient.Connect("127.0.0.1", _currentTestPort);
 
-            ushort assignedId = DefaultHandshakes.ClientTcpHandshake(rawClient, serverSendConfig).GetAwaiter().GetResult();
+            var handshakeResult = DefaultHandshakes.ClientTcpHandshake(rawClient, serverSendConfig).GetAwaiter().GetResult();
+            Assert.That(handshakeResult.Success, Is.True);
+            ushort assignedId = handshakeResult.ClientId;
             Assert.That(assignedId, Is.Not.EqualTo(0));
             Assert.That(SpinWait.SpinUntil(() => timeoutServer.Transport.ConnectedClientCount == 1, 2000), Is.True);
 
@@ -1329,7 +1331,8 @@ namespace Liminal.Net.Tests
                 acceptedSocket.NoDelay = true;
                 // Restrict kernel receive window and omit reading to force TCP window saturation
                 acceptedSocket.Client.ReceiveBufferSize = 4096;
-                _ = await DefaultHandshakes.ServerTcpHandshake(acceptedSocket, clientSendConfig);
+                // UPDATED: ServerTcpHandshake takes (socket, config, canAccept delegate)
+                _ = await DefaultHandshakes.ServerTcpHandshake(acceptedSocket, clientSendConfig, () => true);
             });
 
             client.StartClient("127.0.0.1", _currentTestPort);
@@ -1669,7 +1672,6 @@ namespace Liminal.Net.Tests
             rogueClient.Connect("127.0.0.1", _currentTestPort);
             var stream = rogueClient.GetStream();
 
-            // Craft packet 1 with an invalid Registry Hash
             var maliciousHandshake = new ConnectionHandshakePacketClient
             {
                 ClientName = "DesyncedClient",
@@ -1685,18 +1687,21 @@ namespace Liminal.Net.Tests
 
             stream.Write(frame, 0, frame.Length);
 
-            // Server must drop client on hash mismatch (RST / socket shutdown)
-            byte[] readBuffer = new byte[8];
-            int bytesRead = 0;
-            try
-            {
-                rogueClient.ReceiveTimeout = 2000;
-                bytesRead = stream.Read(readBuffer, 0, 8);
-            }
-            catch { bytesRead = 0; }
+            byte[] header = new byte[8];
+            rogueClient.ReceiveTimeout = 2000;
+            stream.ReadExactly(header, 0, 8);
+            int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
 
-            Assert.That(bytesRead, Is.EqualTo(0), "Server answered a client with a mismatched packet registry hash instead of dropping it.");
-            Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+            byte[] payload = new byte[length];
+            stream.ReadExactly(payload, 0, length);
+            var response = MessagePackSerializer.Deserialize<ConnectionHandshakePacketServer>(payload);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(response.AssignedClientID, Is.EqualTo(0), "Server should not assign an ID to a registry-mismatched client.");
+                Assert.That(response.RejectReason, Is.EqualTo(DisconnectReason.ProtocolViolation));
+                Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+            });
         }
 
         [Test]
@@ -1710,7 +1715,6 @@ namespace Liminal.Net.Tests
             outdatedClient.Connect("127.0.0.1", _currentTestPort);
             var stream = outdatedClient.GetStream();
 
-            // Client sending version 999
             var outdatedHandshake = new ConnectionHandshakePacketClient
             {
                 ClientName = "OutdatedClient",
@@ -1726,17 +1730,21 @@ namespace Liminal.Net.Tests
 
             stream.Write(frame, 0, frame.Length);
 
-            byte[] readBuffer = new byte[8];
-            int bytesRead = 0;
-            try
-            {
-                outdatedClient.ReceiveTimeout = 2000;
-                bytesRead = stream.Read(readBuffer, 0, 8);
-            }
-            catch { bytesRead = 0; }
+            byte[] header = new byte[8];
+            outdatedClient.ReceiveTimeout = 2000;
+            stream.ReadExactly(header, 0, 8);
+            int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
 
-            Assert.That(bytesRead, Is.EqualTo(0), "Server did not drop client on version mismatch.");
-            Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+            byte[] payload = new byte[length];
+            stream.ReadExactly(payload, 0, length);
+            var response = MessagePackSerializer.Deserialize<ConnectionHandshakePacketServer>(payload);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(response.AssignedClientID, Is.EqualTo(0));
+                Assert.That(response.RejectReason, Is.EqualTo(DisconnectReason.VersionMismatch));
+                Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+            });
         }
 
         [Test]
@@ -2204,6 +2212,230 @@ namespace Liminal.Net.Tests
             Assert.That(killTask.Wait(TimeSpan.FromSeconds(2)), Is.True, "Concurrent kill task deadlocked.");
             Assert.That(unhandledExceptions, Is.EqualTo(0), "Architectural exception leaked during concurrent mid-drain disposal.");
             Assert.That(client.Transport.IsConnected, Is.False);
+        }
+
+        #endregion
+
+        #region Premature Handshake Diagnostics & Coordinator Integration Tests
+
+        [Test]
+        public void Test51_HandshakeRejection_ServerFull_ResolvesOnClientCoordinator()
+        {
+            _serverConfig.MaxConnectionCount = 1;
+            _serverManager.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            // Establish primary connection to fill slot
+            var client1 = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected, 2000), Is.True);
+
+            // Prepare second client that should get rejected due to capacity
+            var client2Config = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 5,
+                HandshakeTimeout = 5
+            };
+
+            var client2 = new LiminalNetworkManager(new TcpTransport(), client2Config);
+            _clientManagers.Add(client2);
+
+            DisconnectReason client2Reason = DisconnectReason.Unknown;
+            string client2Message = null;
+            bool client2Resolved = false;
+
+            client2.OnDisconnectResolved += (id, reason, msg) =>
+            {
+                client2Reason = reason;
+                client2Message = msg;
+                client2Resolved = true;
+            };
+
+            client2.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => client2Resolved, 3000), Is.True,
+                "Client 2 failed to resolve disconnect reason from handshake rejection.");
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(client2Reason, Is.EqualTo(DisconnectReason.ServerFull),
+                    "Expected ServerFull reason when connecting to a full server.");
+                Assert.That(client2Message, Is.Not.Null.And.Not.Empty);
+                Assert.That(client2.Transport.IsConnected, Is.False);
+            });
+        }
+
+        [Test]
+        public void Test52_HandshakeRejection_VersionMismatch_ResolvesOnClientCoordinator()
+        {
+            _serverConfig.Version = 2;
+            _serverManager.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var outdatedClientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 5,
+                HandshakeTimeout = 5,
+                Version = 1 // Intentionally mismatched
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), outdatedClientConfig);
+            _clientManagers.Add(client);
+
+            DisconnectReason resolvedReason = DisconnectReason.Unknown;
+            string resolvedMessage = null;
+            bool resolved = false;
+
+            client.OnDisconnectResolved += (id, reason, msg) =>
+            {
+                resolvedReason = reason;
+                resolvedMessage = msg;
+                resolved = true;
+            };
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => resolved, 3000), Is.True,
+                "Client failed to resolve disconnect reason on version mismatch.");
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(resolvedReason, Is.EqualTo(DisconnectReason.VersionMismatch));
+                Assert.That(resolvedMessage, Does.Contain("v2").Or.Contain("version"));
+                Assert.That(client.Transport.IsConnected, Is.False);
+            });
+        }
+
+        [Test]
+        public void Test53_HandshakeRejection_RegistryMismatch_ResolvesProtocolViolation()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            var clientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 5,
+                HandshakeTimeout = 5
+            };
+
+            var clientTransport = new TcpTransport();
+            // Tamper client handshake orchestrator to transmit an invalid registry hash
+            clientTransport.ClientHandshaker = async (tcpClient, cfg) =>
+            {
+                var stream = tcpClient.GetStream();
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+                var clientInfo = new ConnectionHandshakePacketClient
+                {
+                    ClientVersion = cfg.Version,
+                    PacketRegistryHash = LiminalPacketLibrary.RegistryHash ^ 0x1337
+                };
+
+                byte[] body = MessagePackSerializer.Serialize(clientInfo);
+                byte[] full = new byte[8 + body.Length];
+                BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(0, 4), body.Length);
+                BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+                body.CopyTo(full.AsSpan(8));
+                await stream.WriteAsync(full, cts.Token);
+
+                byte[] header = new byte[8];
+                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+                int len = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                byte[] respPayload = new byte[len];
+                await stream.ReadExactlyAsync(respPayload, 0, len, cts.Token);
+
+                var serverResp = MessagePackSerializer.Deserialize<ConnectionHandshakePacketServer>(respPayload);
+                return HandshakeResult.Fail(serverResp.RejectReason, serverResp.RejectMessage);
+            };
+
+            var client = new LiminalNetworkManager(clientTransport, clientConfig);
+            _clientManagers.Add(client);
+
+            DisconnectReason clientResolvedReason = DisconnectReason.Unknown;
+            bool clientResolved = false;
+
+            client.OnDisconnectResolved += (id, reason, msg) =>
+            {
+                clientResolvedReason = reason;
+                clientResolved = true;
+            };
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => clientResolved, 3000), Is.True,
+                "Client coordinator failed to resolve registry rejection.");
+            Assert.That(clientResolvedReason, Is.EqualTo(DisconnectReason.ProtocolViolation));
+        }
+
+        [Test]
+        public void Test54_HandshakeSecurity_HardRstOnOversizedHeader_CoordinatorResolvesConnectionLost()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            var clientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 5,
+                HandshakeTimeout = 5
+            };
+
+            var clientTransport = new TcpTransport();
+            // Client attempts an exploit by writing a huge header size
+            clientTransport.ClientHandshaker = async (tcpClient, cfg) =>
+            {
+                var stream = tcpClient.GetStream();
+                byte[] maliciousHeader = new byte[8];
+                BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(0, 4), 1024 * 1024);
+                BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+
+                await stream.WriteAsync(maliciousHeader);
+
+                // Server should drop via RST; reading returns EOF or throws SocketException
+                byte[] dummy = new byte[8];
+                int read = await stream.ReadAsync(dummy);
+                return read <= 0
+                    ? HandshakeResult.Fail(DisconnectReason.ConnectionLost, "Socket severed abruptly")
+                    : HandshakeResult.Ok(1);
+            };
+
+            var client = new LiminalNetworkManager(clientTransport, clientConfig);
+            _clientManagers.Add(client);
+
+            DisconnectReason reason = DisconnectReason.Unknown;
+            bool fired = false;
+
+            client.OnDisconnectResolved += (id, r, msg) =>
+            {
+                reason = r;
+                fired = true;
+            };
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => fired, 3000), Is.True);
+            Assert.That(reason, Is.EqualTo(DisconnectReason.ConnectionLost));
+            Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
         }
 
         #endregion

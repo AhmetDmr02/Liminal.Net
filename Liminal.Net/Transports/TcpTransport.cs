@@ -38,8 +38,8 @@ namespace Liminal.Net.Transports
 
         protected TcpListener _listener;
 
-        public HandshakeOrchestrator<TcpClient> ServerHandshaker { get; set; } = DefaultHandshakes.ServerTcpHandshake;
-        public HandshakeOrchestrator<TcpClient> ClientHandshaker { get; set; } = DefaultHandshakes.ClientTcpHandshake;
+        public ServerHandshakeOrchestrator<TcpClient> ServerHandshaker { get; set; } = DefaultHandshakes.ServerTcpHandshake;
+        public ClientHandshakeOrchestrator<TcpClient> ClientHandshaker { get; set; } = DefaultHandshakes.ClientTcpHandshake;
 
         #region Events
         protected DataReceivedHandler _onReliable;
@@ -343,26 +343,27 @@ namespace Liminal.Net.Transports
 
                 _onHandshakeInitialized?.Invoke();
 
-                // Run the orchestrator
-                _localClientId = await ClientHandshaker(client, _config);
+                HandshakeResult result = await ClientHandshaker(client, _config);
 
-                if (_localClientId != 0)
+                if (result.Success)
                 {
+                    _localClientId = result.ClientId;
                     _isConnected = true;
-
                     PromoteLocalClient(_localClientId, client);
                 }
                 else
                 {
-                    client.Close();
-                    _onLocalClientDisconnected?.Invoke(0);
+                    try { client.Close(); } catch { }
 
+                    OnTransportDisconnectReason?.Invoke(ILiminalTransport.SERVER_ID, result.FailureReason, result.FailureMessage);
+
+                    _onLocalClientDisconnected?.Invoke(0);
                     Shutdown();
                 }
             }
             catch (Exception ex)
             {
-                try { client.Close(); } catch { } 
+                try { client.Close(); } catch { }
                 LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
                 Shutdown();
             }
@@ -373,28 +374,18 @@ namespace Liminal.Net.Transports
 
         private int _totalConnections = 0;
 
-
         protected async Task AcceptConnectionsAsync(TcpListener listener)
         {
             while (IsConnected && _isServer && listener == _listener)
             {
                 TcpClient client = null;
-                bool counted = false;  
-                bool handedOff = false; 
+                bool slotReserved = false;
+                bool handedOff = false;
 
                 try
                 {
                     client = await listener.AcceptTcpClientAsync();
                     client.NoDelay = true;
-
-                    int total = Interlocked.Increment(ref _totalConnections);
-                    counted = true;
-
-                    if (total > _config.MaxConnectionCount)
-                    {
-                        LiminalLogger.LogWarning($"[Transport] Max connection count reached ({_config.MaxConnectionCount}). Disconnecting client.");
-                        continue; 
-                    }
 
                     var acceptedClient = client;
 
@@ -404,15 +395,35 @@ namespace Liminal.Net.Transports
                         try
                         {
                             _onHandshakeInitialized?.Invoke();
-                            ushort finalId = await ServerHandshaker(acceptedClient, _config);
 
-                            if (finalId != 0)
+                            HandshakeResult result = await ServerHandshaker(
+                                acceptedClient,
+                                _config,
+                                () =>
+                                {
+                                    while (true)
+                                    {
+                                        int current = Volatile.Read(ref _totalConnections);
+                                        if (current >= _config.MaxConnectionCount)
+                                            return false;
+
+                                        if (Interlocked.CompareExchange(ref _totalConnections, current + 1, current) == current)
+                                        {
+                                            slotReserved = true;
+                                            return true;
+                                        }
+                                    }
+                                }
+                            );
+
+                            if (result.Success)
                             {
-                                PromoteClient(finalId, acceptedClient);
+                                PromoteClient(result.ClientId, acceptedClient);
                                 promoted = true;
                             }
                             else
                             {
+                                LiminalLogger.LogWarning($"[Transport] Handshake rejected client: {result.FailureReason} - {result.FailureMessage}");
                                 try { acceptedClient.Close(); } catch { }
                             }
                         }
@@ -423,7 +434,7 @@ namespace Liminal.Net.Transports
                         }
                         finally
                         {
-                            if (!promoted)
+                            if (!promoted && slotReserved)
                             {
                                 Interlocked.Decrement(ref _totalConnections);
                             }
@@ -432,10 +443,7 @@ namespace Liminal.Net.Transports
 
                     handedOff = true;
                 }
-                catch (ObjectDisposedException)
-                {
-                    break;
-                }
+                catch (ObjectDisposedException) { break; }
                 catch (SocketException ex)
                 {
                     if (!_isConnected || !_isServer || listener != _listener) break;
@@ -450,7 +458,6 @@ namespace Liminal.Net.Transports
                 {
                     if (client != null && !handedOff)
                     {
-                        if (counted) Interlocked.Decrement(ref _totalConnections);
                         try { client.Close(); } catch { }
                     }
                 }

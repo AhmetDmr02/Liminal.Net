@@ -10,7 +10,8 @@ namespace Liminal.Net.Interfaces
     public delegate void TransportEventHandler();
     public delegate void ClientConnectionHandler(ushort clientId);
 
-    public delegate Task<ushort> HandshakeOrchestrator<T>(T connection, LiminalTransportConfig config);
+    public delegate Task<HandshakeResult> ClientHandshakeOrchestrator<T>(T connection, LiminalTransportConfig config);
+    public delegate Task<HandshakeResult> ServerHandshakeOrchestrator<T>(T connection, LiminalTransportConfig config, Func<bool> canAccept);
 
     public interface ILiminalTransport
     {

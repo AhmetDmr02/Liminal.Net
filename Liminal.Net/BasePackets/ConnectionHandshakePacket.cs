@@ -21,14 +21,12 @@ namespace Liminal.Net.BasePackets
     [LiminalPacket]
     public struct ConnectionHandshakePacketServer
     {
-        [Key(0)]
-        public ushort ServerVersion { get; set; }
+        [Key(0)] public ushort ServerVersion;
+        [Key(1)] public ushort AssignedClientID; // 0 = rejected
+        [Key(2)] public uint PacketRegistryHash;
 
-        [Key(1)]
-        public ushort AssignedClientID { get; set; }
-
-        [Key(2)] 
-        public uint PacketRegistryHash { get; set; }
+        [Key(3)] public DisconnectReason RejectReason;
+        [Key(4)] public string RejectMessage;
     }
 
     [MessagePackObject]
