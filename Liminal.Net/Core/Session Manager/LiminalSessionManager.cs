@@ -142,31 +142,51 @@ namespace Liminal.Net.Core
             TelemetryFlags activeFlags = _telemetryConfig?.Flags ?? TelemetryFlags.None;
             bool countPackets = (activeFlags & TelemetryFlags.PacketCounting) != 0;
 
-            if (!_sessions.TryGetValue(targetId, out var session))
+            bool isHostMode = _transport.IsServer && _transport.IsClient;
+            ushort localClientId = _transport.LocalClientId;
+
+            bool isSelfSend = !isHostMode && (targetId == localClientId);
+            bool isHostClientToServer = isHostMode && (targetId == ILiminalTransport.SERVER_ID);
+            bool isHostServerToClient = isHostMode && (targetId == localClientId);
+
+            if (isSelfSend || isHostClientToServer || isHostServerToClient)
             {
-                if (targetId == _transport.LocalClientId)
+                if (_loopbackQueue.Count >= _config.MaxPacketCount)
                 {
-                    if (_loopbackQueue.Count >= _config.MaxPacketCount)
-                    {
-                        LiminalLogger.LogError($"[SessionManager] Loopback queue overflow for local client. Dropping self-packet.");
-
-                        return;
-                    }
-
-                    byte[] rentedBuffer = _privatePool.Rent(payload.Length);
-                    payload.CopyTo(rentedBuffer);
-
-                    var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
-
-                    if (countPackets)
-                    {
-                        Interlocked.Increment(ref _totalPacketsOutbound);
-                    }
-
-                    _loopbackQueue.Enqueue((targetId, packet));
+                    LiminalLogger.LogError("[SessionManager] Loopback queue overflow. Dropping packet.");
                     return;
                 }
 
+                byte[] rentedBuffer = _privatePool.Rent(payload.Length);
+                payload.CopyTo(rentedBuffer);
+
+                var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
+
+                if (countPackets)
+                {
+                    Interlocked.Increment(ref _totalPacketsOutbound);
+                }
+
+                ushort senderId;
+                if (isHostServerToClient)
+                {
+                    senderId = ILiminalTransport.SERVER_ID;
+                }
+                else if (isHostClientToServer)
+                {
+                    senderId = localClientId;
+                }
+                else
+                {
+                    senderId = localClientId;
+                }
+
+                _loopbackQueue.Enqueue((senderId, packet));
+                return;
+            }
+
+            if (!_sessions.TryGetValue(targetId, out var session))
+            {
                 LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
                 return;
             }

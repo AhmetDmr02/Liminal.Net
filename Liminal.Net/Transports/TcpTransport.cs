@@ -121,6 +121,10 @@ namespace Liminal.Net.Transports
 
         internal readonly ConcurrentDictionary<ushort, TcpClient> _sockets = new();
 
+
+        private readonly ConcurrentDictionary<TcpClient, byte> _finalizedConnections = new();
+        private bool TryClaimDisconnect(TcpClient client) => _finalizedConnections.TryAdd(client, 0);
+
         private int _isShuttingDown = 0;
 
         public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
@@ -201,7 +205,8 @@ namespace Liminal.Net.Transports
         }
         public virtual void Kick(ushort clientId)
         {
-            if (!_isServer) return;
+            if (!_isServer)
+                return;
 
             if (clientId == ILiminalTransport.SERVER_ID)
             {
@@ -211,20 +216,31 @@ namespace Liminal.Net.Transports
 
             if (clientId == LocalClientId && LocalClientId != ILiminalTransport.SERVER_ID)
             {
-                LiminalLogger.LogWarning($"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
+                LiminalLogger.LogWarning(
+                    $"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
+
                 Shutdown();
                 return;
             }
-
             if (_sockets.TryGetValue(clientId, out var clientSocket))
             {
                 _onClientKicked?.Invoke(clientId);
                 try { clientSocket.Close(); } catch { }
+                _sockets.TryRemove(clientId, out _);
+
+                if (TryClaimDisconnect(clientSocket))
+                {
+                    Interlocked.Decrement(ref _totalConnections);
+                    _onClientDisconnected?.Invoke(clientId);
+                    LiminalLogger.Log($"[Transport] Client {clientId} disconnected.");
+                }
+
                 LiminalLogger.Log($"[Transport] Kicked client {clientId}.");
             }
             else
             {
-                LiminalLogger.LogError($"[Transport] Couldn't find socket for client {clientId}");
+                LiminalLogger.LogError(
+                    $"[Transport] Couldn't find socket for client {clientId}");
             }
         }
 
@@ -270,6 +286,7 @@ namespace Liminal.Net.Transports
             {
                 Interlocked.Exchange(ref _isShuttingDown, 0);
                 Volatile.Write(ref _totalConnections, 0);
+                _finalizedConnections.Clear();
             }
         }
         #endregion
@@ -476,10 +493,11 @@ namespace Liminal.Net.Transports
             _sockets.AddOrUpdate(clientId, client, (key, old) =>
             {
                 LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
+
+                TryClaimDisconnect(old);
+
                 try { old.Close(); } catch { }
-
                 Interlocked.Decrement(ref _totalConnections);
-
                 return client;
             });
 
@@ -542,7 +560,13 @@ namespace Liminal.Net.Transports
                     Memory<byte> receiveTarget = ingestBuffer.Memory.Slice(bytesInBuffer, remainingSpace);
                     int read = 0;
 
-                    if (_config.ReceiveResponseTimeout > 0)
+                    // never carries real traffic BufferPacket routes all self addressed packets
+                    // through the in-memory loopback queue instead. Applying the inactivity timeout
+                    // to this socket is always a false positive, so skip it here.
+                    bool isHostSelfLoop = _isServer && _isClient &&
+                        (incomingId == ILiminalTransport.SERVER_ID || incomingId == _localClientId);
+
+                    if (_config.ReceiveResponseTimeout > 0 && !isHostSelfLoop)
                     {
                         using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ReceiveResponseTimeout));
                         try
@@ -633,15 +657,16 @@ namespace Liminal.Net.Transports
             {
                 if (_isShuttingDown == 0)
                 {
-                    bool isServerConn = (incomingId == ILiminalTransport.SERVER_ID);
-                    bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets)
-                                   .Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
+                    bool isServerConn = incomingId == ILiminalTransport.SERVER_ID;
 
                     try { client.Close(); } catch { }
 
                     if (!isServerConn)
                     {
-                        if (removed)
+                        ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets)
+                            .Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
+
+                        if (TryClaimDisconnect(client))
                         {
                             Interlocked.Decrement(ref _totalConnections);
                             _onClientDisconnected?.Invoke(incomingId);
@@ -654,6 +679,8 @@ namespace Liminal.Net.Transports
                         _onLocalClientDisconnected?.Invoke(_localClientId);
                         Shutdown();
                     }
+
+                    _finalizedConnections.TryRemove(client, out _);
                 }
             }
         }

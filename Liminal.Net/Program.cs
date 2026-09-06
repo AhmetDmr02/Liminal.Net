@@ -31,10 +31,12 @@ namespace Liminal.Net
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = 7777,
-                TickRate = 60,
+                TickRate = 20,
                 MaxPacketSizePerBatch = 4096,
                 InboundPacketProcessors = new(),
                 OutboundPacketProcessors = new(),
+                ReceiveResponseTimeout = 5.0f,
+                SendResponseTimeout = 5.0f,
                 ClientIdResolver = new BaseResolver()
             };
 
@@ -42,7 +44,7 @@ namespace Liminal.Net
             var telemetryConfig = new LiminalTelemetryConfig
             {
                 Flags = TelemetryFlags.All,
-                PollIntervalInSeconds = 0.1f
+                PollIntervalInSeconds = 0.2f
             };
 
             var transport = new TcpTransport();
@@ -126,6 +128,7 @@ namespace Liminal.Net
                 case "spam": HandleSpamCommand(args); break;
                 case "stopspam": StopSpam(); break;
                 case "kick": HandleKickCommand(args); break;
+                case "telemetry": WriteTelemetry(); break;
                 case "reset":
                     _rttAverager.Reset();
                     Interlocked.Exchange(ref _totalSent, 0);
@@ -136,6 +139,17 @@ namespace Liminal.Net
                     Console.WriteLine($"Local ID: {_manager.Transport.LocalClientId}");
                     break;
             }
+        }
+
+        private static void WriteTelemetry()
+        {
+            if (_manager.Role == NetworkRole.None)
+            {
+                Console.WriteLine("Network is not active.");
+                return;
+            }
+
+            Console.WriteLine($"Outbound: {_manager.TelemetryManager?.LatestTransportSnapshot.TotalBytesOutbound} bytes | Inbound: {_manager.TelemetryManager?.LatestTransportSnapshot.TotalBytesInbound} bytes");
         }
 
         private static void HandleRttCommand()

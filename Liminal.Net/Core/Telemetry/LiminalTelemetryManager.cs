@@ -22,7 +22,6 @@ namespace Liminal.Net.Core
         private readonly long _sampleIntervalTicks;
         private long _lastSampleTimestamp;
 
-        // Client-side RTT & In-Flight State
         private double _currentRttMs;
         public double RTT => Volatile.Read(ref _currentRttMs);
 
@@ -71,6 +70,12 @@ namespace Liminal.Net.Core
 
         public bool TryGetClientRTT(ushort clientId, out double rttMs)
         {
+            if (clientId == ILiminalTransport.SERVER_ID)
+            {
+                rttMs = RTT;
+                return rttMs > 0.0;
+            }
+
             return _clientRttMap.TryGetValue(clientId, out rttMs);
         }
 
@@ -129,25 +134,24 @@ namespace Liminal.Net.Core
         {
             long now = Stopwatch.GetTimestamp();
 
-            if (_networkManager.Role == NetworkRole.Client)
+            if (_networkManager.Role == NetworkRole.Client || _networkManager.Role == NetworkRole.Host)
             {
                 long inFlightAt = Volatile.Read(ref _clientPingInFlightTimestamp);
 
-                if (inFlightAt != 0 && (now - inFlightAt) < PingTimeoutTicks)
+                if (inFlightAt == 0 || (now - inFlightAt) >= PingTimeoutTicks)
                 {
-                    return;
+                    uint nextSeq = unchecked(++_clientPingSequence);
+                    Volatile.Write(ref _clientPingInFlightTimestamp, now);
+
+                    _networkManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new PingPacket
+                    {
+                        SequenceId = nextSeq,
+                        TimestampTicks = now
+                    });
                 }
-
-                uint nextSeq = unchecked(++_clientPingSequence);
-                Volatile.Write(ref _clientPingInFlightTimestamp, now);
-
-                _networkManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new PingPacket
-                {
-                    SequenceId = nextSeq,
-                    TimestampTicks = now
-                });
             }
-            else if (_networkManager.Role == NetworkRole.Server || _networkManager.Role == NetworkRole.Host)
+
+            if (_networkManager.Role == NetworkRole.Server || _networkManager.Role == NetworkRole.Host)
             {
                 Span<ushort> ids = stackalloc ushort[_networkManager.Transport.Config.MaxConnectionCount];
                 int count = _networkManager.SessionManager.GetSessionIds(ids);
@@ -155,13 +159,17 @@ namespace Liminal.Net.Core
                 for (int i = 0; i < count; i++)
                 {
                     ushort targetId = ids[i];
-                    if (targetId == _networkManager.localID) continue;
+
+                    // Never let the server ping ID 0 (itself) or its own local client
+                    // that RTT is already captured by the client-side ping above.
+                    if (targetId == ILiminalTransport.SERVER_ID) continue;
+                    if (_networkManager.Role == NetworkRole.Host && targetId == _networkManager.localID) continue;
 
                     if (_serverInFlightPings.TryGetValue(targetId, out var state) && state.Timestamp != 0)
                     {
                         if ((now - state.Timestamp) < PingTimeoutTicks)
                         {
-                            continue; // Still awaiting response to active ping
+                            continue;
                         }
                     }
 
@@ -179,7 +187,6 @@ namespace Liminal.Net.Core
 
         private void HandlePing(PingPacket packet, ushort sender)
         {
-            // Echo back matching sequence and timestamp
             _networkManager.Interpreter.SendCommand(sender, new PongPacket
             {
                 SequenceId = packet.SequenceId,
@@ -191,7 +198,10 @@ namespace Liminal.Net.Core
         {
             long stop = Stopwatch.GetTimestamp();
 
-            if (_networkManager.Role == NetworkRole.Client)
+            bool isServerOrSelf = sender == ILiminalTransport.SERVER_ID ||
+                                  (_networkManager.Role == NetworkRole.Host && sender == _networkManager.localID);
+
+            if (isServerOrSelf)
             {
                 uint expectedSeq = Volatile.Read(ref _clientPingSequence);
                 long inFlightAt = Volatile.Read(ref _clientPingInFlightTimestamp);
@@ -201,19 +211,22 @@ namespace Liminal.Net.Core
                     return;
                 }
 
-                long elapsedTicks = stop - packet.TimestampTicks;
+                long elapsedTicks = Math.Max(0, stop - packet.TimestampTicks);
                 double ms = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
 
                 Volatile.Write(ref _currentRttMs, ms);
-                Volatile.Write(ref _clientPingInFlightTimestamp, 0); 
-            }
-            else
-            {
-                if (!_serverInFlightPings.TryGetValue(sender, out var state))
+                Volatile.Write(ref _clientPingInFlightTimestamp, 0);
+
+                if (_networkManager.Role == NetworkRole.Host)
                 {
-                    return; 
+                    _clientRttMap[_networkManager.localID] = ms;
                 }
 
+                return;
+            }
+
+            if (_serverInFlightPings.TryGetValue(sender, out var state))
+            {
                 if (packet.SequenceId != state.SequenceId || state.Timestamp == 0)
                 {
                     return;
@@ -275,6 +288,14 @@ namespace Liminal.Net.Core
     {
         public readonly long TotalBytesInbound;
         public readonly long TotalBytesOutbound;
+
+        public double InboundKB => TotalBytesInbound / 1024.0;
+        public double InboundMB => TotalBytesInbound / (1024.0 * 1024.0);
+        public double InboundGB => TotalBytesInbound / (1024.0 * 1024.0 * 1024.0);
+
+        public double OutboundKB => TotalBytesOutbound / 1024.0;
+        public double OutboundMB => TotalBytesOutbound / (1024.0 * 1024.0);
+        public double OutboundGB => TotalBytesOutbound / (1024.0 * 1024.0 * 1024.0);
 
         /// <summary>
         /// Packet loss ratio (0.0 to 1.0). Always 0 on reliable stream transports like TCP.
