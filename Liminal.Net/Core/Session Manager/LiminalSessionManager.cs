@@ -3,19 +3,27 @@ using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 
 namespace Liminal.Net.Core
 {
-    public class LiminalSessionManager : IDisposable
+    public class LiminalSessionManager : IDisposable, ISessionTelemetryProvider
     {
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
+
         private readonly ConcurrentQueue<(ushort SenderId, InboundPacket Packet)> _loopbackQueue = new();
         private readonly ILiminalTransport _transport;
         private readonly LiminalTransportConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
         private volatile bool _sessionManagerDisposed;
+
+        private long _totalPacketsInbound;
+        private long _totalPacketsOutbound;
+
+        private volatile LiminalTelemetryConfig _telemetryConfig;
 
         private readonly LiminalPacketInterpreter _interpreter;
 
@@ -48,6 +56,10 @@ namespace Liminal.Net.Core
         private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData)
         {
             if (_sessionManagerDisposed || !_sessions.TryGetValue(ownerId, out var session)) return;
+
+            TelemetryFlags activeFlags = _telemetryConfig?.Flags ?? TelemetryFlags.None;
+            bool countPackets = (activeFlags & TelemetryFlags.PacketCounting) != 0;
+            int inboundBatchCount = 0;
 
             try
             {
@@ -88,6 +100,11 @@ namespace Liminal.Net.Core
 
                         session.InboundQueue.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen));
 
+                        if (countPackets)
+                        {
+                            inboundBatchCount++;
+                        }
+
                         offset += 4 + totalLen;
                     }
                 }
@@ -105,6 +122,13 @@ namespace Liminal.Net.Core
                     _transport.Disconnect();
                 }
             }
+            finally
+            {
+                if (inboundBatchCount > 0)
+                {
+                    Interlocked.Add(ref _totalPacketsInbound, inboundBatchCount);
+                }
+            }
         }
 
         #endregion
@@ -115,6 +139,9 @@ namespace Liminal.Net.Core
         {
             if (_sessionManagerDisposed) return;
 
+            TelemetryFlags activeFlags = _telemetryConfig?.Flags ?? TelemetryFlags.None;
+            bool countPackets = (activeFlags & TelemetryFlags.PacketCounting) != 0;
+
             if (!_sessions.TryGetValue(targetId, out var session))
             {
                 if (targetId == _transport.LocalClientId)
@@ -122,6 +149,7 @@ namespace Liminal.Net.Core
                     if (_loopbackQueue.Count >= _config.MaxPacketCount)
                     {
                         LiminalLogger.LogError($"[SessionManager] Loopback queue overflow for local client. Dropping self-packet.");
+
                         return;
                     }
 
@@ -129,6 +157,11 @@ namespace Liminal.Net.Core
                     payload.CopyTo(rentedBuffer);
 
                     var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
+
+                    if (countPackets)
+                    {
+                        Interlocked.Increment(ref _totalPacketsOutbound);
+                    }
 
                     _loopbackQueue.Enqueue((targetId, packet));
                     return;
@@ -172,6 +205,11 @@ namespace Liminal.Net.Core
                 payload.CopyTo(dest.Slice(6));
 
                 session.RawSendCursor += frameSize;
+
+                if (countPackets)
+                {
+                    Interlocked.Increment(ref _totalPacketsOutbound);
+                }
             }
         }
 
@@ -299,7 +337,6 @@ namespace Liminal.Net.Core
         private void HandleClientDisconnected(ushort id)
         {
             _pendingDisconnects.Enqueue(id);
-
         }
 
         private void ProcessPendingDisconnects()
@@ -358,8 +395,53 @@ namespace Liminal.Net.Core
         }
         #endregion
 
-        #region Test Helpers
+        #region Helpers
         public int GetActiveSessionCount() => _sessions.Count;
+
+
+        /// <summary>
+        /// Copies active session IDs into the destination span up to its capacity.
+        /// </summary>
+        /// <param name="destination">Span to receive session IDs.</param>
+        /// <returns>The actual number of Ids written into destination.</returns>
+        public int GetSessionIds(Span<ushort> destination)
+        {
+            int written = 0;
+            int maxCapacity = destination.Length;
+
+            foreach (var session in _sessions.Values)
+            {
+                if (written >= maxCapacity)
+                {
+                    // Destination buffer was too small to hold all concurrent sessions
+                    LiminalLogger.LogWarning(
+                        $"[SessionManager] Buffer capacity ({maxCapacity}) reached. Truncating session ID copy.");
+                    break;
+                }
+
+                destination[written++] = session.Id;
+            }
+
+            return written;
+        }
+        #endregion
+
+        #region ISessionTelemetryProvider
+
+        public GlobalSessionTelemetrySnapshot GetGlobalSnapshot()
+        {
+            return new GlobalSessionTelemetrySnapshot(
+                activeSessionCount: _sessions.Count,
+                loopbackQueueCount: _loopbackQueue.Count,
+                totalPacketsInbound: Volatile.Read(ref _totalPacketsInbound),
+                totalPacketsOutbound: Volatile.Read(ref _totalPacketsOutbound)
+            );
+        }
+
+        public void InitializeConfig(LiminalTelemetryConfig config)
+        {
+            _telemetryConfig = config;
+        }
         #endregion
     }
 }

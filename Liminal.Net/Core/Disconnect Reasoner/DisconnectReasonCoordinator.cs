@@ -18,7 +18,7 @@ namespace Liminal.Net.Core
     {
         private readonly ILiminalTransport _transport;
         private readonly LiminalPacketInterpreter _interpreter;
-        private readonly ILiminalTransportDiagnostics _diagnostics;
+        private readonly ILiminalTransportDisconnectDiagnostics _diagnostics;
         private readonly LiminalTransportConfig _config;
 
         private readonly ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message)> _resolved = new();
@@ -38,7 +38,7 @@ namespace Liminal.Net.Core
 
             _config = _transport.Config;
 
-            _diagnostics = transport as ILiminalTransportDiagnostics;
+            _diagnostics = transport as ILiminalTransportDisconnectDiagnostics;
             if (_diagnostics != null)
                 _diagnostics.OnTransportDisconnectReason += HandleTransportReason;
 

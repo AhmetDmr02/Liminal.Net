@@ -33,7 +33,7 @@ namespace Liminal.Net.Core
             _tickThread.Start();
         }
 
-        public void Stop()
+        public virtual void Stop()
         {
             if (!_isRunning) return;
             _isRunning = false;
@@ -48,7 +48,7 @@ namespace Liminal.Net.Core
             _tickThread = null;
         }
 
-        private void RunLoop()
+        protected virtual void RunLoop()
         {
             long targetTickTicks = Stopwatch.Frequency / _config.TickRate;
 

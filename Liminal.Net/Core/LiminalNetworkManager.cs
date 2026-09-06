@@ -31,13 +31,17 @@ namespace Liminal.Net.Core
         private LiminalPacketFramerPipeline _pipeline;
         private LiminalTicker _ticker;
 
+        public LiminalTelemetryManager TelemetryManager { get; private set; }
+        private readonly LiminalTelemetryConfig _telemetryConfig;
+
         public DisconnectReasonCoordinator DisconnectCoordinator { get; private set; }
 
         public event Action<ushort, DisconnectReason, string> OnDisconnectResolved;
 
         public ushort localID => _transport.LocalClientId;
 
-        public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config)
+        public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config,
+        LiminalTelemetryConfig telemetryConfig = null)
         {
             Instance = this;
 
@@ -46,6 +50,7 @@ namespace Liminal.Net.Core
 
             _transport = transport;
             _config = config;
+            _telemetryConfig = telemetryConfig ?? new LiminalTelemetryConfig { Flags = TelemetryFlags.None };
 
             Interpreter = new LiminalPacketInterpreter(_config);
 
@@ -76,6 +81,8 @@ namespace Liminal.Net.Core
             DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
             _ticker = new LiminalTicker(_config);
+
+            TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
         }
 
         private void HandleDisconnectResolved(ushort id, DisconnectReason reason, string message)
@@ -86,6 +93,10 @@ namespace Liminal.Net.Core
         private void ShutdownSystems()
         {
             _ticker?.Stop();
+
+            TelemetryManager?.Dispose();
+            TelemetryManager = null;
+
             SessionManager?.Dispose();
 
             // Last flush to trigger internal dispose

@@ -22,7 +22,7 @@ namespace Liminal.Net.Transports
     /// <summary>
     /// It uses tcp by default
     /// </summary>
-    public class TcpTransport<TContext> : ILiminalTransport, ILiminalTransportDiagnostics where TContext : struct
+    public class TcpTransport<TContext> : ILiminalTransport, ITransportTelemetryProvider, ILiminalTransportDisconnectDiagnostics where TContext : struct
     {
         protected volatile ushort _localClientId = 0;
         public ushort LocalClientId => _localClientId;
@@ -311,6 +311,11 @@ namespace Liminal.Net.Transports
                     try
                     {
                         socket.GetStream().Write(fullPacket);
+
+                        if ((_telemetryConfig?.Flags & TelemetryFlags.ByteCounting) != 0)
+                        {
+                            Interlocked.Add(ref _totalBytesOutbound, totalSize);
+                        }
                     }
                     catch (Exception ex) when (ex is ObjectDisposedException || ex is InvalidOperationException || ex is IOException || ex is SocketException)
                     {
@@ -559,6 +564,11 @@ namespace Liminal.Net.Transports
 
                     if (read <= 0) break;
 
+                    if ((_telemetryConfig?.Flags & TelemetryFlags.ByteCounting) != 0)
+                    {
+                        Interlocked.Add(ref _totalBytesInbound, read);
+                    }
+
                     bytesInBuffer += read;
 
 #if NET9_0_OR_GREATER
@@ -699,6 +709,25 @@ namespace Liminal.Net.Transports
                     bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan.Slice(0, remaining));
                 bytesInBuffer = remaining;
             }
+        }
+
+        #endregion
+
+        #region Telemetry
+        private volatile LiminalTelemetryConfig _telemetryConfig;
+        private long _totalBytesInbound;
+        private long _totalBytesOutbound;
+        public GlobalTransportTelemetrySnapshot GetGlobalTransportSnapshot()
+        {
+            return new GlobalTransportTelemetrySnapshot(
+                    totalBytesInbound: Volatile.Read(ref _totalBytesInbound),
+                    totalBytesOutbound: Volatile.Read(ref _totalBytesOutbound),
+                    packetLossRate: 0.0f // We have no way to reach internal status of the OS stack so we can't calculate this in tcp
+                );
+        }
+        public void InitializeConfig(LiminalTelemetryConfig config)
+        {
+            _telemetryConfig = config;
         }
         #endregion
     }

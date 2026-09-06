@@ -1,5 +1,6 @@
 ﻿using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
 using System;
@@ -17,7 +18,8 @@ namespace Liminal.Net
         private static ChatPacket? _lastPacket;
         private static ushort _lastTargetId;
         private static CancellationTokenSource _spamCts;
-        private static readonly PacketMonitor _monitor = new PacketMonitor();
+        private static readonly RttAverager _rttAverager = new RttAverager(sampleWindowSize: 10);
+        private static long _totalReceived = 0;
         private static long _totalSent = 0;
 
         public static void Main()
@@ -29,19 +31,26 @@ namespace Liminal.Net
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = 7777,
-                TickRate = 10,
+                TickRate = 60,
                 MaxPacketSizePerBatch = 4096,
                 InboundPacketProcessors = new(),
                 OutboundPacketProcessors = new(),
                 ClientIdResolver = new BaseResolver()
             };
 
+            // Enable active RTT tracking with short poll interval for rapid telemetry updates
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.All,
+                PollIntervalInSeconds = 0.1f
+            };
+
             var transport = new TcpTransport();
-            _manager = new LiminalNetworkManager(transport, config);
+            _manager = new LiminalNetworkManager(transport, config, telemetryConfig);
             _manager.Interpreter.Subscribe<ChatPacket>(OnChatReceived, "Program");
             _manager.Interpreter.Subscribe<FilePacket>(OnFileReceived, "Program");
 
-            Console.WriteLine("Commands: host, server, connect, send {t} {id}, sendfile {file} {id}, spam {pps}, stopspam, reset, disconnect, kick {id}");
+            Console.WriteLine("Commands: host, server, connect, rtt, send {t} {id}, sendfile {file} {id}, spam {pps}, stopspam, reset, disconnect, kick {id}");
 
             bool running = true;
             string inputBuffer = "";
@@ -78,7 +87,18 @@ namespace Liminal.Net
                     }
                 }
 
-                _monitor.UpdateTitle(_totalSent);
+                // Sample and update the rolling average
+                if (_manager.TelemetryManager != null)
+                {
+                    double liveRtt = _manager.TelemetryManager.RTT;
+                    if (liveRtt > 0.0)
+                    {
+                        _rttAverager.AddSample(liveRtt);
+                    }
+                }
+
+                _rttAverager.UpdateTitle(_totalSent, Interlocked.Read(ref _totalReceived), _manager.Role);
+                Thread.Sleep(15);
             }
 
             _manager.Shutdown();
@@ -98,21 +118,74 @@ namespace Liminal.Net
                 case "disconnect":
                     StopSpam();
                     _manager.Disconnect();
+                    _rttAverager.Reset();
                     break;
+                case "rtt": HandleRttCommand(); break;
                 case "send": HandleSendCommand(args); break;
                 case "sendfile": HandleSendFileCommand(args); break;
                 case "spam": HandleSpamCommand(args); break;
                 case "stopspam": StopSpam(); break;
                 case "kick": HandleKickCommand(args); break;
                 case "reset":
-                    _monitor.Reset();
+                    _rttAverager.Reset();
                     Interlocked.Exchange(ref _totalSent, 0);
-                    Console.WriteLine("Counters reset.");
+                    Interlocked.Exchange(ref _totalReceived, 0);
+                    Console.WriteLine("Counters and RTT rolling buffer reset.");
                     break;
                 case "localid":
                     Console.WriteLine($"Local ID: {_manager.Transport.LocalClientId}");
                     break;
             }
+        }
+
+        private static void HandleRttCommand()
+        {
+            if (_manager.Role == NetworkRole.None)
+            {
+                Console.WriteLine("Network is not active.");
+                return;
+            }
+
+            if (_manager.Role == NetworkRole.Client)
+            {
+                double currentRtt = _manager.TelemetryManager?.RTT ?? 0.0;
+                double avgRtt = _rttAverager.GetAverageRtt();
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[RTT -> Server] Current: {currentRtt:F2} ms | Avg: {avgRtt:F2} ms");
+                Console.ResetColor();
+                return;
+            }
+
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("=== Connected Client Latencies ===");
+
+            Span<ushort> clientIds = stackalloc ushort[_manager.Transport.Config.MaxConnectionCount];
+            int count = _manager.SessionManager.GetSessionIds(clientIds);
+
+            int listed = 0;
+            for (int i = 0; i < count; i++)
+            {
+                ushort id = clientIds[i];
+                if (id == _manager.localID) continue; 
+
+                listed++;
+                if (_manager.TelemetryManager != null && _manager.TelemetryManager.TryGetClientRTT(id, out double rtt))
+                {
+                    Console.WriteLine($" Client {id}: {rtt:F2} ms");
+                }
+                else
+                {
+                    Console.WriteLine($" Client {id}: [Sampling in progress...]");
+                }
+            }
+
+            if (listed == 0)
+            {
+                Console.WriteLine(" No remote clients connected.");
+            }
+
+            Console.WriteLine("_____________________");
+            Console.ResetColor();
         }
 
         private static void StopSpam()
@@ -260,18 +333,15 @@ namespace Liminal.Net
 
         private static void OnChatReceived(ChatPacket packet, ushort senderId)
         {
-            _monitor.RecordPacket();
-            if (_monitor.GetCurrentPPS() < 3)
-            {
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"\n[MSG] {senderId}: {packet.Message}");
-                Console.ResetColor();
-            }
+            Interlocked.Increment(ref _totalReceived);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"\n[MSG] {senderId}: {packet.Message}");
+            Console.ResetColor();
         }
 
         private static void OnFileReceived(FilePacket packet, ushort senderId)
         {
-            _monitor.RecordPacket();
+            Interlocked.Increment(ref _totalReceived);
             try
             {
                 string saveDir = Path.Combine(Environment.CurrentDirectory, "ReceivedFiles");
@@ -293,36 +363,63 @@ namespace Liminal.Net
         }
     }
 
-    public class PacketMonitor
+    public class RttAverager
     {
-        private readonly ConcurrentQueue<DateTime> _arrivalTimes = new ConcurrentQueue<DateTime>();
-        private long _totalReceived = 0;
+        private readonly double[] _samples;
+        private int _index;
+        private int _count;
+        private readonly object _lock = new();
 
-        public void RecordPacket()
+        public RttAverager(int sampleWindowSize = 10)
         {
-            _arrivalTimes.Enqueue(DateTime.Now);
-            Interlocked.Increment(ref _totalReceived);
+            _samples = new double[Math.Max(1, sampleWindowSize)];
+        }
+
+        public void AddSample(double rttMs)
+        {
+            lock (_lock)
+            {
+                _samples[_index] = rttMs;
+                _index = (_index + 1) % _samples.Length;
+                if (_count < _samples.Length)
+                {
+                    _count++;
+                }
+            }
+        }
+
+        public double GetAverageRtt()
+        {
+            lock (_lock)
+            {
+                if (_count == 0) return 0.0;
+
+                double sum = 0.0;
+                for (int i = 0; i < _count; i++)
+                {
+                    sum += _samples[i];
+                }
+                return sum / _count;
+            }
         }
 
         public void Reset()
         {
-            Interlocked.Exchange(ref _totalReceived, 0);
-            while (_arrivalTimes.TryDequeue(out _)) { }
+            lock (_lock)
+            {
+                _index = 0;
+                _count = 0;
+                Array.Clear(_samples, 0, _samples.Length);
+            }
         }
 
-        public int GetCurrentPPS()
+        public void UpdateTitle(long sentByMe, long recvByMe, NetworkRole role)
         {
-            DateTime cutoff = DateTime.Now.AddSeconds(-1);
-            while (_arrivalTimes.TryPeek(out DateTime time) && time < cutoff) _arrivalTimes.TryDequeue(out _);
-            return _arrivalTimes.Count;
-        }
+            string roleLabel = role != NetworkRole.None ? $"[{role}] " : "";
+            double avgRtt = GetAverageRtt();
 
-        public void UpdateTitle(long sentByMe)
-        {
-            int pps = GetCurrentPPS();
-            long recv = Interlocked.Read(ref _totalReceived);
-
-            Console.Title = $"PPS: {pps} | Sent: {sentByMe} | Recv: {recv}";
+            string rttText = avgRtt > 0.0 ? $"{avgRtt:F1}ms" : "--";
+            Console.Title = $"{roleLabel}RTT Avg: {rttText} | Sent: {sentByMe} | Recv: {recvByMe}";
         }
     }
 }

@@ -1,19 +1,20 @@
-﻿using Liminal.Net.ClientIdResolvers;
+﻿using Liminal.Net.BasePackets;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
+using MessagePack;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
-using Liminal.Net.BasePackets;
-using MessagePack;
 
 namespace Liminal.Net.Tests
 {
@@ -58,7 +59,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient()
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
         {
             var config = new LiminalTransportConfig
             {
@@ -70,7 +71,7 @@ namespace Liminal.Net.Tests
                 HandshakeTimeout = 15,
                 ConnectionTimeout = 15
             };
-            var client = new LiminalNetworkManager(new TcpTransport(), config);
+            var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
             client.StartClient("127.0.0.1", _currentTestPort);
             return client;
@@ -2335,7 +2336,7 @@ namespace Liminal.Net.Tests
             };
 
             var clientTransport = new TcpTransport();
-            // Tamper client handshake orchestrator to transmit an invalid registry hash
+
             clientTransport.ClientHandshaker = async (tcpClient, cfg) =>
             {
                 var stream = tcpClient.GetStream();
@@ -2401,7 +2402,6 @@ namespace Liminal.Net.Tests
             };
 
             var clientTransport = new TcpTransport();
-            // Client attempts an exploit by writing a huge header size
             clientTransport.ClientHandshaker = async (tcpClient, cfg) =>
             {
                 var stream = tcpClient.GetStream();
@@ -2411,7 +2411,6 @@ namespace Liminal.Net.Tests
 
                 await stream.WriteAsync(maliciousHeader);
 
-                // Server should drop via RST; reading returns EOF or throws SocketException
                 byte[] dummy = new byte[8];
                 int read = await stream.ReadAsync(dummy);
                 return read <= 0
@@ -2436,6 +2435,209 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => fired, 3000), Is.True);
             Assert.That(reason, Is.EqualTo(DisconnectReason.ConnectionLost));
             Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+        }
+
+        #endregion
+
+        #region Telemetry & RTT Integration Tests
+
+        [Test]
+        public void Test55_Telemetry_ByteAndPacketCounting_TracksThroughputAccurately()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig { Flags = TelemetryFlags.All };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            ushort clientId = client.localID;
+
+            int packetsReceived = 0;
+            client.Interpreter.Subscribe<ChatPacket>((pkt, sender) => Interlocked.Increment(ref packetsReceived), this);
+
+            const int packetCount = 20;
+            for (int i = 0; i < packetCount; i++)
+            {
+                _serverManager.Interpreter.SendCommand(clientId, new ChatPacket { Message = $"Telemetry_{i}" });
+            }
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => packetsReceived == packetCount, 2000), Is.True);
+
+            _serverManager.TelemetryManager.Sample();
+            client.TelemetryManager.Sample();
+
+            var serverSessionSnap = _serverManager.TelemetryManager.LatestSessionSnapshot;
+            var serverTransportSnap = _serverManager.TelemetryManager.LatestTransportSnapshot;
+            var clientSessionSnap = client.TelemetryManager.LatestSessionSnapshot;
+            var clientTransportSnap = client.TelemetryManager.LatestTransportSnapshot;
+
+            Assert.Multiple(() =>
+            {
+                // Server Outbound
+                Assert.That(serverSessionSnap.TotalPacketsOutbound, Is.GreaterThanOrEqualTo(packetCount));
+                Assert.That(serverTransportSnap.TotalBytesOutbound, Is.GreaterThan(0));
+
+                // Client Inbound
+                Assert.That(clientSessionSnap.TotalPacketsInbound, Is.GreaterThanOrEqualTo(packetCount));
+                Assert.That(clientTransportSnap.TotalBytesInbound, Is.GreaterThan(0));
+            });
+        }
+
+        [Test]
+        public void Test56_Telemetry_RTT_MeasuresNonZeroLatencyBetweenPeers()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.All,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            ushort clientId = client.localID;
+
+            bool rttUpdated = SpinWait.SpinUntil(() =>
+            {
+                return client.TelemetryManager != null &&
+                       client.TelemetryManager.RTT > 0.0 &&
+                       _serverManager.TelemetryManager.TryGetClientRTT(clientId, out double serverSeenRtt) &&
+                       serverSeenRtt > 0.0;
+            }, 3000);
+
+            Assert.That(rttUpdated, Is.True, "RTT measurement failed to complete for client or server.");
+            Assert.That(client.TelemetryManager.RTT, Is.LessThan(150.0), "Local loopback RTT unusually high.");
+        }
+
+        [Test]
+        public void Test57_Telemetry_InFlightGating_PreventsSpammingWhenPongDelayed()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.RTT,
+                PollIntervalInSeconds = 0f 
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            int pingCount = 0;
+            _serverManager.Interpreter.UnsubscribeAll(_serverManager.TelemetryManager);
+            _serverManager.Interpreter.Subscribe<PingPacket>((pkt, sender) =>
+            {
+                Interlocked.Increment(ref pingCount);
+            }, this);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            Thread.Sleep(300);
+
+            Assert.That(pingCount, Is.EqualTo(1), "In-flight gate failed; client spammed multiple pings without receiving pong.");
+        }
+
+        [Test]
+        public void Test58_Telemetry_StalePongSequence_IsRejectedAndDoesNotPoisonRTT()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.All,
+                PollIntervalInSeconds = 10f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            client.TelemetryManager.Sample();
+            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.RTT > 0.0, 2000), Is.True);
+            double baselineRtt = client.TelemetryManager.RTT;
+
+            long ancientTimestamp = Stopwatch.GetTimestamp() - (Stopwatch.Frequency * 10);
+            var stalePong = new PongPacket
+            {
+                SequenceId = 99999, 
+                TimestampTicks = ancientTimestamp
+            };
+
+            _serverManager.Interpreter.SendCommand(client.localID, stalePong);
+            _serverManager.SessionManager.Flush();
+
+            Thread.Sleep(100);
+
+            Assert.That(client.TelemetryManager.RTT, Is.LessThan(1000.0),
+                "Stale pong with unmatched SequenceId poisoned client RTT calculation.");
+            Assert.That(client.TelemetryManager.RTT, Is.EqualTo(baselineRtt),
+                "RTT changed unexpectedly despite no new pings being scheduled.");
+        }
+
+        [Test]
+        public void Test59_Telemetry_ClientDisconnect_EvictsServerTrackingDictionaries()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.All,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            ushort clientId = client.localID;
+
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.TelemetryManager.TryGetClientRTT(clientId, out _), 2000), Is.True);
+
+            client.Disconnect();
+
+            bool removed = SpinWait.SpinUntil(() =>
+            {
+                return !_serverManager.TelemetryManager.TryGetClientRTT(clientId, out _);
+            }, 2000);
+
+            Assert.That(removed, Is.True, "Server failed to evict disconnected client ID from telemetry tracking dictionary.");
+        }
+
+        [Test]
+        public void Test60_Telemetry_LocalClientDisconnect_ResetsInFlightGateAndMetrics()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.All,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.RTT > 0.0, 3000), Is.True);
+
+            var clientTelemetry = client.TelemetryManager;
+
+            client.Transport.Disconnect();
+
+            Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 2000), Is.True);
+
+            Assert.That(clientTelemetry.RTT, Is.EqualTo(0.0),
+                "Client telemetry state was not zeroed upon local disconnect.");
         }
 
         #endregion
