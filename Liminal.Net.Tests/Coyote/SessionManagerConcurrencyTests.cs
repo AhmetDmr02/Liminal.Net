@@ -30,7 +30,7 @@ namespace Liminal.Net.Tests
             var t2 = Task.Run(() => {
                 for (int i = 0; i < 15; i++)
                 {
-                    manager.BufferPacket(clientId, 1, payload);
+                    manager.BufferPacket(transport.LocalClientId, clientId, 1, payload);
                     manager.Flush();
                 }
             });
@@ -83,7 +83,7 @@ namespace Liminal.Net.Tests
 
             byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "RaceSpam" });
 
-            interpreter.OnSendRequest += (sessionId, pid, payload) =>
+            interpreter.OnSendRequest += (senderId, sessionId, pid, payload) =>
             {
                 if (payload.Length > 0)
                 {

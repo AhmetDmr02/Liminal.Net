@@ -135,7 +135,7 @@ namespace Liminal.Net.Core
 
         #region Write Path (Game Thread)
 
-        public void BufferPacket(ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
+        public void BufferPacket(ushort senderId, ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
         {
             if (_sessionManagerDisposed) return;
 
@@ -145,11 +145,9 @@ namespace Liminal.Net.Core
             bool isHostMode = _transport.IsServer && _transport.IsClient;
             ushort localClientId = _transport.LocalClientId;
 
-            bool isSelfSend = !isHostMode && (targetId == localClientId);
-            bool isHostClientToServer = isHostMode && (targetId == ILiminalTransport.SERVER_ID);
-            bool isHostServerToClient = isHostMode && (targetId == localClientId);
+            bool isLocalDestination = (targetId == localClientId) || (isHostMode && targetId == ILiminalTransport.SERVER_ID);
 
-            if (isSelfSend || isHostClientToServer || isHostServerToClient)
+            if (isLocalDestination)
             {
                 if (_loopbackQueue.Count >= _config.MaxPacketCount)
                 {
@@ -165,20 +163,6 @@ namespace Liminal.Net.Core
                 if (countPackets)
                 {
                     Interlocked.Increment(ref _totalPacketsOutbound);
-                }
-
-                ushort senderId;
-                if (isHostServerToClient)
-                {
-                    senderId = ILiminalTransport.SERVER_ID;
-                }
-                else if (isHostClientToServer)
-                {
-                    senderId = localClientId;
-                }
-                else
-                {
-                    senderId = localClientId;
                 }
 
                 _loopbackQueue.Enqueue((senderId, packet));

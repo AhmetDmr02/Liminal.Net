@@ -44,7 +44,7 @@ namespace Liminal.Net
             var telemetryConfig = new LiminalTelemetryConfig
             {
                 Flags = TelemetryFlags.All,
-                PollIntervalInSeconds = 0.2f
+                PollIntervalInSeconds = 1.33f
             };
 
             var transport = new TcpTransport();
@@ -59,11 +59,6 @@ namespace Liminal.Net
 
             while (running)
             {
-                if (_manager.Role != NetworkRole.None)
-                {
-                    _manager.ManualPoll();
-                }
-
                 if (Console.KeyAvailable)
                 {
                     var key = Console.ReadKey(intercept: true);
@@ -124,6 +119,7 @@ namespace Liminal.Net
                     break;
                 case "rtt": HandleRttCommand(); break;
                 case "send": HandleSendCommand(args); break;
+                case "sendasclient": HandleSendAsClientCommand(args); break;
                 case "sendfile": HandleSendFileCommand(args); break;
                 case "spam": HandleSpamCommand(args); break;
                 case "stopspam": StopSpam(); break;
@@ -241,6 +237,19 @@ namespace Liminal.Net
                 _lastPacket = new ChatPacket { Message = message };
                 _lastTargetId = targetId;
                 _manager.Interpreter.SendCommand(targetId, _lastPacket.Value);
+                Interlocked.Increment(ref _totalSent);
+            }
+        }
+
+        private static void HandleSendAsClientCommand(string[] args)
+        {
+            if (args.Length < 3) return;
+            if (ushort.TryParse(args[^1], out ushort targetId))
+            {
+                string message = string.Join(" ", args[1..^1]);
+                _lastPacket = new ChatPacket { Message = message };
+                _lastTargetId = targetId;
+                _manager.Interpreter.SendCommandAsClient(targetId, _lastPacket.Value);
                 Interlocked.Increment(ref _totalSent);
             }
         }

@@ -1,4 +1,5 @@
-﻿using MessagePack;
+﻿using Liminal.Net.Interfaces;
+using MessagePack;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -243,14 +244,48 @@ namespace Liminal.Net.Core
             }
         }
 
-#if NET9_0_OR_GREATER
-        public event Action<ushort, ushort, ReadOnlySpan<byte>> OnSendRequest;
-#else
-        public delegate void SendRequestHandler(ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload);
+        public delegate void SendRequestHandler(ushort senderId, ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload);
         public event SendRequestHandler OnSendRequest;
-#endif
 
+        #region SingleSends
         public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        {
+            ushort defaultSender;
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                //Standalone Client always sends from its local ID
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                //On Host: if targeting the Server (0), senderId is localID.
+                //If targeting other clients the server authority is sending, senderId is SERVER_ID.
+                defaultSender = (targetSessionId == ILiminalTransport.SERVER_ID)
+                    ? manager.localID
+                    : ILiminalTransport.SERVER_ID;
+            }
+            else 
+            {
+                // Dedicated Server always sends from SERVER_ID (0)
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendCommandFrom(defaultSender, targetSessionId, packet);
+        }
+        //Host uses these to disambiguate
+        public void SendCommandAsClient<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        {
+            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionId, packet);
+        }
+
+        public void SendCommandAsServer<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        {
+            SendCommandFrom(ILiminalTransport.SERVER_ID, targetSessionId, packet);
+        }
+
+        public void SendCommandFrom<TSendStruct>(ushort senderId, ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
         {
             int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
             if (idInt == 0)
@@ -260,23 +295,57 @@ namespace Liminal.Net.Core
             }
 
             var writer = RentWriter();
-
             try
             {
                 MessagePackSerializer.Serialize(writer, packet);
-                OnSendRequest?.Invoke(targetSessionId, (ushort)idInt, writer.WrittenSpan);
+                OnSendRequest?.Invoke(senderId, targetSessionId, (ushort)idInt, writer.WrittenSpan);
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send! {ex.InnerException?.Message}");
+                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send: {ex.InnerException?.Message}");
             }
             finally
             {
                 _writerPool.Add(writer);
             }
         }
+        #endregion
 
+        #region Multicast Sends
         public void SendCommand<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        {
+            ushort defaultSender;
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                // Host client sending if targets list only contains Server, otherwise Server authority
+                bool targetsOnlyServer = targetSessionIds.Length == 1 && targetSessionIds[0] == ILiminalTransport.SERVER_ID;
+                defaultSender = targetsOnlyServer ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else // NetworkRole.Server
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendCommandFrom(defaultSender, targetSessionIds, packet);
+        }
+
+        public void SendCommandAsServer<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        {
+            SendCommandFrom(ILiminalTransport.SERVER_ID, targetSessionIds, packet);
+        }
+
+        public void SendCommandAsClient<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        {
+            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionIds, packet);
+        }
+
+        public void SendCommandFrom<TSendStruct>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
         {
             if (targetSessionIds.IsEmpty) return;
 
@@ -293,10 +362,11 @@ namespace Liminal.Net.Core
             {
                 MessagePackSerializer.Serialize(writer, packet);
                 var payload = writer.WrittenSpan;
+                ushort packetId = (ushort)idInt;
 
                 for (int i = 0; i < targetSessionIds.Length; i++)
                 {
-                    OnSendRequest?.Invoke(targetSessionIds[i], (ushort)idInt, payload);
+                    OnSendRequest?.Invoke(senderId, targetSessionIds[i], packetId, payload);
                 }
             }
             catch (MessagePackSerializationException ex)
@@ -308,7 +378,7 @@ namespace Liminal.Net.Core
                 _writerPool.Add(writer);
             }
         }
-
+        #endregion
         public void Dispatch(ushort packetId, ushort sender, ReadOnlyMemory<byte> rawData)
         {
             if (_handlers.TryGetValue(packetId, out var dispatcher))
