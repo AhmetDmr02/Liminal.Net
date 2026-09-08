@@ -1148,6 +1148,7 @@ namespace Liminal.Net.Tests
                 TickRate = 60,
                 MaxPacketSizePerBatch = 4096,
                 MaxPacketCount = maxPacketCount,
+                Hiccup = { Enabled = false },
                 ClientIdResolver = new BaseResolver(),
                 ConnectionTimeout = 15,
                 HandshakeTimeout = 15
@@ -1157,6 +1158,8 @@ namespace Liminal.Net.Tests
             customServer.StartServer("127.0.0.1", _currentTestPort);
 
             Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
+
+            customServer.Interpreter.Subscribe<ChatPacket>((pkt, id) => {LiminalLogger.Log($"Server received packet: {pkt.Message}");}, this);
 
             var client = CreateAndStartClient();
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);

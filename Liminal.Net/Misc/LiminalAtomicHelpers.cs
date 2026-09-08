@@ -1,11 +1,10 @@
-﻿using System;
+using System;
 using System.Threading;
 
 namespace Liminal.Net.Misc
 {
     public static class LiminalAtomicHelpers
     {
-        #region Atomic Helper Methods
         public static void SafeAdd<TDelegate>(ref TDelegate field, TDelegate value) where TDelegate : Delegate
         {
             TDelegate current = field;
@@ -17,6 +16,7 @@ namespace Liminal.Net.Misc
                 current = original;
             }
         }
+
         public static void SafeRemove<TDelegate>(ref TDelegate field, TDelegate value) where TDelegate : Delegate
         {
             TDelegate current = field;
@@ -28,6 +28,5 @@ namespace Liminal.Net.Misc
                 current = original;
             }
         }
-        #endregion
     }
 }

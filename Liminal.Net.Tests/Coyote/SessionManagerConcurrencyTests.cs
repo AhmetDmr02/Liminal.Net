@@ -2,7 +2,9 @@
 using Liminal.Net.Core;
 using Liminal.Net.Test;
 using MessagePack;
+using Microsoft.Coyote.Specifications;
 using Microsoft.Coyote.SystematicTesting;
+using System.Buffers.Binary;
 using System.Threading.Tasks;
 using TestAttribute = Microsoft.Coyote.SystematicTesting.TestAttribute;
 
@@ -13,7 +15,16 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestSessionManagerFullPipelineChaos()
         {
-            var config = new LiminalTransportConfig { MaxPacketCount = 5 };
+            var config = new LiminalTransportConfig
+            {
+                MaxPacketSizePerBatch = 64,
+                MaxPacketCount = 10,
+                MaxConnectionCount = 4
+            };
+            config.Hiccup.MaxRecoveryScale = 4;
+            config.Hiccup.GraceCount = 500;
+            config.Hiccup.RecoveryHoldSeconds = 0.0001f;
+
             var transport = new MockTransport();
             var interpreter = new LiminalPacketInterpreter(config);
             var pipeline = new LiminalPacketFramerPipeline(config);
@@ -21,57 +32,78 @@ namespace Liminal.Net.Tests
 
             ushort clientId = 42;
             transport.TriggerClientConnected(clientId);
-            byte[] payload = new byte[64];
 
-            var t1 = Task.Run(() => {
-                for (int i = 0; i < 15; i++) transport.TriggerMessageReceived(payload, clientId);
-            });
+            byte[] rawPayload = new byte[20];
+            byte[] framedPacket = new byte[4 + 2 + rawPayload.Length];
+            BinaryPrimitives.WriteInt32LittleEndian(framedPacket.AsSpan(0, 4), rawPayload.Length + 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(framedPacket.AsSpan(4, 2), 1);
+            rawPayload.CopyTo(framedPacket.AsSpan(6));
 
-            var t2 = Task.Run(() => {
-                for (int i = 0; i < 15; i++)
+            int totalDispatched = 0;
+
+            interpreter.OnSendRequest += (sender, target, pid, data) =>
+            {
+                Interlocked.Increment(ref totalDispatched);
+            };
+
+            var workers = new Task[3];
+
+            workers[0] = Task.Run(async () =>
+            {
+                for (int i = 0; i < 25; i++)
                 {
-                    manager.BufferPacket(transport.LocalClientId, clientId, 1, payload);
-                    manager.Flush();
+                    transport.TriggerMessageReceived(framedPacket, clientId);
+                    await Task.Yield();
                 }
             });
 
-            var t3 = Task.Run(() => {
-                for (int i = 0; i < 15; i++) manager.Poll();
+            workers[1] = Task.Run(async () =>
+            {
+                for (int i = 0; i < 25; i++)
+                {
+                    manager.BufferPacket(transport.LocalClientId, clientId, 1, rawPayload);
+                    await Task.Yield();
+                }
             });
 
-            var t4 = Task.Run(() => transport.Kick(clientId));
+            workers[2] = Task.Run(async () =>
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    await Task.Yield();
+                    transport.Kick(clientId);
+                    await Task.Yield();
+                    transport.TriggerClientConnected(clientId);
+                }
+            });
 
-            await Task.WhenAll(t1, t2, t3, t4);
+            var allWorkers = Task.WhenAll(workers);
+            while (!allWorkers.IsCompleted)
+            {
+                manager.Poll();
+                manager.Flush();
+                await Task.Yield();
+            }
+
+            await allWorkers;
+
+            for (int i = 0; i < 5; i++)
+            {
+                manager.Poll();
+                manager.Flush();
+            }
+
+            manager.Dispose();
+            manager.Flush();
+
+            Specification.Assert(manager.GetActiveSessionCount() == 0,
+                "Sessions were not fully cleaned up after chaos disconnect and shutdown.");
         }
 
         [Test]
         public static async Task TestInterpreterSubscriptionRace()
         {
             var config = new LiminalTransportConfig();
-            var interpreter = new LiminalPacketInterpreter(config);
-            object subscriber = new object();
-            byte[] dummyData = new byte[10];
-
-            ushort packetId = LiminalPacketLibrary.GetId<ChatPacket>();
-            var t1 = Task.Run(() => {
-                for (int i = 0; i < 10; i++) interpreter.Subscribe<ChatPacket>((pkt, id) => { }, subscriber);
-            });
-
-            var t2 = Task.Run(() => {
-                for (int i = 0; i < 10; i++) interpreter.UnsubscribeAll(subscriber);
-            });
-
-            var t3 = Task.Run(() => {
-                for (int i = 0; i < 10; i++) interpreter.Dispatch(packetId, 1, dummyData);
-            });
-
-            await Task.WhenAll(t1, t2, t3);
-        }
-
-        [Test]
-        public static async Task TestInterpreterMulticastAndGhostSubscriptionRace()
-        {
-            var config = new LiminalTransportConfig { MaxPacketSizePerBatch = 4096 };
             var interpreter = new LiminalPacketInterpreter(config);
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
@@ -81,73 +113,65 @@ namespace Liminal.Net.Tests
                 chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
             }
 
-            byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "RaceSpam" });
+            byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "RaceTest" });
 
-            interpreter.OnSendRequest += (senderId, sessionId, pid, payload) =>
+            object subscriberA = new object();
+            object subscriberB = new object();
+            int totalInvocations = 0;
+
+            Action<ChatPacket, ushort> callback = (pkt, id) =>
             {
-                if (payload.Length > 0)
-                {
-                    byte _ = payload[0];
-                }
+                Interlocked.Increment(ref totalInvocations);
             };
 
-            object target = new object();
-            int postUnsubscribeHits = 0;
-            int phaseComplete = 0;
+            var tasks = new Task[4];
 
-            var tSubscribe = Task.Run(() =>
+            tasks[0] = Task.Run(async () =>
             {
-                for (int i = 0; i < 20; i++)
+                for (int i = 0; i < 30; i++)
                 {
-                    interpreter.Subscribe<ChatPacket>((pkt, sender) =>
-                    {
-                        if (Volatile.Read(ref phaseComplete) == 1)
-                        {
-                            Interlocked.Increment(ref postUnsubscribeHits);
-                        }
-                    }, target);
+                    interpreter.Subscribe(callback, subscriberA);
+                    interpreter.Subscribe(callback, subscriberB);
+                    await Task.Yield();
                 }
             });
 
-            var tUnsubscribe = Task.Run(() =>
+            tasks[1] = Task.Run(async () =>
             {
-                for (int i = 0; i < 10; i++)
+                for (int i = 0; i < 30; i++)
                 {
-                    interpreter.UnsubscribeAll(target);
+                    interpreter.Unsubscribe<ChatPacket>(subscriberA);
+                    await Task.Yield();
                 }
             });
 
-            var tDispatch = Task.Run(() =>
+            tasks[2] = Task.Run(async () =>
             {
-                for (int i = 0; i < 20; i++)
+                for (int i = 0; i < 30; i++)
+                {
+                    interpreter.UnsubscribeAll(subscriberB);
+                    await Task.Yield();
+                }
+            });
+
+            tasks[3] = Task.Run(async () =>
+            {
+                for (int i = 0; i < 50; i++)
                 {
                     interpreter.Dispatch(chatPacketId, 1, serializedChat);
+                    await Task.Yield();
                 }
             });
 
-            var tSend = Task.Run(() =>
-            {
-                ushort[] targets = { 1, 2, 3 };
-                for (int i = 0; i < 15; i++)
-                {
-                    interpreter.SendCommand<ChatPacket>(targets.AsSpan(), new ChatPacket { Message = "Multi" });
-                    interpreter.SendCommand(1, new ChatPacket { Message = "Uni" });
-                }
-            });
+            await Task.WhenAll(tasks);
 
-            await Task.WhenAll(tSubscribe, tUnsubscribe, tDispatch, tSend);
+            // Clean teardown check
+            interpreter.ClearAllHandlers();
+            int finalHitsBefore = Volatile.Read(ref totalInvocations);
+            interpreter.Dispatch(chatPacketId, 1, serializedChat);
 
-            interpreter.UnsubscribeAll(target);
-            Volatile.Write(ref phaseComplete, 1);
-
-            for (int i = 0; i < 10; i++)
-            {
-                interpreter.Dispatch(chatPacketId, 1, serializedChat);
-            }
-
-            Microsoft.Coyote.Specifications.Specification.Assert(
-                postUnsubscribeHits == 0,
-                $"GHOST SUBSCRIPTION LEAK: Target received {postUnsubscribeHits} packets after terminal UnsubscribeAll!");
+            Specification.Assert(Volatile.Read(ref totalInvocations) == finalHitsBefore,
+                "Handlers still dispatched after ClearAllHandlers!");
         }
 
         [Test]
@@ -163,43 +187,157 @@ namespace Liminal.Net.Tests
                 chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
             }
 
-            byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "Boom" });
+            byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "GhostHunter" });
 
             object target = new object();
-            int ghostHit = 0;
+            int postUnsubscribeHits = 0;
             int phaseComplete = 0;
 
-            Action<ChatPacket, ushort> cb1 = (pkt, sender) => { };
-            Action<ChatPacket, ushort> cb2 = (pkt, sender) =>
+            Action<ChatPacket, ushort> ghostDetector = (pkt, sender) =>
             {
                 if (Volatile.Read(ref phaseComplete) == 1)
                 {
-                    Interlocked.Increment(ref ghostHit);
+                    Interlocked.Increment(ref postUnsubscribeHits);
                 }
             };
 
-            interpreter.Subscribe(cb1, target);
-
-            var t1 = Task.Run(() =>
+            var t1 = Task.Run(async () =>
             {
-                interpreter.Subscribe(cb2, target);
+                for (int i = 0; i < 40; i++)
+                {
+                    interpreter.Subscribe(ghostDetector, target);
+                    await Task.Yield();
+                }
             });
 
-            var t2 = Task.Run(() =>
+            var t2 = Task.Run(async () =>
             {
-                interpreter.UnsubscribeAll(target);
+                for (int i = 0; i < 40; i++)
+                {
+                    interpreter.UnsubscribeAll(target);
+                    await Task.Yield();
+                }
             });
 
-            await Task.WhenAll(t1, t2);
+            var t3 = Task.Run(async () =>
+            {
+                for (int i = 0; i < 40; i++)
+                {
+                    interpreter.Dispatch(chatPacketId, 1, serializedChat);
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(t1, t2, t3);
 
             interpreter.UnsubscribeAll(target);
             Volatile.Write(ref phaseComplete, 1);
 
-            interpreter.Dispatch(chatPacketId, 1, serializedChat);
+            for (int i = 0; i < 20; i++)
+            {
+                interpreter.Dispatch(chatPacketId, 1, serializedChat);
+            }
 
-            Microsoft.Coyote.Specifications.Specification.Assert(
-                ghostHit == 0,
-                $"GHOST LEAK CONFIRMED: Ghost callback cb2 survived UnsubscribeAll and was invoked!");
+            Specification.Assert(
+                postUnsubscribeHits == 0,
+                $"GHOST SUBSCRIPTION LEAK: Target received {postUnsubscribeHits} packets after terminal UnsubscribeAll!");
+        }
+
+        [Test]
+        public static async Task TestHiccupSharedPoolContentionAcrossSessions()
+        {
+            var config = new LiminalTransportConfig
+            {
+                MaxPacketSizePerBatch = 64,
+                MaxPacketCount = 10,
+                MaxConnectionCount = 4
+            };
+
+            config.Hiccup.MaxRecoveryScale = 50;
+            config.Hiccup.GraceCount = 500;
+            config.Hiccup.GraceWindowSeconds = 10f;
+            config.Hiccup.CooldownSeconds = 0f;
+            config.Hiccup.RecoveryHoldSeconds = 0.0001f;
+            config.Hiccup.WarmRecoverySessions = 1;
+
+            var transport = new MockTransport();
+            var interpreter = new LiminalPacketInterpreter(config);
+            var pipeline = new LiminalPacketFramerPipeline(config);
+            var manager = new LiminalSessionManager(transport, interpreter, config, pipeline);
+
+            ushort[] clientIds = { 21, 22, 23, 24 };
+            foreach (var id in clientIds)
+            {
+                transport.TriggerClientConnected(id);
+            }
+
+            byte[] normalPayload = new byte[20];
+            byte[] burstPayload = new byte[70];
+
+            byte[] BuildFramedPacket(byte[] payload)
+            {
+                byte[] frame = new byte[4 + 2 + payload.Length];
+                BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), payload.Length + 2);
+                BinaryPrimitives.WriteUInt16LittleEndian(frame.AsSpan(4, 2), 1);
+                payload.CopyTo(frame.AsSpan(6));
+                return frame;
+            }
+
+            byte[] normalWireFrame = BuildFramedPacket(normalPayload);
+            byte[] burstWireFrame = BuildFramedPacket(burstPayload);
+
+            var workers = new Task[clientIds.Length * 2];
+            int idx = 0;
+
+            for (int c = 0; c < clientIds.Length; c++)
+            {
+                var capturedId = clientIds[c];
+                workers[idx++] = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        byte[] frame = (i % 2 == 0) ? burstWireFrame : normalWireFrame;
+                        transport.TriggerMessageReceived(frame, capturedId);
+                        await Task.Yield();
+                    }
+                });
+            }
+
+            for (int c = 0; c < clientIds.Length; c++)
+            {
+                var capturedId = clientIds[c];
+                workers[idx++] = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        byte[] p = (i % 2 == 0) ? burstPayload : normalPayload;
+                        manager.BufferPacket(transport.LocalClientId, capturedId, 1, p);
+                        await Task.Yield();
+                    }
+                });
+            }
+
+            var allWorkers = Task.WhenAll(workers);
+            while (!allWorkers.IsCompleted)
+            {
+                manager.Poll();
+                manager.Flush();
+                await Task.Yield();
+            }
+
+            await allWorkers;
+
+            for (int i = 0; i < 5; i++)
+            {
+                manager.Poll();
+                manager.Flush();
+            }
+
+            manager.Dispose();
+            manager.Flush();
+
+            Specification.Assert(manager.GetActiveSessionCount() == 0,
+                "Sessions were not cleaned up upon Dispose + final Flush.");
         }
 
         [Test]

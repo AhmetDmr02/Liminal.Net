@@ -1,9 +1,8 @@
-﻿using Liminal.Net.Interfaces;
+using Liminal.Net.Interfaces;
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 
@@ -18,16 +17,19 @@ namespace Liminal.Net.Core
         private readonly LiminalTransportConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
+        private readonly ArrayPool<byte> _recoveryPacketPool;
+
+        private readonly LiminalHiccupController _hiccup;
+
         private volatile bool _sessionManagerDisposed;
 
         private long _totalPacketsInbound;
         private long _totalPacketsOutbound;
-
         private volatile LiminalTelemetryConfig _telemetryConfig;
 
         private readonly LiminalPacketInterpreter _interpreter;
 
-        private const bool DisconnectClientOnInboundOverflow = true;
+        public event Action<ServerStarvationEvent> OnServerStarvation;
 
         public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
         {
@@ -36,7 +38,14 @@ namespace Liminal.Net.Core
             _pipeline = pipeline;
             _interpreter = interpreter;
 
+            _config.Validate();
+
             _privatePool = ArrayPool<byte>.Create(config.MaxPacketSizePerBatch, 50);
+            _recoveryPacketPool = ArrayPool<byte>.Create(config.Hiccup.GetRecoverySize(config.MaxPacketSizePerBatch), 50);
+
+            _hiccup = new LiminalHiccupController(_transport, _config, _sessions);
+            _hiccup.OnServerStarvation += eventData => OnServerStarvation?.Invoke(eventData);
+
             _loopbackQueue = new ConcurrentQueue<(ushort SenderId, InboundPacket Packet)>();
 
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
@@ -61,49 +70,104 @@ namespace Liminal.Net.Core
             bool countPackets = (activeFlags & TelemetryFlags.PacketCounting) != 0;
             int inboundBatchCount = 0;
 
+            bool shouldKick = false;
+            string kickReason = null;
+
             try
             {
                 lock (session.ReceiveLock)
                 {
                     if (session.IsDisposed()) return;
 
+                    if (transportData.Length > _config.MaxPacketSizePerBatch || session.InboundPacketCount >= _config.MaxPacketCount)
+                    {
+                        if (!EnsureInboundRecoveryLocked(session, ownerId, transportData.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                        {
+                            shouldKick = true;
+                            kickReason = failureReason;
+                            return;
+                        }
+                    }
+
+                    if (transportData.Length > GetInboundStageCapacity(session))
+                    {
+                        shouldKick = true;
+                        kickReason = "Inbound payload exceeded the session recovery ceiling.";
+                        return;
+                    }
+
                     var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
                     if (processedBatch.IsEmpty) return;
+
+                    if (processedBatch.Length > GetInboundStageCapacity(session))
+                    {
+                        shouldKick = true;
+                        kickReason = "Inbound transformed batch exceeded the session recovery ceiling.";
+                        return;
+                    }
 
                     int offset = 0;
                     while (offset + 4 <= processedBatch.Length)
                     {
-                        if (session.InboundQueue.Count >= _config.MaxPacketCount)
-                        {
-                            LiminalLogger.LogWarning($"[Security] Client {ownerId} exceeded InboundQueue capacity. Dropping connection.");
+                        int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
+                        if (totalLen < 2 || offset + 4 + totalLen > processedBatch.Length)
+                            break;
 
-                            if (_transport.IsServer)
+                        if (session.InboundPacketCount >= GetInboundPacketLimit(session))
+                        {
+                            if (!EnsureInboundRecoveryLocked(session, ownerId, processedBatch.Length, Stopwatch.GetTimestamp(), out string failureReason))
                             {
-                                _transport.Kick(ownerId);
+                                shouldKick = true;
+                                kickReason = failureReason;
+                                return;
                             }
-                            else
+
+                            if (session.InboundPacketCount >= GetInboundPacketLimit(session))
                             {
-                                if (DisconnectClientOnInboundOverflow)
-                                    _transport.Disconnect();
+                                shouldKick = true;
+                                kickReason = "Inbound packet-count recovery ceiling exceeded.";
+                                return;
                             }
-                            return;
                         }
 
-                        int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
-                        if (totalLen <= 0 || offset + 4 + totalLen > processedBatch.Length) break;
+                        if (!session.TryReserveInboundPacket(GetInboundPacketLimit(session)))
+                        {
+                            shouldKick = true;
+                            kickReason = "Inbound packet-count reservation failed at the active ceiling.";
+                            return;
+                        }
 
                         ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
                         int payloadLen = totalLen - 2;
 
-                        byte[] rentedBuffer = _privatePool.Rent(payloadLen);
-                        processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
+                        ArrayPool<byte> payloadPool = payloadLen > _config.MaxPacketSizePerBatch
+                            ? _recoveryPacketPool
+                            : _privatePool;
 
-                        session.InboundQueue.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen));
+                        byte[] rentedBuffer = null;
+                        try
+                        {
+                            rentedBuffer = payloadPool.Rent(payloadLen);
+                            processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
+                            session.InboundQueue.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen, payloadPool == _recoveryPacketPool));
+                            rentedBuffer = null;
+                        }
+                        catch
+                        {
+                            session.ReleaseInboundPacket();
+                            throw;
+                        }
+                        finally
+                        {
+                            if (rentedBuffer != null)
+                                payloadPool.Return(rentedBuffer);
+                        }
+
+                        if (session.InboundRecoveryActive)
+                            session.Recovery.InboundLimiter.LastActivityTimestamp = Stopwatch.GetTimestamp();
 
                         if (countPackets)
-                        {
                             inboundBatchCount++;
-                        }
 
                         offset += 4 + totalLen;
                     }
@@ -112,21 +176,17 @@ namespace Liminal.Net.Core
             catch (Exception e)
             {
                 LiminalLogger.LogError($"[SessionManager] Error processing inbound packet: {e}");
-
-                if (_transport.IsServer)
-                {
-                    _transport.Kick(ownerId);
-                }
-                else
-                {
-                    _transport.Disconnect();
-                }
+                shouldKick = true;
+                kickReason = "Inbound processing failure.";
             }
             finally
             {
                 if (inboundBatchCount > 0)
-                {
                     Interlocked.Add(ref _totalPacketsInbound, inboundBatchCount);
+
+                if (shouldKick)
+                {
+                    _hiccup.Kick(ownerId, LiminalRecoveryDirection.Inbound, kickReason);
                 }
             }
         }
@@ -144,7 +204,6 @@ namespace Liminal.Net.Core
 
             bool isHostMode = _transport.IsServer && _transport.IsClient;
             ushort localClientId = _transport.LocalClientId;
-
             bool isLocalDestination = (targetId == localClientId) || (isHostMode && targetId == ILiminalTransport.SERVER_ID);
 
             if (isLocalDestination)
@@ -161,9 +220,7 @@ namespace Liminal.Net.Core
                 var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
 
                 if (countPackets)
-                {
                     Interlocked.Increment(ref _totalPacketsOutbound);
-                }
 
                 _loopbackQueue.Enqueue((senderId, packet));
                 return;
@@ -176,43 +233,56 @@ namespace Liminal.Net.Core
             }
 
             int frameSize = 4 + 2 + payload.Length;
+            bool shouldKick = false;
+            string kickReason = null;
 
-            lock (session.SendLock)
+            try
             {
-                if (session.IsDisposed()) return;
-
-                if (session.RawSendCursor + frameSize > session.RawSendBuffer.Memory.Length)
+                lock (session.SendLock)
                 {
-                    LiminalLogger.LogError(
-                        $"[Manager] FATAL: Outbound send buffer exceeded for Session {targetId} " +
-                        $"({session.RawSendCursor + frameSize}b > {session.RawSendBuffer.Memory.Length}b). " +
-                        $"Kicking client to prevent state desync. Increase MaxPacketSizePerBatch or throttle outgoing packets.");
+                    if (session.IsDisposed()) return;
 
-                    session.RawSendCursor = 0;
-
-                    if (_transport.IsServer)
+                    int activeCapacity = GetOutboundBufferCapacity(session);
+                    if (frameSize > activeCapacity || session.RawSendCursor + frameSize > activeCapacity)
                     {
-                        _transport.Kick(targetId);
-                    }
-                    else
-                    {
-                        _transport.Disconnect();
+                        int required = Math.Max(frameSize, session.RawSendCursor + frameSize);
+                        if (!EnsureOutboundRecoveryLocked(session, targetId, required, Stopwatch.GetTimestamp(), out string failureReason))
+                        {
+                            session.RawSendCursor = 0;
+                            shouldKick = true;
+                            kickReason = failureReason;
+                            return;
+                        }
+
+                        activeCapacity = GetOutboundBufferCapacity(session);
+                        if (frameSize > activeCapacity || session.RawSendCursor + frameSize > activeCapacity)
+                        {
+                            session.RawSendCursor = 0;
+                            shouldKick = true;
+                            kickReason = "Outbound recovery ceiling exceeded.";
+                            return;
+                        }
                     }
 
-                    return;
+                    Span<byte> dest = session.ActiveRawSendBuffer.GetSpan().Slice(session.RawSendCursor);
+                    BinaryPrimitives.WriteInt32LittleEndian(dest.Slice(0, 4), payload.Length + 2);
+                    BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(4, 2), packetId);
+                    payload.CopyTo(dest.Slice(6));
+
+                    session.RawSendCursor += frameSize;
+
+                    if (session.OutboundRecoveryActive)
+                        session.Recovery.OutboundLimiter.LastActivityTimestamp = Stopwatch.GetTimestamp();
+
+                    if (countPackets)
+                        Interlocked.Increment(ref _totalPacketsOutbound);
                 }
-
-                // [Len][ID][Payload]
-                Span<byte> dest = session.RawSendBuffer.GetSpan().Slice(session.RawSendCursor);
-                BinaryPrimitives.WriteInt32LittleEndian(dest.Slice(0, 4), payload.Length + 2);
-                BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(4, 2), packetId);
-                payload.CopyTo(dest.Slice(6));
-
-                session.RawSendCursor += frameSize;
-
-                if (countPackets)
+            }
+            finally
+            {
+                if (shouldKick)
                 {
-                    Interlocked.Increment(ref _totalPacketsOutbound);
+                    _hiccup.Kick(targetId, LiminalRecoveryDirection.Outbound, kickReason);
                 }
             }
         }
@@ -222,47 +292,83 @@ namespace Liminal.Net.Core
             if (_sessionManagerDisposed)
             {
                 RaiseShutdown();
-
                 return;
             }
+
+            long now = Stopwatch.GetTimestamp();
 
             foreach (var session in _sessions.Values)
             {
                 try
                 {
                     FlushSession(session);
+                    _hiccup.ReleaseOutboundWhenSafe(session, now);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    LiminalLogger.LogError($"[SessionManager] Error flushing session {session.Id}");
-                    _transport.Kick(session.Id);
+                    LiminalLogger.LogError($"[SessionManager] Error flushing session {session.Id}: {ex}");
 
-                    continue;
+                    _hiccup.Kick(session.Id, LiminalRecoveryDirection.Outbound, "Flush pipeline failure.");
                 }
             }
         }
 
         private void FlushSession(LiminalSession session)
         {
-            lock (session.SendLock)
+            bool shouldKick = false;
+            string kickReason = null;
+            int bytesToSend = 0;
+
+            try
             {
-                if (session.RawSendCursor == 0) return;
-                if (session.IsDisposed()) return;
-
-                // Pipeline handles the messy transform logic
-                int bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
-                session.RawSendCursor = 0;
-
-                if (bytesToSend > session.SendBuffer.Memory.Length)
+                lock (session.SendLock)
                 {
-                    LiminalLogger.LogError($"[SessionManager] Pipeline output ({bytesToSend}b) exceeds buffer size! Dropping packet.");
-                    return;
-                }
+                    if (session.RawSendCursor == 0 || session.IsDisposed()) return;
 
-                if (bytesToSend > 0)
-                {
-                    _transport.SendReliable(session.SendBuffer.GetSpan().Slice(0, bytesToSend), session.Id);
+                    int activeCapacity = GetOutboundBufferCapacity(session);
+                    if (session.RawSendCursor > activeCapacity)
+                    {
+                        if (!EnsureOutboundRecoveryLocked(session, session.Id, session.RawSendCursor, Stopwatch.GetTimestamp(), out string failureReason))
+                        {
+                            session.RawSendCursor = 0;
+                            shouldKick = true;
+                            kickReason = failureReason;
+                            return;
+                        }
+
+                        activeCapacity = GetOutboundBufferCapacity(session);
+                        if (session.RawSendCursor > activeCapacity)
+                        {
+                            session.RawSendCursor = 0;
+                            shouldKick = true;
+                            kickReason = "Outbound raw buffer exceeded the recovery ceiling.";
+                            return;
+                        }
+                    }
+
+                    bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
+                    session.RawSendCursor = 0;
+
+                    if (bytesToSend > GetOutboundBufferCapacity(session))
+                    {
+                        shouldKick = true;
+                        kickReason = "Outbound transformed batch exceeded the recovery ceiling.";
+                        bytesToSend = 0;
+                        return;
+                    }
                 }
+            }
+            finally
+            {
+                if (shouldKick)
+                {
+                    _hiccup.Kick(session.Id, LiminalRecoveryDirection.Outbound, kickReason);
+                }
+            }
+
+            if (bytesToSend > 0)
+            {
+                _transport.SendReliable(session.ActiveSendBuffer.GetSpan().Slice(0, bytesToSend), session.Id);
             }
         }
 
@@ -274,11 +380,9 @@ namespace Liminal.Net.Core
             if (_sessionManagerDisposed)
             {
                 RaiseShutdown();
-
                 return;
             }
 
-            //VIRTUAL LOOPBACK Self Sends
             while (!_loopbackQueue.IsEmpty && _loopbackQueue.TryDequeue(out var loopbackItem))
             {
                 var senderId = loopbackItem.SenderId;
@@ -290,31 +394,36 @@ namespace Liminal.Net.Core
                 }
                 finally
                 {
-                    _privatePool.Return(packet.BackingBuffer);
+                    ReturnPacketBuffer(packet);
                 }
             }
+
+            long now = Stopwatch.GetTimestamp();
 
             foreach (var session in _sessions.Values)
             {
                 if (session.IsDisposed()) continue;
-                if (session.InboundQueue.IsEmpty) continue;
-
-                while (session.InboundQueue.TryDequeue(out var packet))
+                if (!session.InboundQueue.IsEmpty)
                 {
-                    try
+                    while (session.InboundQueue.TryDequeue(out var packet))
                     {
-                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
-                    }
-                    catch (Exception ex)
-                    {
-                        LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
-                        continue;
-                    }
-                    finally
-                    {
-                        _privatePool.Return(packet.BackingBuffer);
+                        session.ReleaseInboundPacket();
+                        try
+                        {
+                            _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                        }
+                        finally
+                        {
+                            ReturnPacketBuffer(packet);
+                        }
                     }
                 }
+
+                _hiccup.ReleaseInboundWhenSafe(session, now);
             }
 
             ProcessPendingDisconnects();
@@ -334,14 +443,15 @@ namespace Liminal.Net.Core
 
         private void HandleClientConnected(ushort id)
         {
-            if (!_sessionManagerDisposed) _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
+            if (!_sessionManagerDisposed)
+                _sessions.TryAdd(id, new LiminalSession(id, _config.MaxPacketSizePerBatch));
         }
 
         private readonly ConcurrentQueue<ushort> _pendingDisconnects = new();
-        private void HandleClientDisconnected(ushort id)
-        {
-            _pendingDisconnects.Enqueue(id);
-        }
+        private void HandleClientDisconnected(ushort id) => _pendingDisconnects.Enqueue(id);
+
+        private void ReleaseRecoveryForSession(LiminalSession session) =>
+            _hiccup.ReleaseForSession(session);
 
         private void ProcessPendingDisconnects()
         {
@@ -349,11 +459,13 @@ namespace Liminal.Net.Core
             {
                 if (_sessions.TryRemove(id, out var session))
                 {
+                    ReleaseRecoveryForSession(session);
                     session.Dispose();
 
                     while (session.InboundQueue.TryDequeue(out var packet))
                     {
-                        _privatePool.Return(packet.BackingBuffer);
+                        session.ReleaseInboundPacket();
+                        ReturnPacketBuffer(packet);
                     }
                 }
             }
@@ -373,22 +485,25 @@ namespace Liminal.Net.Core
             _interpreter.OnSendRequest -= BufferPacket;
 
             while (_loopbackQueue.TryDequeue(out var loopbackItem))
-            {
-                _privatePool.Return(loopbackItem.Packet.BackingBuffer);
-            }
+                ReturnPacketBuffer(loopbackItem.Packet);
 
             foreach (var session in _sessions.Values)
             {
+                ReleaseRecoveryForSession(session);
                 session.Dispose();
 
                 while (session.InboundQueue.TryDequeue(out var packet))
                 {
-                    _privatePool.Return(packet.BackingBuffer);
+                    session.ReleaseInboundPacket();
+                    ReturnPacketBuffer(packet);
                 }
             }
 
             _sessions.Clear();
             _pendingDisconnects.Clear();
+
+            _hiccup.Dispose();
+
         }
 
         private bool disposed = false;
@@ -400,14 +515,18 @@ namespace Liminal.Net.Core
         #endregion
 
         #region Helpers
+        private void ReturnPacketBuffer(InboundPacket packet)
+        {
+            if (packet.BackingBuffer == null) return;
+
+            if (packet.UsesRecoveryPool)
+                _recoveryPacketPool.Return(packet.BackingBuffer);
+            else
+                _privatePool.Return(packet.BackingBuffer);
+        }
+
         public int GetActiveSessionCount() => _sessions.Count;
 
-
-        /// <summary>
-        /// Copies active session IDs into the destination span up to its capacity.
-        /// </summary>
-        /// <param name="destination">Span to receive session IDs.</param>
-        /// <returns>The actual number of Ids written into destination.</returns>
         public int GetSessionIds(Span<ushort> destination)
         {
             int written = 0;
@@ -417,7 +536,6 @@ namespace Liminal.Net.Core
             {
                 if (written >= maxCapacity)
                 {
-                    // Destination buffer was too small to hold all concurrent sessions
                     LiminalLogger.LogWarning(
                         $"[SessionManager] Buffer capacity ({maxCapacity}) reached. Truncating session ID copy.");
                     break;
@@ -430,6 +548,25 @@ namespace Liminal.Net.Core
         }
         #endregion
 
+        #region Hiccup Recovery
+
+        private int GetInboundStageCapacity(LiminalSession session) =>
+            session.InboundRecoveryActive ? _hiccup.RecoverySize : _config.MaxPacketSizePerBatch;
+
+        private int GetInboundPacketLimit(LiminalSession session) =>
+            session.InboundRecoveryActive ? _hiccup.RecoveryPacketCount : _config.MaxPacketCount;
+
+        private int GetOutboundBufferCapacity(LiminalSession session) =>
+            session.OutboundRecoveryActive ? _hiccup.RecoverySize : _config.MaxPacketSizePerBatch;
+
+        private bool EnsureInboundRecoveryLocked(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason) =>
+            _hiccup.TryEnableInbound(session, clientId, requiredBytes, now, out failureReason) == HiccupEnableResult.Success;
+
+        private bool EnsureOutboundRecoveryLocked(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason) =>
+            _hiccup.TryEnableOutbound(session, clientId, requiredBytes, now, out failureReason) == HiccupEnableResult.Success;
+
+        #endregion
+
         #region ISessionTelemetryProvider
 
         public GlobalSessionTelemetrySnapshot GetGlobalSnapshot()
@@ -438,8 +575,7 @@ namespace Liminal.Net.Core
                 activeSessionCount: _sessions.Count,
                 loopbackQueueCount: _loopbackQueue.Count,
                 totalPacketsInbound: Volatile.Read(ref _totalPacketsInbound),
-                totalPacketsOutbound: Volatile.Read(ref _totalPacketsOutbound)
-            );
+                totalPacketsOutbound: Volatile.Read(ref _totalPacketsOutbound));
         }
 
         public void InitializeConfig(LiminalTelemetryConfig config)

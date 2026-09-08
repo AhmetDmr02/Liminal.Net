@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
 using System;
@@ -144,6 +144,7 @@ namespace Liminal.Net.Transports
         public virtual void InitializeTransport(LiminalTransportConfig config)
         {
             _config = config;
+            _config.Validate();
 
             _framing = config.TransportFramingProvider as ILiminalTransportFramingProvider<TContext>;
 
@@ -534,7 +535,9 @@ namespace Liminal.Net.Transports
 
         private async Task ReceiveLoop(ushort incomingId, TcpClient client)
         {
-            using var ingestBuffer = new LiminalNativeBuffer(_config.MaxPacketSizePerBatch * 2);
+            // Fixed for the lifetime of this receive loop. Hiccup recovery never swaps
+            // or resizes the transport buffer at runtime.
+            using var ingestBuffer = new LiminalNativeBuffer(_config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch));
             var stream = client.GetStream();
             int bytesInBuffer = 0;
 
@@ -615,7 +618,7 @@ namespace Liminal.Net.Transports
                             return;
                         }
 
-                        if (payloadLength < 0 || payloadLength > _config.MaxPacketSizePerBatch)
+                        if (payloadLength < 0 || payloadLength > _config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch))
                         {
                             LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
                             OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.InvalidPacketSize, $"Payload size {payloadLength}b outside allowed bounds.");
@@ -709,7 +712,7 @@ namespace Liminal.Net.Transports
                     return;
                 }
 
-                if (payloadLength < 0 || payloadLength > _config.MaxPacketSizePerBatch)
+                if (payloadLength < 0 || payloadLength > _config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch))
                 {
                     LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
                     OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.InvalidPacketSize, $"Payload length {payloadLength}b outside allowed bounds.");
@@ -759,3 +762,4 @@ namespace Liminal.Net.Transports
         #endregion
     }
 }
+

@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Interfaces;
+using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -18,7 +18,7 @@ namespace Liminal.Net.Core
 
         public int ExecuteOutboundBatch(LiminalSession session, int rawLength)
         {
-            session.RawSendBuffer.GetSpan().Slice(0, rawLength).CopyTo(session.OutboundStagingA.GetSpan());
+            session.ActiveRawSendBuffer.GetSpan().Slice(0, rawLength).CopyTo(session.OutboundStagingA.GetSpan());
             int currentLength = rawLength;
             bool isAtA = true;
 
@@ -32,7 +32,7 @@ namespace Liminal.Net.Core
             }
 
             var finalResult = isAtA ? session.OutboundStagingA.GetSpan() : session.OutboundStagingB.GetSpan();
-            finalResult.Slice(0, currentLength).CopyTo(session.SendBuffer.GetSpan());
+            finalResult.Slice(0, currentLength).CopyTo(session.ActiveSendBuffer.GetSpan());
 
             return currentLength;
         }
@@ -58,3 +58,4 @@ namespace Liminal.Net.Core
         }
     }
 }
+

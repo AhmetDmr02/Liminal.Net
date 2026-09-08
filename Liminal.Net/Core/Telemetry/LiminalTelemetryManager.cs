@@ -1,4 +1,4 @@
-﻿using Liminal.Net.BasePackets;
+using Liminal.Net.BasePackets;
 using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Concurrent;
@@ -40,6 +40,7 @@ namespace Liminal.Net.Core
         public GlobalSessionTelemetrySnapshot LatestSessionSnapshot { get; private set; }
 
         public event Action<GlobalSessionTelemetrySnapshot, GlobalTransportTelemetrySnapshot> OnTelemetryUpdated;
+        public event Action<ServerStarvationEvent> OnServerStarvation;
 
         public LiminalTelemetryManager(LiminalNetworkManager manager, LiminalTicker ticker, LiminalTelemetryConfig config)
         {
@@ -53,6 +54,8 @@ namespace Liminal.Net.Core
 
             _transportTelemetry = manager.Transport as ITransportTelemetryProvider;
             _sessionTelemetry = manager.SessionManager as ISessionTelemetryProvider;
+
+            manager.SessionManager.OnServerStarvation += HandleServerStarvation;
 
             _transportTelemetry?.InitializeConfig(_config);
             _sessionTelemetry?.InitializeConfig(_config);
@@ -88,6 +91,11 @@ namespace Liminal.Net.Core
         private void HandleLocalClientDisconnected(ushort localId)
         {
             ResetAllState();
+        }
+
+        private void HandleServerStarvation(ServerStarvationEvent evt)
+        {
+            OnServerStarvation?.Invoke(evt);
         }
 
         private void ResetAllState()
@@ -257,10 +265,12 @@ namespace Liminal.Net.Core
                 _networkManager.Transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
             }
 
+            _networkManager.SessionManager.OnServerStarvation -= HandleServerStarvation;
             _networkManager.Interpreter.UnsubscribeAll(this);
             ResetAllState();
 
             OnTelemetryUpdated = null;
+            OnServerStarvation = null;
         }
     }
 
@@ -310,3 +320,4 @@ namespace Liminal.Net.Core
         }
     }
 }
+

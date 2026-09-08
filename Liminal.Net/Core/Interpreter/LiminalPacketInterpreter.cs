@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Interfaces;
+using Liminal.Net.Interfaces;
 using MessagePack;
 using System;
 using System.Collections.Concurrent;
@@ -130,7 +130,7 @@ namespace Liminal.Net.Core
                 writer.Clear();
                 return writer;
             }
-            return new LiminalNativeBufferWriter(_config.MaxPacketSizePerBatch);
+            return new LiminalNativeBufferWriter(_config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch));
         }
 
         public void Subscribe<T>(Action<T, ushort> callback, object subscriber)
@@ -401,3 +401,4 @@ namespace Liminal.Net.Core
         private readonly MessagePackSerializerOptions _options = MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
     }
 }
+

@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Interfaces;
+using Liminal.Net.Interfaces;
 using System.Collections.Generic;
 
 namespace Liminal.Net.Core
@@ -9,7 +9,7 @@ namespace Liminal.Net.Core
         /// The default host
         /// </summary>
         public string Default_Host = "127.0.0.1";
-        
+
         /// <summary>
         /// The default port
         /// </summary>
@@ -42,7 +42,7 @@ namespace Liminal.Net.Core
 
         /// <summary>
         /// The maximum size of a packet buffer that will be sent in a tick
-        /// Exceeding this size will cause a packet drop with a warning
+        /// Exceeding this size will cause a recovery systems to be triggered
         /// </summary>
         public ushort MaxPacketSizePerBatch = ushort.MaxValue;
 
@@ -55,16 +55,16 @@ namespace Liminal.Net.Core
         /// The version of the transport
         /// </summary>
         public ushort Version = 1;
-        
-        /// <summary>
-        /// The maximum number of packets that will be held in the inbound queue per connection
-        /// </summary>
-        public int MaxPacketCount = 50;
 
         /// <summary>
-        /// The maximum number of connections that will be allowed
+        /// The maximum number of packets that will be held in the queue per connection
         /// </summary>
+        public int MaxPacketCount = 10;
+
         public int MaxConnectionCount = 10;
+
+        /// <summary>Bounded local Hiccup recovery configuration. Never serialized onto the wire.</summary>
+        public LiminalHiccupConfig Hiccup { get; } = new();
 
         /// <summary>
         /// The number of seconds to wait for a client to disconnect before forcing a kick
@@ -72,11 +72,15 @@ namespace Liminal.Net.Core
         public int WaitForKickGracePeriod = 10;
 
         public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
-
         public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();
 
         public ILiminalTransportFramingProvider TransportFramingProvider { get; set; } = new DefaultTransportFramingProvider();
 
         public ILiminalClientIdResolver ClientIdResolver;
+
+        public void Validate()
+        {
+            Hiccup.Validate(MaxPacketSizePerBatch, MaxPacketCount, MaxConnectionCount);
+        }
     }
 }
