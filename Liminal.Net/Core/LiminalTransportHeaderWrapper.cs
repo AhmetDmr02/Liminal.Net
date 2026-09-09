@@ -10,7 +10,9 @@ namespace Liminal.Net.Core
     {
         Unreliable = 0,
         Reliable = 1 << 0,
-        Fragmented = 1 << 1
+        Fragmented = 1 << 1,
+        WirePing = 1 << 2,
+        WirePong = 1 << 3
     }
 
     public enum HeaderReadResult

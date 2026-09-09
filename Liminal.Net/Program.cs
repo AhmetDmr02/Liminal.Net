@@ -4,7 +4,6 @@ using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
 using System;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
@@ -18,7 +17,11 @@ namespace Liminal.Net
         private static ChatPacket? _lastPacket;
         private static ushort _lastTargetId;
         private static CancellationTokenSource _spamCts;
-        private static readonly RttAverager _rttAverager = new RttAverager(sampleWindowSize: 10);
+
+        // Dual rolling averagers for E2E and Wire RTT
+        private static readonly RttAverager _e2eAverager = new RttAverager(sampleWindowSize: 10);
+        private static readonly RttAverager _wireAverager = new RttAverager(sampleWindowSize: 10);
+
         private static long _totalReceived = 0;
         private static long _totalSent = 0;
 
@@ -40,7 +43,7 @@ namespace Liminal.Net
                 ClientIdResolver = new BaseResolver()
             };
 
-            // Enable active RTT tracking with short poll interval for rapid telemetry updates
+            // Flags = All now enables both End2EndRTT and WireRTT
             var telemetryConfig = new LiminalTelemetryConfig
             {
                 Flags = TelemetryFlags.All,
@@ -84,21 +87,33 @@ namespace Liminal.Net
                     }
                 }
 
-                // Sample and update the rolling average
+                // Sample and update both rolling buffers
                 if (_manager.TelemetryManager != null)
                 {
-                    double liveRtt = _manager.TelemetryManager.RTT;
-                    if (liveRtt > 0.0)
-                    {
-                        _rttAverager.AddSample(liveRtt);
-                    }
+                    double liveE2E = _manager.TelemetryManager.End2EndRTT;
+                    if (liveE2E > 0.0) _e2eAverager.AddSample(liveE2E);
+
+                    double liveWire = _manager.TelemetryManager.WireRTT;
+                    if (liveWire > 0.0) _wireAverager.AddSample(liveWire);
                 }
 
-                _rttAverager.UpdateTitle(_totalSent, Interlocked.Read(ref _totalReceived), _manager.Role);
+                UpdateConsoleTitle();
                 Thread.Sleep(15);
             }
 
             _manager.Shutdown();
+        }
+
+        private static void UpdateConsoleTitle()
+        {
+            string roleLabel = _manager.Role != NetworkRole.None ? $"[{_manager.Role}] " : "";
+            double avgE2E = _e2eAverager.GetAverageRtt();
+            double avgWire = _wireAverager.GetAverageRtt();
+
+            string e2eText = avgE2E > 0.0 ? $"{avgE2E:F1}ms" : "--";
+            string wireText = avgWire > 0.0 ? $"{avgWire:F1}ms" : "--";
+
+            Console.Title = $"{roleLabel}Wire: {wireText} | E2E: {e2eText} | Sent: {_totalSent} | Recv: {Interlocked.Read(ref _totalReceived)}";
         }
 
         private static void ProcessCommand(string input, LiminalTransportConfig config)
@@ -115,7 +130,8 @@ namespace Liminal.Net
                 case "disconnect":
                     StopSpam();
                     _manager.Disconnect();
-                    _rttAverager.Reset();
+                    _e2eAverager.Reset();
+                    _wireAverager.Reset();
                     break;
                 case "rtt": HandleRttCommand(); break;
                 case "send": HandleSendCommand(args); break;
@@ -126,10 +142,11 @@ namespace Liminal.Net
                 case "kick": HandleKickCommand(args); break;
                 case "telemetry": WriteTelemetry(); break;
                 case "reset":
-                    _rttAverager.Reset();
+                    _e2eAverager.Reset();
+                    _wireAverager.Reset();
                     Interlocked.Exchange(ref _totalSent, 0);
                     Interlocked.Exchange(ref _totalReceived, 0);
-                    Console.WriteLine("Counters and RTT rolling buffer reset.");
+                    Console.WriteLine("Counters and RTT rolling buffers reset.");
                     break;
                 case "localid":
                     Console.WriteLine($"Local ID: {_manager.Transport.LocalClientId}");
@@ -156,17 +173,23 @@ namespace Liminal.Net
                 return;
             }
 
+            Console.ForegroundColor = ConsoleColor.Yellow;
+
             if (_manager.Role == NetworkRole.Client)
             {
-                double currentRtt = _manager.TelemetryManager?.RTT ?? 0.0;
-                double avgRtt = _rttAverager.GetAverageRtt();
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"[RTT -> Server] Current: {currentRtt:F2} ms | Avg: {avgRtt:F2} ms");
+                double curE2E = _manager.TelemetryManager?.End2EndRTT ?? 0.0;
+                double curWire = _manager.TelemetryManager?.WireRTT ?? 0.0;
+                double avgE2E = _e2eAverager.GetAverageRtt();
+                double avgWire = _wireAverager.GetAverageRtt();
+
+                Console.WriteLine("=== Latency to Server ===");
+                Console.WriteLine($" [Wire RTT]    Current: {curWire:F2} ms | Avg: {avgWire:F2} ms");
+                Console.WriteLine($" [End2End RTT] Current: {curE2E:F2} ms | Avg: {avgE2E:F2} ms");
+                Console.WriteLine("=========================");
                 Console.ResetColor();
                 return;
             }
 
-            Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("=== Connected Client Latencies ===");
 
             Span<ushort> clientIds = stackalloc ushort[_manager.Transport.Config.MaxConnectionCount];
@@ -176,17 +199,20 @@ namespace Liminal.Net
             for (int i = 0; i < count; i++)
             {
                 ushort id = clientIds[i];
-                if (id == _manager.localID) continue; 
+                if (id == _manager.localID) continue;
 
                 listed++;
-                if (_manager.TelemetryManager != null && _manager.TelemetryManager.TryGetClientRTT(id, out double rtt))
-                {
-                    Console.WriteLine($" Client {id}: {rtt:F2} ms");
-                }
-                else
-                {
-                    Console.WriteLine($" Client {id}: [Sampling in progress...]");
-                }
+
+                double wire = 0.0;
+                double e2e = 0.0;
+
+                bool hasE2E = _manager.TelemetryManager != null && _manager.TelemetryManager.TryGetClientEnd2EndRTT(id, out e2e);
+                bool hasWire = _manager.TelemetryManager != null && _manager.TelemetryManager.TryGetClientWireRTT(id, out wire);
+
+                string wireStr = hasWire ? $"{wire:F2} ms" : "[Sampling...]";
+                string e2eStr = hasE2E ? $"{e2e:F2} ms" : "[Sampling...]";
+
+                Console.WriteLine($" Client {id,-5} | Wire: {wireStr,-12} | E2E: {e2eStr,-12}");
             }
 
             if (listed == 0)
@@ -194,7 +220,7 @@ namespace Liminal.Net
                 Console.WriteLine(" No remote clients connected.");
             }
 
-            Console.WriteLine("_____________________");
+            Console.WriteLine("________________________________________________");
             Console.ResetColor();
         }
 
@@ -434,15 +460,6 @@ namespace Liminal.Net
                 _count = 0;
                 Array.Clear(_samples, 0, _samples.Length);
             }
-        }
-
-        public void UpdateTitle(long sentByMe, long recvByMe, NetworkRole role)
-        {
-            string roleLabel = role != NetworkRole.None ? $"[{role}] " : "";
-            double avgRtt = GetAverageRtt();
-
-            string rttText = avgRtt > 0.0 ? $"{avgRtt:F1}ms" : "--";
-            Console.Title = $"{roleLabel}RTT Avg: {rttText} | Sent: {sentByMe} | Recv: {recvByMe}";
         }
     }
 }

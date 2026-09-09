@@ -11,5 +11,8 @@ namespace Liminal.Net.Interfaces
     {
         public GlobalTransportTelemetrySnapshot GetGlobalTransportSnapshot();
         public void InitializeConfig(LiminalTelemetryConfig config);
+
+        bool TryGetWireRTT(ushort clientId, out double rttMs);
+        void SendWirePing(ushort targetId);
     }
 }

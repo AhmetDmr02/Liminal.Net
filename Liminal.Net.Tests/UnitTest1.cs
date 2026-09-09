@@ -2511,13 +2511,13 @@ namespace Liminal.Net.Tests
             bool rttUpdated = SpinWait.SpinUntil(() =>
             {
                 return client.TelemetryManager != null &&
-                       client.TelemetryManager.RTT > 0.0 &&
-                       _serverManager.TelemetryManager.TryGetClientRTT(clientId, out double serverSeenRtt) &&
+                       client.TelemetryManager.End2EndRTT > 0.0 &&
+                       _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out double serverSeenRtt) &&
                        serverSeenRtt > 0.0;
             }, 3000);
 
             Assert.That(rttUpdated, Is.True, "RTT measurement failed to complete for client or server.");
-            Assert.That(client.TelemetryManager.RTT, Is.LessThan(150.0), "Local loopback RTT unusually high.");
+            Assert.That(client.TelemetryManager.End2EndRTT, Is.LessThan(150.0), "Local loopback RTT unusually high.");
         }
 
         [Test]
@@ -2525,7 +2525,7 @@ namespace Liminal.Net.Tests
         {
             var telemetryConfig = new LiminalTelemetryConfig
             {
-                Flags = TelemetryFlags.RTT,
+                Flags = TelemetryFlags.End2EndRTT,
                 PollIntervalInSeconds = 0f 
             };
 
@@ -2565,8 +2565,8 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             client.TelemetryManager.Sample();
-            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.RTT > 0.0, 2000), Is.True);
-            double baselineRtt = client.TelemetryManager.RTT;
+            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.End2EndRTT > 0.0, 2000), Is.True);
+            double baselineRtt = client.TelemetryManager.End2EndRTT;
 
             long ancientTimestamp = Stopwatch.GetTimestamp() - (Stopwatch.Frequency * 10);
             var stalePong = new PongPacket
@@ -2580,9 +2580,9 @@ namespace Liminal.Net.Tests
 
             Thread.Sleep(100);
 
-            Assert.That(client.TelemetryManager.RTT, Is.LessThan(1000.0),
+            Assert.That(client.TelemetryManager.End2EndRTT, Is.LessThan(1000.0),
                 "Stale pong with unmatched SequenceId poisoned client RTT calculation.");
-            Assert.That(client.TelemetryManager.RTT, Is.EqualTo(baselineRtt),
+            Assert.That(client.TelemetryManager.End2EndRTT, Is.EqualTo(baselineRtt),
                 "RTT changed unexpectedly despite no new pings being scheduled.");
         }
 
@@ -2603,13 +2603,13 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.TelemetryManager.TryGetClientRTT(clientId, out _), 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out _), 2000), Is.True);
 
             client.Disconnect();
 
             bool removed = SpinWait.SpinUntil(() =>
             {
-                return !_serverManager.TelemetryManager.TryGetClientRTT(clientId, out _);
+                return !_serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out _);
             }, 2000);
 
             Assert.That(removed, Is.True, "Server failed to evict disconnected client ID from telemetry tracking dictionary.");
@@ -2631,7 +2631,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient(telemetryConfig);
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
-            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.RTT > 0.0, 3000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.End2EndRTT > 0.0, 3000), Is.True);
 
             var clientTelemetry = client.TelemetryManager;
 
@@ -2639,8 +2639,272 @@ namespace Liminal.Net.Tests
 
             Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 2000), Is.True);
 
-            Assert.That(clientTelemetry.RTT, Is.EqualTo(0.0),
+            Assert.That(clientTelemetry.End2EndRTT, Is.EqualTo(0.0),
                 "Client telemetry state was not zeroed upon local disconnect.");
+        }
+
+        [Test]
+        public void Test61_Telemetry_PingTimeout_SetsBothClientAndServerRTTTo999()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.End2EndRTT,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            ushort clientId = client.localID;
+
+            bool baselineEstablished = SpinWait.SpinUntil(() =>
+            {
+                return client.TelemetryManager != null &&
+                       client.TelemetryManager.End2EndRTT > 0.0 &&
+                       client.TelemetryManager.End2EndRTT < 150.0 &&
+                       _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out double serverRtt) &&
+                       serverRtt > 0.0 &&
+                       serverRtt < 150.0;
+            }, 3000);
+
+            Assert.That(baselineEstablished, Is.True, "Initial baseline RTT measurement failed to establish.");
+
+            _serverManager.Interpreter.Unsubscribe<PingPacket>(_serverManager.TelemetryManager);
+            client.Interpreter.Unsubscribe<PingPacket>(client.TelemetryManager);
+
+            bool bothTimedOut = SpinWait.SpinUntil(() =>
+            {
+                bool serverSeesTimeout = _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out double serverMs) &&
+                                         Math.Abs(serverMs - 999.0) < 0.01;
+
+                bool clientSeesTimeout = Math.Abs(client.TelemetryManager.End2EndRTT - 999.0) < 0.01;
+
+                return serverSeesTimeout && clientSeesTimeout;
+            }, 6000);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(bothTimedOut, Is.True, "Either client or server RTT failed to reach 999 ms after the 3-second timeout window.");
+                Assert.That(client.TelemetryManager.End2EndRTT, Is.EqualTo(999.0).Within(0.01), "Client RTT did not reflect 999 ms timeout value.");
+
+                bool serverReadSuccess = _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out double serverSeenRtt);
+                Assert.That(serverReadSuccess, Is.True, "Server failed to retrieve RTT entry for client.");
+                Assert.That(serverSeenRtt, Is.EqualTo(999.0).Within(0.01), "Server-measured client RTT did not reflect 999 ms timeout value.");
+            });
+        }
+        #endregion
+        #region Wire RTT Integration Tests
+
+        [Test]
+        public void Test62_WireRTT_BaselineLoopback_MeasuresAccurateAndSubMillisecondLatency()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.WireRTT,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            ushort clientId = client.localID;
+
+            bool wireRttResolved = SpinWait.SpinUntil(() =>
+            {
+                bool clientHasWire = client.TelemetryManager != null && client.TelemetryManager.WireRTT > 0.0;
+                bool serverHasWire = _serverManager.TelemetryManager != null &&
+                                     _serverManager.TelemetryManager.TryGetClientWireRTT(clientId, out double sWire) &&
+                                     sWire > 0.0;
+
+                return clientHasWire && serverHasWire;
+            }, 3000);
+
+            Assert.That(wireRttResolved, Is.True, "Wire RTT failed to resolve on either client or server.");
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(client.TelemetryManager.WireRTT, Is.GreaterThan(0.0).And.LessThan(50.0),
+                    "Client Wire RTT outside expected loopback range.");
+
+                bool serverSuccess = _serverManager.TelemetryManager.TryGetClientWireRTT(clientId, out double serverSeenWire);
+                Assert.That(serverSuccess, Is.True);
+                Assert.That(serverSeenWire, Is.GreaterThan(0.0).And.LessThan(50.0),
+                    "Server Wire RTT outside expected loopback range.");
+            });
+        }
+
+        [Test]
+        public void Test63_WireRTT_LatencySimulator_AccuratelyTracksConfiguredDelay()
+        {
+            _currentTestPort = Interlocked.Increment(ref _portCounter);
+            const double oneWayDelayMs = 40.0;
+            const double expectedRttMs = oneWayDelayMs * 2.0; // 80ms RTT
+
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.WireRTT,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var serverSimTransport = new LatencySimulatorTransport()
+            {
+                OneWayDelayMs = oneWayDelayMs,
+                JitterMs = 0.0
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(serverSimTransport, serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var clientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var clientSimTransport = new LatencySimulatorTransport()
+            {
+                OneWayDelayMs = oneWayDelayMs,
+                JitterMs = 0.0
+            };
+
+            var client = new LiminalNetworkManager(clientSimTransport, clientConfig, telemetryConfig);
+            _clientManagers.Add(client);
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 4000), Is.True, "Client failed to connect.");
+
+            // Allow wire pings to travel and stabilize
+            bool stabilized = SpinWait.SpinUntil(() =>
+            {
+                return client.TelemetryManager != null &&
+                       client.TelemetryManager.WireRTT >= (expectedRttMs - 15.0);
+            }, 5000);
+
+            Assert.That(stabilized, Is.True,
+                $"Wire RTT failed to reflect simulated latency window. Client WireRTT: {client.TelemetryManager?.WireRTT} ms");
+
+            Assert.That(client.TelemetryManager.WireRTT, Is.EqualTo(expectedRttMs).Within(30.0),
+                $"Client measured {client.TelemetryManager.WireRTT:F2} ms, expected ~{expectedRttMs} ms.");
+        }
+
+        [Test]
+        public void Test64_WireRTT_ContinuesMeasuringWhenGameInterpreterIsBlocked()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.WireRTT | TelemetryFlags.End2EndRTT,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 2000), Is.True);
+
+            _serverManager.Interpreter.UnsubscribeAll(_serverManager.TelemetryManager);
+            client.Interpreter.UnsubscribeAll(client.TelemetryManager);
+
+            client.TelemetryManager.Sample();
+            _serverManager.TelemetryManager.Sample();
+
+            Thread.Sleep(200);
+
+            var clientTransport = (ITransportTelemetryProvider)client.Transport;
+            clientTransport.SendWirePing(ILiminalTransport.SERVER_ID);
+
+            bool wireStillActive = SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 1000);
+            Assert.That(wireStillActive, Is.True, "Wire RTT stopped functioning when high-level packet handlers were disabled.");
+            Assert.That(client.TelemetryManager.WireRTT, Is.LessThan(50.0), "Wire RTT was stalled by high-level layer detachment.");
+        }
+
+        [Test]
+        public void Test65_WireRTT_ClientDisconnect_CleansUpServerWireTracking()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.WireRTT,
+                PollIntervalInSeconds = 0.05f
+            };
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            ushort clientId = client.localID;
+
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.TelemetryManager.TryGetClientWireRTT(clientId, out _), 2000), Is.True);
+
+            client.Disconnect();
+
+            bool removed = SpinWait.SpinUntil(() =>
+            {
+                return !_serverManager.Transport.IsClientConnected(clientId);
+            }, 2000);
+
+            Assert.That(removed, Is.True, "Server transport failed to clear disconnected client socket.");
+        }
+
+        [Test]
+        public void Test66_WireRTT_MismatchedSequencePong_IsIgnoredAndDoesNotPoisonLatency()
+        {
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            var clientTransport = (TcpTransport)client.Transport;
+
+            clientTransport.SendWirePing(ILiminalTransport.SERVER_ID);
+            Assert.That(SpinWait.SpinUntil(() => clientTransport.TryGetWireRTT(ILiminalTransport.SERVER_ID, out _), 2000), Is.True);
+            clientTransport.TryGetWireRTT(ILiminalTransport.SERVER_ID, out double validBaseline);
+
+            Span<byte> maliciousPongPayload = stackalloc byte[12];
+            BinaryPrimitives.WriteUInt32LittleEndian(maliciousPongPayload.Slice(0, 4), 0xBADF00D);
+            BinaryPrimitives.WriteInt64LittleEndian(maliciousPongPayload.Slice(4, 8), Stopwatch.GetTimestamp() - (Stopwatch.Frequency * 10));
+
+            var serverTransport = (TcpTransport)_serverManager.Transport;
+            serverTransport.SendReliable(maliciousPongPayload, client.localID);
+
+            Thread.Sleep(100);
+
+            clientTransport.TryGetWireRTT(ILiminalTransport.SERVER_ID, out double currentWireRtt);
+
+            Assert.That(currentWireRtt, Is.EqualTo(validBaseline),
+                "Mismatched sequence number was processed and poisoned the wire RTT state.");
+            Assert.That(currentWireRtt, Is.LessThan(1000.0),
+                "Spoofed ancient timestamp inflated the wire RTT metric.");
         }
 
         #endregion

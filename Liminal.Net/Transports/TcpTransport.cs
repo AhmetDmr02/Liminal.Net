@@ -6,9 +6,11 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -131,7 +133,7 @@ namespace Liminal.Net.Transports
         public int ConnectedClientCount => _sockets.Count;
 
         /// <summary>
-        /// Lifecycle state for outbound frames. Mutate this directly on the transport if context needs changing.
+        /// Lifecycle state for outbound frames.
         /// </summary>
         public TContext OutboundContext { get; set; }
 
@@ -251,6 +253,9 @@ namespace Liminal.Net.Transports
             {
                 return; // Already shutting down
             }
+
+            LiminalLogger.Log($"[Transport-Debug] Shutdown initiated by thread '{Thread.CurrentThread.Name ?? Thread.CurrentThread.ManagedThreadId.ToString()}'. Stack:\n{Environment.StackTrace}", LiminalLogger.LogLevel.Detailed);
+
             try
             {
                 _isConnected = false;
@@ -651,10 +656,13 @@ namespace Liminal.Net.Transports
 #endif
                 }
             }
-            catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException) { }
+            catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
+            {
+                LiminalLogger.LogWarning($"[Transport-Debug] Socket closed/dropped on {incomingId}. Reason: {ex.GetType().Name} - {ex.Message}");
+            }
             catch (Exception ex)
             {
-                LiminalLogger.LogError($"[Transport] Unexpected receive error on {incomingId}: {ex}");
+                LiminalLogger.LogError($"[Transport-Debug] Unexpected receive error on {incomingId}: {ex.GetType().Name} - {ex.Message}\n{ex.StackTrace}");
             }
             finally
             {
@@ -725,9 +733,28 @@ namespace Liminal.Net.Transports
 
                 var payloadSpan = bufferSpan.Slice(offset + headerSize, payloadLength);
 
-                if ((flags & TransportFlags.Fragmented) != 0) { }
-                else if ((flags & TransportFlags.Reliable) != 0) _onReliable?.Invoke(payloadSpan, incomingId);
-                else _onUnreliable?.Invoke(payloadSpan, incomingId);
+                switch (flags)
+                {
+                    case var f when (f & TransportFlags.WirePing) != 0:
+                        SendInternal(payloadSpan, incomingId, TransportFlags.WirePong);
+                        break;
+
+                    case var f when (f & TransportFlags.WirePong) != 0:
+                        HandleWirePong(incomingId, payloadSpan);
+                        break;
+
+                    case var f when (f & TransportFlags.Fragmented) != 0:
+                        //HandleFragment(incomingId, payloadSpan);
+                        break;
+
+                    case var f when (f & TransportFlags.Reliable) != 0:
+                        _onReliable?.Invoke(payloadSpan, incomingId);
+                        break;
+
+                    default:
+                        _onUnreliable?.Invoke(payloadSpan, incomingId);
+                        break;
+                }
 
                 offset += totalFrameSize;
             }
@@ -759,6 +786,66 @@ namespace Liminal.Net.Transports
         {
             _telemetryConfig = config;
         }
+
+        private readonly ConcurrentDictionary<ushort, double> _wireRttMap = new();
+        private readonly ConcurrentDictionary<ushort, (uint Seq, long SentTicks)> _wireInFlight = new();
+        private uint _wireSeqCounter;
+
+        public bool TryGetWireRTT(ushort clientId, out double rttMs)
+        {
+            return _wireRttMap.TryGetValue(clientId, out rttMs);
+        }
+
+        private static readonly long WirePingTimeoutTicks = Stopwatch.Frequency * 3; // 3 sec timeout
+
+        public void SendWirePing(ushort targetId)
+        {
+            if (!_sockets.ContainsKey(targetId)) return;
+
+            long now = Stopwatch.GetTimestamp();
+
+            if (_wireInFlight.TryGetValue(targetId, out var existing))
+            {
+                if (existing.SentTicks != 0)
+                {
+                    if ((now - existing.SentTicks) < WirePingTimeoutTicks)
+                    {
+                        return; 
+                    }
+
+                    _wireRttMap[targetId] = 999.0;
+                }
+            }
+
+            uint seq = unchecked(++_wireSeqCounter);
+            _wireInFlight[targetId] = (seq, now);
+
+            // Payload: 4 bytes Seq + 8 bytes Timestamp
+            Span<byte> pingPayload = stackalloc byte[12];
+            BinaryPrimitives.WriteUInt32LittleEndian(pingPayload.Slice(0, 4), seq);
+            BinaryPrimitives.WriteInt64LittleEndian(pingPayload.Slice(4, 8), now);
+
+            SendInternal(pingPayload, targetId, TransportFlags.WirePing);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void HandleWirePong(ushort peerId, ReadOnlySpan<byte> payload)
+        {
+            if (payload.Length < 12) return;
+
+            uint seq = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(0, 4));
+            long sentTicks = BinaryPrimitives.ReadInt64LittleEndian(payload.Slice(4, 8));
+
+            if (_wireInFlight.TryGetValue(peerId, out var state) && state.Seq == seq)
+            {
+                long now = Stopwatch.GetTimestamp();
+                double rttMs = Math.Max(0, (now - sentTicks) * 1000.0 / Stopwatch.Frequency);
+
+                _wireRttMap[peerId] = rttMs;
+                _wireInFlight.TryRemove(peerId, out _);
+            }
+        }
+
         #endregion
     }
 }

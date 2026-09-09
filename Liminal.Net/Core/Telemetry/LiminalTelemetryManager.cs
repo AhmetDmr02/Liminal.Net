@@ -3,6 +3,7 @@ using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Reflection;
 using System.Threading;
 
 namespace Liminal.Net.Core
@@ -22,14 +23,26 @@ namespace Liminal.Net.Core
         private readonly long _sampleIntervalTicks;
         private long _lastSampleTimestamp;
 
-        private double _currentRttMs;
-        public double RTT => Volatile.Read(ref _currentRttMs);
+        private double _currentE2ERttMs;
+        public double End2EndRTT => Volatile.Read(ref _currentE2ERttMs);
+
+        public double WireRTT
+        {
+            get
+            {
+                if (_transportTelemetry != null && _transportTelemetry.TryGetWireRTT(ILiminalTransport.SERVER_ID, out double wireMs))
+                {
+                    return wireMs;
+                }
+                return 0.0;
+            }
+        }
 
         private uint _clientPingSequence;
         private long _clientPingInFlightTimestamp;
 
         // Server-side State (Per-Client)
-        private readonly ConcurrentDictionary<ushort, double> _clientRttMap = new();
+        private readonly ConcurrentDictionary<ushort, double> _clientE2ERttMap = new();
         private readonly ConcurrentDictionary<ushort, (uint SequenceId, long Timestamp)> _serverInFlightPings = new();
         private uint _serverSequenceGenerator;
 
@@ -63,7 +76,6 @@ namespace Liminal.Net.Core
             _networkManager.Interpreter.Subscribe<PingPacket>(HandlePing, this);
             _networkManager.Interpreter.Subscribe<PongPacket>(HandlePong, this);
 
-            // Match transport disconnect cleanup pattern
             _networkManager.Transport.OnClientDisconnected += HandleClientDisconnected;
             _networkManager.Transport.OnClientKicked += HandleClientDisconnected;
             _networkManager.Transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
@@ -71,21 +83,32 @@ namespace Liminal.Net.Core
             _ticker.OnTick += HandleTick;
         }
 
-        public bool TryGetClientRTT(ushort clientId, out double rttMs)
+        public bool TryGetClientEnd2EndRTT(ushort clientId, out double rttMs)
         {
             if (clientId == ILiminalTransport.SERVER_ID)
             {
-                rttMs = RTT;
+                rttMs = End2EndRTT;
                 return rttMs > 0.0;
             }
 
-            return _clientRttMap.TryGetValue(clientId, out rttMs);
+            return _clientE2ERttMap.TryGetValue(clientId, out rttMs);
+        }
+
+        public bool TryGetClientWireRTT(ushort clientId, out double rttMs)
+        {
+            if (_transportTelemetry != null)
+            {
+                return _transportTelemetry.TryGetWireRTT(clientId, out rttMs);
+            }
+
+            rttMs = 0.0;
+            return false;
         }
 
         private void HandleClientDisconnected(ushort clientId)
         {
             _serverInFlightPings.TryRemove(clientId, out _);
-            _clientRttMap.TryRemove(clientId, out _);
+            _clientE2ERttMap.TryRemove(clientId, out _);
         }
 
         private void HandleLocalClientDisconnected(ushort localId)
@@ -101,11 +124,11 @@ namespace Liminal.Net.Core
         private void ResetAllState()
         {
             Volatile.Write(ref _clientPingInFlightTimestamp, 0);
-            Volatile.Write(ref _currentRttMs, 0);
+            Volatile.Write(ref _currentE2ERttMs, 0);
             Volatile.Write(ref _clientPingSequence, 0);
 
             _serverInFlightPings.Clear();
-            _clientRttMap.Clear();
+            _clientE2ERttMap.Clear();
         }
 
         private void HandleTick()
@@ -130,23 +153,57 @@ namespace Liminal.Net.Core
             if (_transportTelemetry != null)
                 LatestTransportSnapshot = _transportTelemetry.GetGlobalTransportSnapshot();
 
-            if (_config.HasFlag(TelemetryFlags.RTT))
+            if (_config.HasFlag(TelemetryFlags.WireRTT))
             {
-                SendPing();
+                SendWirePing();
+            }
+
+            if (_config.HasFlag(TelemetryFlags.End2EndRTT))
+            {
+                SendE2EPing();
             }
 
             OnTelemetryUpdated?.Invoke(LatestSessionSnapshot, LatestTransportSnapshot);
         }
+        private void SendWirePing()
+        {
+            if (_transportTelemetry == null) return;
 
-        private void SendPing()
+            if (_networkManager.Role == NetworkRole.Client || _networkManager.Role == NetworkRole.Host)
+            {
+                _transportTelemetry.SendWirePing(ILiminalTransport.SERVER_ID);
+            }
+
+            if (_networkManager.Role == NetworkRole.Server || _networkManager.Role == NetworkRole.Host)
+            {
+                Span<ushort> ids = stackalloc ushort[_networkManager.Transport.Config.MaxConnectionCount];
+                int count = _networkManager.SessionManager.GetSessionIds(ids);
+
+                for (int i = 0; i < count; i++)
+                {
+                    ushort targetId = ids[i];
+                    if (targetId == ILiminalTransport.SERVER_ID) continue;
+                    if (_networkManager.Role == NetworkRole.Host && targetId == _networkManager.localID) continue;
+
+                    _transportTelemetry.SendWirePing(targetId);
+                }
+            }
+        }
+        private void SendE2EPing()
         {
             long now = Stopwatch.GetTimestamp();
 
             if (_networkManager.Role == NetworkRole.Client || _networkManager.Role == NetworkRole.Host)
             {
                 long inFlightAt = Volatile.Read(ref _clientPingInFlightTimestamp);
+                bool isTimedOut = inFlightAt != 0 && (now - inFlightAt) >= PingTimeoutTicks;
 
-                if (inFlightAt == 0 || (now - inFlightAt) >= PingTimeoutTicks)
+                if (isTimedOut)
+                {
+                    Volatile.Write(ref _currentE2ERttMs, 999.0);
+                }
+
+                if (inFlightAt == 0 || isTimedOut)
                 {
                     uint nextSeq = unchecked(++_clientPingSequence);
                     Volatile.Write(ref _clientPingInFlightTimestamp, now);
@@ -183,6 +240,8 @@ namespace Liminal.Net.Core
 
                     uint nextSeq = unchecked(++_serverSequenceGenerator);
                     _serverInFlightPings[targetId] = (nextSeq, now);
+
+                    _clientE2ERttMap[targetId] = 999f;
 
                     _networkManager.Interpreter.SendCommand(targetId, new PingPacket
                     {
@@ -222,12 +281,12 @@ namespace Liminal.Net.Core
                 long elapsedTicks = Math.Max(0, stop - packet.TimestampTicks);
                 double ms = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
 
-                Volatile.Write(ref _currentRttMs, ms);
+                Volatile.Write(ref _currentE2ERttMs, ms);
                 Volatile.Write(ref _clientPingInFlightTimestamp, 0);
 
                 if (_networkManager.Role == NetworkRole.Host)
                 {
-                    _clientRttMap[_networkManager.localID] = ms;
+                    _clientE2ERttMap[_networkManager.localID] = ms;
                 }
 
                 return;
@@ -243,7 +302,7 @@ namespace Liminal.Net.Core
                 long elapsedTicks = Math.Max(0, stop - packet.TimestampTicks);
                 double ms = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
 
-                _clientRttMap[sender] = ms;
+                _clientE2ERttMap[sender] = ms;
                 _serverInFlightPings[sender] = (state.SequenceId, 0);
             }
         }
@@ -308,7 +367,7 @@ namespace Liminal.Net.Core
         public double OutboundGB => TotalBytesOutbound / (1024.0 * 1024.0 * 1024.0);
 
         /// <summary>
-        /// Packet loss ratio (0.0 to 1.0). Always 0 on reliable stream transports like TCP.
+        /// Packet loss ratio (0.0 to 1.0). Always shows 0 on reliable stream transports like TCP.
         /// </summary>
         public readonly float PacketLossRate;
 
