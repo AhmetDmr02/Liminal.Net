@@ -1,6 +1,7 @@
-﻿using Liminal.Net.Interfaces;
-using Liminal.Net.Core;
+﻿using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
 using System;
+using System.Diagnostics;
 
 namespace Liminal.Net.Core
 {
@@ -29,7 +30,9 @@ namespace Liminal.Net.Core
         public LiminalPacketInterpreter Interpreter { get; private set; }
 
         private LiminalPacketFramerPipeline _pipeline;
+
         private LiminalTicker _ticker;
+        private LiminalPhaseAligner _phaseAligner;
 
         public LiminalTelemetryManager TelemetryManager { get; private set; }
         private readonly LiminalTelemetryConfig _telemetryConfig;
@@ -81,6 +84,13 @@ namespace Liminal.Net.Core
             DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
             _ticker = new LiminalTicker(_config);
+
+            if (_transport is ITransportTelemetryProvider telemetryProvider)
+            {
+                telemetryProvider.NextTickProvider = () => _ticker.NextTickTimestamp;
+            }
+
+            _phaseAligner = new LiminalPhaseAligner(_config);
 
             TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
         }
@@ -224,6 +234,22 @@ namespace Liminal.Net.Core
             var sm = SessionManager;
 
             sm?.Poll();
+
+            if (Role == NetworkRole.Client && _phaseAligner != null && TelemetryManager != null)
+            {
+                double wireRtt = TelemetryManager.WireRTT;
+                if (wireRtt > 0.0)
+                {
+                    // The tick is firing right now, so clientCountdownMs for this batch is 0
+                    long slew = _phaseAligner.CalculateSlewAdjustment(
+                        wireRtt,
+                        TelemetryManager.ServerCountdownMs,
+                        clientCountdownMs: 0.0);
+
+                    _ticker.ApplySlew(slew);
+                }
+            }
+
             sm?.Flush();
         }
 

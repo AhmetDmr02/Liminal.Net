@@ -755,57 +755,8 @@ namespace Liminal.Net.Transports
 
                     bytesInBuffer += read;
 
-#if NET9_0_OR_GREATER
-                    Span<byte> bufferSpan = ingestBuffer.GetSpan();
-                    int offset = 0;
-                    int headerSize = LiminalTransportHeader.GetHeaderSize(_framing);
-
-                    while (bytesInBuffer - offset >= LiminalTransportHeader.BaseHeaderSize)
-                    {
-                        var currentSlice = bufferSpan.Slice(offset, bytesInBuffer - offset);
-                        var result = LiminalTransportHeader.TryReadHeader(currentSlice, _framing, out var flags, out int payloadLength, out TContext framingContext);
-
-                        if (result == HeaderReadResult.Incomplete) break;
-
-                        if (result == HeaderReadResult.Malformed)
-                        {
-                            LiminalLogger.LogError($"[Transport] Malformed frame header received from {incomingId}. Kicking connection.");
-                            OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.ProtocolViolation, "Malformed transport frame header.");
-                            Kick(incomingId);
-                            return;
-                        }
-
-                        if (payloadLength < 0 || payloadLength > _config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch))
-                        {
-                            LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
-                            OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.InvalidPacketSize, $"Payload size {payloadLength}b outside allowed bounds.");
-                            Kick(incomingId);
-                            return;
-                        }
-
-                        int totalFrameSize = headerSize + payloadLength;
-                        if (bytesInBuffer - offset < totalFrameSize) break;
-
-                        var payloadSpan = bufferSpan.Slice(offset + headerSize, payloadLength);
-
-                        if ((flags & TransportFlags.Fragmented) != 0) { }
-                        else if ((flags & TransportFlags.Reliable) != 0) _onReliable?.Invoke(payloadSpan, incomingId);
-                        else _onUnreliable?.Invoke(payloadSpan, incomingId);
-
-                        offset += totalFrameSize;
-                    }
-
-                    if (offset > 0)
-                    {
-                        int remaining = bytesInBuffer - offset;
-                        if (remaining > 0)
-                            bufferSpan.Slice(offset, remaining).CopyTo(bufferSpan.Slice(0, remaining));
-                        bytesInBuffer = remaining;
-                    }
-#else
                     ProcessIngestBufferSynchronous(incomingId, ingestBuffer, ref bytesInBuffer);
                     if (!IsClientConnected(incomingId) && incomingId != ILiminalTransport.SERVER_ID) break;
-#endif
                 }
             }
             catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
@@ -892,7 +843,22 @@ namespace Liminal.Net.Transports
                 switch (flags)
                 {
                     case var f when (f & TransportFlags.WirePing) != 0:
-                        SendInternal(payloadSpan, incomingId, TransportFlags.WirePong);
+                        if (payloadSpan.Length >= 16)
+                        {
+                            float countdownMs = 0f;
+                            if (NextTickProvider != null)
+                            {
+                                long nextTick = NextTickProvider();
+                                long diffTicks = Math.Max(0, nextTick - Stopwatch.GetTimestamp());
+                                countdownMs = (float)((diffTicks * 1000.0) / Stopwatch.Frequency);
+                            }
+
+                            Span<byte> pongPayload = stackalloc byte[16];
+                            payloadSpan.Slice(0, 12).CopyTo(pongPayload);
+                            BinaryPrimitives.WriteSingleLittleEndian(pongPayload.Slice(12, 4), countdownMs);
+
+                            SendInternal(pongPayload, incomingId, TransportFlags.WirePong);
+                        }
                         break;
 
                     case var f when (f & TransportFlags.WirePong) != 0:
@@ -900,7 +866,6 @@ namespace Liminal.Net.Transports
                         break;
 
                     case var f when (f & TransportFlags.Fragmented) != 0:
-                        //HandleFragment(incomingId, payloadSpan);
                         break;
 
                     case var f when (f & TransportFlags.Reliable) != 0:
@@ -930,6 +895,8 @@ namespace Liminal.Net.Transports
         private volatile LiminalTelemetryConfig _telemetryConfig;
         private long _totalBytesInbound;
         private long _totalBytesOutbound;
+
+        public Func<long> NextTickProvider { get; set; }
         public GlobalTransportTelemetrySnapshot GetGlobalTransportSnapshot()
         {
             return new GlobalTransportTelemetrySnapshot(
@@ -966,7 +933,7 @@ namespace Liminal.Net.Transports
                 {
                     if ((now - existing.SentTicks) < WirePingTimeoutTicks)
                     {
-                        return; 
+                        return;
                     }
 
                     _wireRttMap[targetId] = 999.0;
@@ -976,21 +943,47 @@ namespace Liminal.Net.Transports
             uint seq = unchecked(++_wireSeqCounter);
             _wireInFlight[targetId] = (seq, now);
 
-            // Payload: 4 bytes Seq + 8 bytes Timestamp
-            Span<byte> pingPayload = stackalloc byte[12];
+            // [0.4] Seq | [4.12] SentTicks | [12.16] ServerCountdownMs
+            Span<byte> pingPayload = stackalloc byte[16];
             BinaryPrimitives.WriteUInt32LittleEndian(pingPayload.Slice(0, 4), seq);
             BinaryPrimitives.WriteInt64LittleEndian(pingPayload.Slice(4, 8), now);
+            BinaryPrimitives.WriteSingleLittleEndian(pingPayload.Slice(12, 4), 0f);
 
             SendInternal(pingPayload, targetId, TransportFlags.WirePing);
+        }
+
+        private double _serverCountdownSnapshotMs;
+        private long _serverCountdownReceivedTicks;
+
+        /// <summary>
+        /// Real-time server countdown accounting for elapsed time since the last pong.
+        /// </summary>
+        public double ServerCountdownMs
+        {
+            get
+            {
+                long receivedAt = Volatile.Read(ref _serverCountdownReceivedTicks);
+                if (receivedAt == 0) return 0.0;
+
+                long elapsedTicks = Stopwatch.GetTimestamp() - receivedAt;
+                double elapsedMs = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
+
+                double tickIntervalMs = 1000.0 / (_config?.TickRate ?? 20);
+                double liveCountdown = (Volatile.Read(ref _serverCountdownSnapshotMs) - elapsedMs) % tickIntervalMs;
+                if (liveCountdown < 0) liveCountdown += tickIntervalMs;
+
+                return liveCountdown;
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void HandleWirePong(ushort peerId, ReadOnlySpan<byte> payload)
         {
-            if (payload.Length < 12) return;
+            if (payload.Length < 16) return;
 
             uint seq = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(0, 4));
             long sentTicks = BinaryPrimitives.ReadInt64LittleEndian(payload.Slice(4, 8));
+            float serverRemainingMs = BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(12, 4));
 
             if (_wireInFlight.TryGetValue(peerId, out var state) && state.Seq == seq)
             {
@@ -999,9 +992,18 @@ namespace Liminal.Net.Transports
 
                 _wireRttMap[peerId] = rttMs;
                 _wireInFlight.TryRemove(peerId, out _);
+
+                double tickIntervalMs = 1000.0 / (_config?.TickRate ?? 20);
+                double owtMs = rttMs / 2.0;
+
+                // Adjust for one-way wire transit
+                double adjustedCountdown = (serverRemainingMs - owtMs) % tickIntervalMs;
+                if (adjustedCountdown < 0) adjustedCountdown += tickIntervalMs;
+
+                Volatile.Write(ref _serverCountdownSnapshotMs, adjustedCountdown);
+                Volatile.Write(ref _serverCountdownReceivedTicks, now);
             }
         }
-
         #endregion
 
 

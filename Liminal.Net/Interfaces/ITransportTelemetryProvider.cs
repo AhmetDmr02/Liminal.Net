@@ -14,5 +14,15 @@ namespace Liminal.Net.Interfaces
 
         bool TryGetWireRTT(ushort clientId, out double rttMs);
         void SendWirePing(ushort targetId);
+
+        /// <summary>
+        /// How many milliseconds remain until the server's next tick, evaluated at the moment of the last pong.
+        /// </summary>
+        double ServerCountdownMs { get; }
+
+        /// <summary>
+        /// Delegate provided by the engine so the transport can read the local ticker's NextTickTimestamp.
+        /// </summary>
+        Func<long> NextTickProvider { get; set; }
     }
 }

@@ -38,6 +38,18 @@ namespace Liminal.Net.Core
             }
         }
 
+        public double ServerCountdownMs
+        {
+            get
+            {
+                if (_transportTelemetry != null)
+                {
+                    return _transportTelemetry.ServerCountdownMs;
+                }
+                return 0.0;
+            }
+        }
+
         private uint _clientPingSequence;
         private long _clientPingInFlightTimestamp;
 

@@ -91,8 +91,32 @@ public class LatencySimulatorTransport : TcpTransport
                     else
                     {
                         long waitTicks = deliverAt - now;
-                        int waitMs = Math.Max(1, (int)(waitTicks * 1000 / Stopwatch.Frequency));
-                        Monitor.Wait(_sendLock, waitMs);
+                        long waitMs = (waitTicks * 1000) / Stopwatch.Frequency;
+
+                        if (waitMs > 16)
+                        {
+                            Monitor.Wait(_sendLock, (int)(waitMs - 15));
+                        }
+                    }
+                }
+            }
+
+            if (!hasPacket && _sendQueue.TryPeek(out _, out long targetTimestamp))
+            {
+                if (Stopwatch.GetTimestamp() < targetTimestamp)
+                {
+                    Thread.SpinWait(20);
+                    continue;
+                }
+                else
+                {
+                    lock (_sendLock)
+                    {
+                        if (_sendQueue.Count > 0 && Stopwatch.GetTimestamp() >= targetTimestamp)
+                        {
+                            packet = _sendQueue.Dequeue();
+                            hasPacket = true;
+                        }
                     }
                 }
             }
