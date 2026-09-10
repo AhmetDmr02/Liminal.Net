@@ -367,21 +367,35 @@ namespace Liminal.Net.Transports
             byte[] rentedBuffer = _sendBytePool.Rent(totalSize);
 
             Span<byte> fullPacket = rentedBuffer.AsSpan(0, totalSize);
-            LiminalTransportHeader.WriteHeader(fullPacket, flags, data.Length, in contextSnapshot, _framing);
-            data.CopyTo(fullPacket.Slice(headerSize));
-
-            var packet = new OutboundPacket(rentedBuffer, totalSize);
-
-            if (!sendState.Channel.Writer.TryWrite(packet))
+            bool queued = false;
+            try
             {
-                _sendBytePool.Return(rentedBuffer);
+                LiminalTransportHeader.WriteHeader(fullPacket, flags, data.Length, in contextSnapshot, _framing);
 
-                LiminalLogger.LogWarning($"[Transport] Send queue rejected packet for client {targetId}. kicking.");
+                data.CopyTo(fullPacket.Slice(headerSize));
 
-                if (IsServer)
-                    Kick(targetId);
-                else
-                    Shutdown();
+                var packet = new OutboundPacket(rentedBuffer, totalSize);
+
+                if (!sendState.Channel.Writer.TryWrite(packet))
+                {
+                    LiminalLogger.LogWarning($"[Transport] Send queue rejected packet for client {targetId}. kicking.");
+
+                    return;
+                }
+
+                queued = true;
+            }
+            finally
+            {
+                if (!queued)
+                {
+                    _sendBytePool.Return(rentedBuffer);
+
+                    if (IsServer)
+                        Kick(targetId);
+                    else
+                        Shutdown();
+                }
             }
         }
         private async Task ProcessSendQueueAsync(ushort clientId, TcpClient client, ClientSendState state)

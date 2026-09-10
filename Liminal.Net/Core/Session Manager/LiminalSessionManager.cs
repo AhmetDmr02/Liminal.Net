@@ -215,15 +215,27 @@ namespace Liminal.Net.Core
                 }
 
                 byte[] rentedBuffer = _privatePool.Rent(payload.Length);
-                payload.CopyTo(rentedBuffer);
 
-                var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
+                try
+                {
+                    payload.CopyTo(rentedBuffer);
 
-                if (countPackets)
-                    Interlocked.Increment(ref _totalPacketsOutbound);
+                    var packet = new InboundPacket(packetId, rentedBuffer, payload.Length);
 
-                _loopbackQueue.Enqueue((senderId, packet));
-                return;
+                    if (countPackets)
+                        Interlocked.Increment(ref _totalPacketsOutbound);
+
+                    _loopbackQueue.Enqueue((senderId, packet));
+
+                    rentedBuffer = null;
+                }
+                finally
+                {
+                    if (rentedBuffer != null)
+                    {
+                        _privatePool.Return(rentedBuffer);
+                    }
+                }
             }
 
             if (!_sessions.TryGetValue(targetId, out var session))
