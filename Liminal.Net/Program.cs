@@ -1,5 +1,6 @@
 ﻿using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Core.Telemetry;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
@@ -163,6 +164,18 @@ namespace Liminal.Net
             }
 
             Console.WriteLine($"Outbound: {_manager.TelemetryManager?.LatestTransportSnapshot.TotalBytesOutbound} bytes | Inbound: {_manager.TelemetryManager?.LatestTransportSnapshot.TotalBytesInbound} bytes");
+
+            TickPacketSizeTelemetrySnapshot packetSizeSnapshot = _manager.TelemetryManager.GetTickPayloadSizeSnapshot();
+
+            TickPacketSizeTelemetrySnapshot latestTickSnapshot = _manager.TelemetryManager.GetLatestTickPayloadSizeSnapshot();
+
+            Console.WriteLine("AVG TICK-------------------------------------");
+            Console.WriteLine(packetSizeSnapshot.TelemetryData.ToString());
+            Console.WriteLine("------------------------------------------------");
+
+            Console.WriteLine("LATEST TICK-------------------------------------");
+            Console.WriteLine(latestTickSnapshot.TelemetryData.ToString());
+            Console.WriteLine("------------------------------------------------");
         }
 
         private static void HandleRttCommand()

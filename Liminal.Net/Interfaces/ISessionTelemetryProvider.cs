@@ -15,5 +15,7 @@ namespace Liminal.Net.Interfaces
         public GlobalSessionTelemetrySnapshot GetGlobalSnapshot();
 
         public void InitializeConfig (LiminalTelemetryConfig config);
+
+        public event Action<ushort,Memory<byte>> OnPacketBuffered;
     }
 }

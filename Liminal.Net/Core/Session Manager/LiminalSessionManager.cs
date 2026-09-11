@@ -195,6 +195,7 @@ namespace Liminal.Net.Core
 
         #region Write Path (Game Thread)
 
+        public event Action<ushort,Memory<byte>> OnPacketBuffered;
         public void BufferPacket(ushort senderId, ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
         {
             if (_sessionManagerDisposed) return;
@@ -228,6 +229,8 @@ namespace Liminal.Net.Core
                     _loopbackQueue.Enqueue((senderId, packet));
 
                     rentedBuffer = null;
+
+                    return;
                 }
                 finally
                 {
@@ -282,6 +285,12 @@ namespace Liminal.Net.Core
                     payload.CopyTo(dest.Slice(6));
 
                     session.RawSendCursor += frameSize;
+
+                    if (_telemetryConfig.EnablePacketCounting)
+                    {
+                        Memory<byte> framedMemory = session.ActiveRawSendBuffer.Memory.Slice(session.RawSendCursor - frameSize, frameSize);
+                        OnPacketBuffered.Invoke(packetId, framedMemory);
+                    }
 
                     if (session.OutboundRecoveryActive)
                         session.Recovery.OutboundLimiter.LastActivityTimestamp = Stopwatch.GetTimestamp();

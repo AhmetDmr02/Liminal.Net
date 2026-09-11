@@ -1,7 +1,9 @@
 using Liminal.Net.BasePackets;
+using Liminal.Net.Core.Telemetry;
 using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
 using System.Threading;
@@ -13,6 +15,8 @@ namespace Liminal.Net.Core
         private readonly LiminalNetworkManager _networkManager;
         private readonly LiminalTicker _ticker;
         private readonly LiminalTelemetryConfig _config;
+
+        private readonly TickPayloadSizeDiagnostics _tickPayloadSizeDiagnostics;
 
         private readonly ITransportTelemetryProvider _transportTelemetry;
         private readonly ISessionTelemetryProvider _sessionTelemetry;
@@ -93,6 +97,8 @@ namespace Liminal.Net.Core
             _networkManager.Transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
 
             _ticker.OnTick += HandleTick;
+
+            _tickPayloadSizeDiagnostics = new TickPayloadSizeDiagnostics(_networkManager.Transport.Config.TickRate, ticker, manager.SessionManager);
         }
 
         public bool TryGetClientEnd2EndRTT(ushort clientId, out double rttMs)
@@ -116,6 +122,10 @@ namespace Liminal.Net.Core
             rttMs = 0.0;
             return false;
         }
+
+        public TickPacketSizeTelemetrySnapshot GetTickPayloadSizeSnapshot() => _tickPayloadSizeDiagnostics.GetAverageTickSnapshot();
+
+        public TickPacketSizeTelemetrySnapshot GetLatestTickPayloadSizeSnapshot() => _tickPayloadSizeDiagnostics.GetLatestTickSnapshot();
 
         private void HandleClientDisconnected(ushort clientId)
         {
@@ -322,6 +332,7 @@ namespace Liminal.Net.Core
         public void Dispose()
         {
             if (_disposed) return;
+
             _disposed = true;
 
             if (_ticker != null)
@@ -336,8 +347,11 @@ namespace Liminal.Net.Core
                 _networkManager.Transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
             }
 
+            _tickPayloadSizeDiagnostics?.Dispose();
+
             _networkManager.SessionManager.OnServerStarvation -= HandleServerStarvation;
             _networkManager.Interpreter.UnsubscribeAll(this);
+
             ResetAllState();
 
             OnTelemetryUpdated = null;
