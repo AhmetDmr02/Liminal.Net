@@ -325,7 +325,7 @@ namespace Liminal.Net.Core
 
         #region Sending
 
-        public delegate void SendRequestHandler(ushort senderId, ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload);
+        public delegate void SendRequestHandler(ushort senderId, ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable);
 
         private readonly object _sendHandlerLock = new();
         private SendRequestHandler[] _sendHandlers = Array.Empty<SendRequestHandler>();
@@ -389,7 +389,7 @@ namespace Liminal.Net.Core
             }
         }
 
-        private void InvokeSendRequest(ushort senderId, ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload)
+        private void InvokeSendRequest(ushort senderId, ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod)
         {
             var handlers = Volatile.Read(ref _sendHandlers);
 
@@ -397,7 +397,7 @@ namespace Liminal.Net.Core
             {
                 try
                 {
-                    handlers[i](senderId, targetSessionId, packetId, payload);
+                    handlers[i](senderId, targetSessionId, packetId, payload, deliveryMethod);
                 }
                 catch (Exception ex)
                 {
@@ -408,7 +408,7 @@ namespace Liminal.Net.Core
 
         #region SingleSends
 
-        public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
             ushort defaultSender;
             var manager = LiminalNetworkManager.Instance;
@@ -426,20 +426,20 @@ namespace Liminal.Net.Core
                 defaultSender = ILiminalTransport.SERVER_ID;
             }
 
-            SendCommandFrom(defaultSender, targetSessionId, packet);
+            SendCommandFrom(defaultSender, targetSessionId, packet, deliveryMethod);
         }
 
-        public void SendCommandAsClient<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        public void SendCommandAsClient<TSendStruct>(ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
-            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionId, packet);
+            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionId, packet, deliveryMethod);
         }
 
-        public void SendCommandAsServer<TSendStruct>(ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        public void SendCommandAsServer<TSendStruct>(ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
-            SendCommandFrom(ILiminalTransport.SERVER_ID, targetSessionId, packet);
+            SendCommandFrom(ILiminalTransport.SERVER_ID, targetSessionId, packet, deliveryMethod);
         }
 
-        public void SendCommandFrom<TSendStruct>(ushort senderId, ushort targetSessionId, TSendStruct packet) where TSendStruct : struct
+        public void SendCommandFrom<TSendStruct>(ushort senderId, ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
             int idInt = LiminalPacketLibrary.GetId<TSendStruct>();
 
@@ -454,7 +454,7 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, packet);
-                InvokeSendRequest(senderId, targetSessionId, checked((ushort)idInt), writer.WrittenSpan);
+                InvokeSendRequest(senderId, targetSessionId, checked((ushort)idInt), writer.WrittenSpan, deliveryMethod);
             }
             catch (MessagePackSerializationException ex)
             {
@@ -470,7 +470,7 @@ namespace Liminal.Net.Core
 
         #region Multicast Sends
 
-        public void SendCommand<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        public void SendCommand<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
             if (targetSessionIds.IsEmpty)
                 return;
@@ -492,20 +492,20 @@ namespace Liminal.Net.Core
                 defaultSender = ILiminalTransport.SERVER_ID;
             }
 
-            SendCommandFrom(defaultSender, targetSessionIds, packet);
+            SendCommandFrom(defaultSender, targetSessionIds, packet, deliveryMethod);
         }
 
-        public void SendCommandAsServer<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        public void SendCommandAsServer<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
-            SendCommandFrom(ILiminalTransport.SERVER_ID, targetSessionIds, packet);
+            SendCommandFrom(ILiminalTransport.SERVER_ID, targetSessionIds, packet, deliveryMethod);
         }
 
-        public void SendCommandAsClient<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        public void SendCommandAsClient<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
-            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionIds, packet);
+            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionIds, packet, deliveryMethod);
         }
 
-        public void SendCommandFrom<TSendStruct>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet) where TSendStruct : struct
+        public void SendCommandFrom<TSendStruct>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
             if (targetSessionIds.IsEmpty)
                 return;
@@ -527,7 +527,7 @@ namespace Liminal.Net.Core
                 ReadOnlySpan<byte> payload = writer.WrittenSpan;
 
                 for (int i = 0; i < targetSessionIds.Length; i++)
-                    InvokeSendRequest(senderId, targetSessionIds[i], packetId, payload);
+                    InvokeSendRequest(senderId, targetSessionIds[i], packetId, payload, deliveryMethod);
             }
             catch (MessagePackSerializationException ex)
             {

@@ -210,9 +210,12 @@ namespace Liminal.Net.Transports
 
             if (!_isServer && _isConnected)
             {
-                _onLocalClientDisconnected?.Invoke(_localClientId);
+                ushort disconnectedId = _localClientId;
+                _isConnected = false;
 
+                _onLocalClientDisconnected?.Invoke(disconnectedId);
                 Shutdown();
+
                 LiminalLogger.Log($"[Transport] Disconnected from server.");
             }
         }
@@ -346,12 +349,6 @@ namespace Liminal.Net.Transports
         private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
         public virtual void Send(Span<byte> data, ushort targetId, TransportFlags flags)
         {
-            if (flags == TransportFlags.Unreliable)
-            {
-                //TcpTransport is inherently reliable
-                flags = TransportFlags.Reliable;
-            }
-
             SendInternal(data, targetId, flags);
         }
 
@@ -821,7 +818,11 @@ namespace Liminal.Net.Transports
                         {
                             LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
 
-                            _onLocalClientDisconnected?.Invoke(_localClientId);
+                            ushort disconnectedId = _localClientId;
+                            _isConnected = false;
+
+                            _onLocalClientDisconnected?.Invoke(disconnectedId);
+
                             Shutdown();
                         }
                     }

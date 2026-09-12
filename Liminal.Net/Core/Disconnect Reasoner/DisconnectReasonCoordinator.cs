@@ -47,7 +47,19 @@ namespace Liminal.Net.Core
 
             _transport.OnClientDisconnected += HandleDisconnected;
             _transport.OnClientKicked += HandleDisconnected;
-            _transport.OnLocalClientDisconnected += HandleDisconnected;
+            _transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
+        }
+
+        private void HandleLocalClientDisconnected(ushort localId)
+        {
+            // If the client never received a specific reason from the server,
+            // resolve under its local ID as ConnectionLost.
+            if (!_resolved.ContainsKey(localId))
+            {
+                _resolved[localId] = (DisconnectReason.ConnectionLost, "Connection to server was lost.");
+            }
+
+            HandleDisconnected(localId);
         }
 
         public void ServerKickWithReason(ushort clientId, DisconnectReason reason, string message = null, int? graceSeconds = null)
@@ -81,7 +93,6 @@ namespace Liminal.Net.Core
 
                     if (completedTask == ackTcs.Task && await ackTcs.Task.ConfigureAwait(false))
                     {
-                        // Brief drain so the transport has time to complete socket writes
                         await Task.Delay(20, linkedCts.Token).ConfigureAwait(false);
                     }
                     else
@@ -106,15 +117,12 @@ namespace Liminal.Net.Core
 
         public void ClientDisconnectWithReason(DisconnectReason reason, string message = null, int? graceSeconds = null)
         {
-            if (_disposed || _transport.IsServer && _transport.LocalClientId == ILiminalTransport.SERVER_ID)
+            if (_disposed || (_transport.IsServer && _transport.LocalClientId == ILiminalTransport.SERVER_ID))
             {
-                // Dedicated servers don't shouldnt call this but just in case we directly shut down the transport!
-
                 _transport.Disconnect();
                 return;
             }
 
-            // The client itself is disconnecting, so record it under its own LocalClientId
             ushort myId = _transport.LocalClientId;
             _resolved[myId] = (reason, message);
 
@@ -154,9 +162,7 @@ namespace Liminal.Net.Core
                 finally
                 {
                     _pendingAcks.TryRemove(ILiminalTransport.SERVER_ID, out _);
-
-                    OnResolved?.Invoke(myId, reason, message);
-
+                    Resolve(myId);
                     _transport.Disconnect();
                 }
             });
@@ -183,12 +189,10 @@ namespace Liminal.Net.Core
 
             if (!_transport.IsServer)
             {
-                // Client received kick notice store it under my local ID so when my socket drops, it resolves cleanly
                 _resolved[_transport.LocalClientId] = (reason, packet.Message);
             }
             else
             {
-                // Server received notice from client store under the sender's client ID
                 _resolved[sender] = (reason, packet.Message);
             }
 
@@ -259,9 +263,16 @@ namespace Liminal.Net.Core
 
                 _transport.OnClientDisconnected -= HandleDisconnected;
                 _transport.OnClientKicked -= HandleDisconnected;
-                _transport.OnLocalClientDisconnected -= HandleDisconnected;
+                _transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
 
                 handlerSnapshot = OnResolved;
+
+                // If local client dropped and was never resolved, ensure it fires ConnectionLost before dying
+                if (!_transport.IsServer && _transport.LocalClientId != 0 && !_alreadyFired.ContainsKey(_transport.LocalClientId))
+                {
+                    _resolved.TryAdd(_transport.LocalClientId, (DisconnectReason.ConnectionLost, "Connection to server was lost."));
+                }
+
                 remaining = new ConcurrentDictionary<ushort, (DisconnectReason, string)>(_resolved);
             }
 

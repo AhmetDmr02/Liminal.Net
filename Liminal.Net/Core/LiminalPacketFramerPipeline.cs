@@ -16,9 +16,10 @@ namespace Liminal.Net.Core
             _outboundChain = config.OutboundPacketProcessors.ToList();
         }
 
-        public int ExecuteOutboundBatch(LiminalSession session, int rawLength)
+        internal int ExecuteOutboundBatch(LiminalSession session, int rawLength, LiminalNativeBuffer startingBuffer)
         {
-            session.ActiveRawSendBuffer.GetSpan().Slice(0, rawLength).CopyTo(session.OutboundStagingA.GetSpan());
+            startingBuffer.GetSpan().Slice(0, rawLength).CopyTo(session.OutboundStagingA.GetSpan());
+
             int currentLength = rawLength;
             bool isAtA = true;
 

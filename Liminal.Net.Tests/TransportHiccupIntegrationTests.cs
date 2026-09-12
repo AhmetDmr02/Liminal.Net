@@ -435,6 +435,111 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 3000), Is.True,
                 "Client did not enforce its local recovery grace count.");
         }
+        #region Unreliable vs Hiccup Boundary Tests
+
+        [Test]
+        public void Test12_UnreliableTraffic_NeverConsumesHiccupGraceCountOrEntersRecovery()
+        {
+            var serverConfig = CreateConfig(_currentTestPort, 256, 10, 4);
+            serverConfig.Hiccup.GraceCount = 1;
+            serverConfig.Hiccup.RecoveryHoldSeconds = 5.0f;
+
+            var server = StartServer(serverConfig);
+            var client = StartClient(_currentTestPort, CreateConfig(_currentTestPort, 256, 10, 4));
+
+            byte[] oversized = new byte[5000];
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new FilePacket
+            {
+                FileName = "unrel-flood",
+                Data = oversized
+            }, DeliveryMethod.Unreliable);
+            client.SessionManager.Flush();
+
+            Thread.Sleep(100);
+
+            var session = server.SessionManager.GetActiveSessionCount() > 0;
+            Assert.That(server.Transport.IsConnected, Is.True);
+
+            var receivedReliable = new ManualResetEventSlim(false);
+            server.Interpreter.Subscribe<FilePacket>((pkt, _) =>
+            {
+                if (pkt.FileName == "legit-reliable") receivedReliable.Set();
+            }, this);
+
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new FilePacket
+            {
+                FileName = "legit-reliable",
+                Data = CreateData(700, 101)
+            }, DeliveryMethod.Reliable);
+            client.SessionManager.Flush();
+
+            Assert.That(receivedReliable.Wait(3000), Is.True,
+                "Reliable recovery packet was rejected. Unreliable traffic corrupted or exhausted the Hiccup grace budget!");
+        }
+
+        [Test]
+        public void Test13_Outbound_MixedBatch_OnlyReliableExpandsRecovery()
+        {
+            var server = StartServer(CreateConfig(_currentTestPort, 256, 10, 4));
+            var client = StartClient(_currentTestPort, CreateConfig(_currentTestPort, 256, 10, 4));
+
+            var relReceived = new ManualResetEventSlim(false);
+            var unrelReceived = new ManualResetEventSlim(false);
+
+            client.Interpreter.Subscribe<FilePacket>((pkt, _) =>
+            {
+                if (pkt.FileName == "rel-large") relReceived.Set();
+                if (pkt.FileName == "unrel-normal") unrelReceived.Set();
+            }, this);
+
+            server.Interpreter.SendCommand(client.localID, new FilePacket
+            {
+                FileName = "unrel-normal",
+                Data = CreateData(100, 1)
+            }, DeliveryMethod.Unreliable);
+
+            server.Interpreter.SendCommand(client.localID, new FilePacket
+            {
+                FileName = "rel-large",
+                Data = CreateData(700, 2)
+            }, DeliveryMethod.Reliable);
+
+            server.SessionManager.Flush();
+
+            Assert.That(relReceived.Wait(3000), Is.True, "Reliable recovery packet failed to arrive.");
+            Assert.That(unrelReceived.Wait(3000), Is.True, "Normal unreliable packet in mixed batch was erroneously dropped.");
+        }
+
+        [Test]
+        public void Test14_Inbound_UnreliableDroppedUnderQueueSaturation_WhileReliableRecovers()
+        {
+            var serverConfig = CreateConfig(_currentTestPort, 256, 3, 2);
+            var server = StartServer(serverConfig);
+            var client = StartClient(_currentTestPort, CreateConfig(_currentTestPort, 256, 3, 2));
+
+            int unreliableDelivered = 0;
+            int reliableDelivered = 0;
+
+            server.Interpreter.Subscribe<ChatPacket>((pkt, _) =>
+            {
+                if (pkt.Message.StartsWith("unrel")) Interlocked.Increment(ref unreliableDelivered);
+                if (pkt.Message.StartsWith("rel")) Interlocked.Increment(ref reliableDelivered);
+            }, this);
+
+            for (int i = 0; i < 3; i++)
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"unrel-{i}" }, DeliveryMethod.Unreliable);
+            for (int i = 0; i < 3; i++)
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"rel-{i}" }, DeliveryMethod.Reliable);
+
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref reliableDelivered) == 3, 3000), Is.True,
+                $"Expected 3 reliable packets to survive and recover, but got {reliableDelivered}");
+            Assert.That(server.Transport.IsConnected, Is.True, "Server kicked client instead of recovering.");
+        }
+
+        #endregion
+
 
         private LiminalNetworkManager StartServer(LiminalTransportConfig config)
         {

@@ -28,7 +28,24 @@ namespace Liminal.Net.Core
         {
             Interlocked.Exchange(ref _slewAdjustmentTicks, adjustmentTicks);
         }
+        //For testing
+        public void TickOnce()
+        {
+            long currentSlew = Interlocked.Exchange(
+                ref _slewAdjustmentTicks,
+                0);
 
+            long nextTick = Volatile.Read(ref _nextTickTimestamp);
+
+            if (nextTick == 0)
+                nextTick = Stopwatch.GetTimestamp();
+
+            nextTick += NominalTickTicks + currentSlew;
+
+            Volatile.Write(ref _nextTickTimestamp, nextTick);
+
+            OnTick?.Invoke();
+        }
         public void Start()
         {
             if (_isRunning) return;
@@ -102,7 +119,10 @@ namespace Liminal.Net.Core
                     if (msRemaining > 16) Thread.Sleep(1);
                     else Thread.SpinWait(10);
                 }
+
             }
+
+
         }
     }
 }

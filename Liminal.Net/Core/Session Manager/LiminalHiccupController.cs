@@ -137,10 +137,10 @@ namespace Liminal.Net.Core
             var buffers = _outboundPool.Rent();
             try
             {
-                if (session.RawSendCursor > 0)
+                if (session.RawSendCursorReliable > 0)
                 {
-                    session.RawSendBuffer.GetSpan()
-                        .Slice(0, session.RawSendCursor)
+                    session.RawSendBufferReliable.GetSpan()
+                        .Slice(0, session.RawSendCursorReliable)
                         .CopyTo(buffers.RawSendBuffer.GetSpan());
                 }
 
@@ -191,7 +191,7 @@ namespace Liminal.Net.Core
 
             lock (session.SendLock)
             {
-                if (session.IsDisposed() || !session.OutboundRecoveryActive || session.RawSendCursor != 0)
+                if (session.IsDisposed() || !session.OutboundRecoveryActive || session.RawSendCursorReliable != 0)
                     return;
 
                 if (!HasRecoveryHoldElapsed(session.Recovery.OutboundLimiter, now))

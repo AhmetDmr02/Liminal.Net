@@ -71,7 +71,7 @@ namespace Liminal.Net.Core
         #endregion
 
         #region Send Path
-        public static void Send<T>(SendTo target, T packet) where T : struct
+        public static void Send<T>(SendTo target, T packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where T : struct
         {
             var manager = LiminalNetworkManager.Instance;
 
@@ -92,11 +92,11 @@ namespace Liminal.Net.Core
                 switch (target)
                 {
                     case SendTo.Me:
-                        manager.Interpreter.SendCommand(manager.localID, packet);
+                        manager.Interpreter.SendCommand(manager.localID, packet, deliveryMethod);
                         return;
 
                     case SendTo.Server:
-                        manager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, packet);
+                        manager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, packet, deliveryMethod);
                         return;
 
                     default:
@@ -105,10 +105,10 @@ namespace Liminal.Net.Core
                 }
             }
 
-            ResolveAndSendMulticast(manager, target, packet);
+            ResolveAndSendMulticast(manager, target, packet, deliveryMethod);
         }
 
-        public static void SendToClient<T>(ushort targetClientId, T packet) where T : struct
+        public static void SendToClient<T>(ushort targetClientId, T packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where T : struct
         {
             var manager = LiminalNetworkManager.Instance;
 
@@ -122,12 +122,12 @@ namespace Liminal.Net.Core
 
             if (!ValidateTargetSession(manager, targetClientId)) return;
 
-            manager.Interpreter.SendCommandAsServer(targetClientId, packet);
+            manager.Interpreter.SendCommandAsServer(targetClientId, packet, deliveryMethod);
         }
 
-        private static void ResolveAndSendMulticast<T>(LiminalNetworkManager manager, SendTo target, T packet) where T : struct
+        private static void ResolveAndSendMulticast<T>(LiminalNetworkManager manager, SendTo target, T packet, DeliveryMethod deliveryMethod) where T : struct
         {
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2; // +2 safety buffer for Local/Server IDs
+            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
             Span<ushort> allSessions = stackalloc ushort[maxClients];
             int totalSessions = manager.SessionManager.GetSessionIds(allSessions);
 
@@ -155,23 +155,18 @@ namespace Liminal.Net.Core
                         break;
 
                     case SendTo.Everyone:
-                        // Includes every active session: server authority, host player, and all clients
                         include = true;
                         break;
 
                     case SendTo.NotMe:
-                        // Host: Excludes local host client (localId), keeps Server and remotes
-                        // Server: Excludes Server authority (SERVER_ID), keeps all clients
                         include = isHost ? (id != localId) : (id != ILiminalTransport.SERVER_ID);
                         break;
 
                     case SendTo.NotServer:
-                        // Excludes Server authority (SERVER_ID), keeps all clients and Host local client
                         include = (id != ILiminalTransport.SERVER_ID);
                         break;
 
                     case SendTo.NotHost:
-                        // Excludes Server authority (SERVER_ID) and Host local client if running as Host
                         include = (id != ILiminalTransport.SERVER_ID) && (!isHost || id != localId);
                         break;
                 }
@@ -185,19 +180,15 @@ namespace Liminal.Net.Core
             if (targetCount == 0) return;
 
             var targetsSlice = filteredTargets.Slice(0, targetCount);
-
-            // If running in Host mode and targeting client-side scopes (.Me, .NotServer, .Server),
-            // dispatch from the host's client identity (localID).
-            // Otherwise, dispatch with server authority (SERVER_ID / 0).
             bool sendAsClient = isHost && (target == SendTo.Me || target == SendTo.NotServer || target == SendTo.Server);
 
             if (sendAsClient)
             {
-                manager.Interpreter.SendCommandAsClient(targetsSlice, packet);
+                manager.Interpreter.SendCommandAsClient(targetsSlice, packet, deliveryMethod);
             }
             else
             {
-                manager.Interpreter.SendCommandAsServer(targetsSlice, packet);
+                manager.Interpreter.SendCommandAsServer(targetsSlice, packet, deliveryMethod);
             }
         }
         #endregion
@@ -225,7 +216,6 @@ namespace Liminal.Net.Core
 
         private static bool ValidateTargetSession(LiminalNetworkManager manager, ushort targetClientId)
         {
-            // Allow targeting SERVER_ID or check if client socket is connected
             if (targetClientId == ILiminalTransport.SERVER_ID || manager.Transport.IsClientConnected(targetClientId) || (manager.Role == NetworkRole.Host && targetClientId == manager.localID))
             {
                 return true;

@@ -6,6 +6,7 @@ using Liminal.Net.Transports;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Security.Cryptography;
@@ -198,7 +199,7 @@ namespace Liminal.Net.Tests
             _serverManager.Transport.Kick(1);
 
             Assert.That(SpinWait.SpinUntil(() => clientSawDisconnect, 2000), Is.True, "Client did not detect being kicked.");
-            Assert.That(client.Transport.IsConnected, Is.False);
+            Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 2000), Is.True, "Client transport remained marked as connected.");
         }
 
         [Test]
@@ -417,5 +418,363 @@ namespace Liminal.Net.Tests
                 _serverManager.ManualPoll();
             }, "Polling after a dropped packet caused an exception.");
         }
+        #region Dual-Channel & DeliveryMethod Tests
+
+        [Test]
+        public void Test17_SendUnreliable_SmallPayload_Delivered()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            bool received = false;
+            client.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
+            {
+                if (pkt.Message == "UnreliablePing") received = true;
+            }, this);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "UnreliablePing" }, DeliveryMethod.Unreliable);
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => received, 2000), Is.True, "Unreliable packet was not delivered.");
+        }
+
+        [Test]
+        public void Test18_SendMixed_ReliableAndUnreliable_BothDeliveredSequentially()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            bool receivedRel = false;
+            bool receivedUnrel = false;
+
+            client.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
+            {
+                if (pkt.Message == "ReliableMsg") receivedRel = true;
+                if (pkt.Message == "UnreliableMsg") receivedUnrel = true;
+            }, this);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "UnreliableMsg" }, DeliveryMethod.Unreliable);
+            _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "ReliableMsg" }, DeliveryMethod.Reliable);
+
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => receivedRel && receivedUnrel, 2000), Is.True,
+                $"Failed mixed delivery. Reliable: {receivedRel}, Unreliable: {receivedUnrel}");
+        }
+
+        [Test]
+        public void Test19_Broadcaster_SendToClient_ForwardsDeliveryMethod()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            bool received = false;
+            client.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
+            {
+                if (pkt.Message == "BroadcastUnreliable") received = true;
+            }, this);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            Broadcaster.SendToClient(1, new ChatPacket { Message = "BroadcastUnreliable" }, DeliveryMethod.Unreliable);
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => received, 2000), Is.True,
+                "Packet sent via Broadcaster with DeliveryMethod.Unreliable failed to arrive.");
+        }
+
+        [Test]
+        public void Test20_UnreliableOverflow_DropsSilently_ConnectionRemainsAlive()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            byte[] oversized = new byte[5000];
+            Assert.DoesNotThrow(() =>
+            {
+                _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "drop.bin", Data = oversized }, DeliveryMethod.Unreliable);
+            });
+
+            _serverManager.SessionManager.Flush();
+
+            Thread.Sleep(100);
+            Assert.That(client.Transport.IsConnected, Is.True, "Client was kicked due to an oversized unreliable packet!");
+
+            bool reliableDelivered = false;
+            client.Interpreter.Subscribe<ChatPacket>((pkt, id) => reliableDelivered = true, this);
+
+            _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "StillAlive" }, DeliveryMethod.Reliable);
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => reliableDelivered, 2000), Is.True,
+                "Subsequent reliable packet was not delivered after unreliable drop.");
+        }
+
+        [Test]
+        public void Test21_ReliablePacket_DropsQueuedUnreliable_ToAvoidHiccupRecovery()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            bool sawUnreliable = false;
+            bool sawReliable = false;
+
+            client.Interpreter.Subscribe<FilePacket>((pkt, id) =>
+            {
+                if (pkt.FileName == "unreliable.bin") sawUnreliable = true;
+                if (pkt.FileName == "reliable.bin") sawReliable = true;
+            }, this);
+
+            byte[] unrelPayload = new byte[2500];
+            _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "unreliable.bin", Data = unrelPayload }, DeliveryMethod.Unreliable);
+
+            byte[] relPayload = new byte[2000];
+            _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "reliable.bin", Data = relPayload }, DeliveryMethod.Reliable);
+
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => sawReliable, 2000), Is.True, "Reliable packet was not delivered.");
+            Assert.That(sawUnreliable, Is.False, "Queued unreliable packet should have been dropped to prevent Hiccup recovery.");
+        }
+
+        [Test]
+        public void Test22_UnderCapacity_BothReliableAndUnreliable_NeitherDropped()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            bool sawUnreliable = false;
+            bool sawReliable = false;
+
+            client.Interpreter.Subscribe<FilePacket>((pkt, id) =>
+            {
+                if (pkt.FileName == "unrel.bin") sawUnreliable = true;
+                if (pkt.FileName == "rel.bin") sawReliable = true;
+            }, this);
+
+            byte[] payload = new byte[1200];
+            _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "unrel.bin", Data = payload }, DeliveryMethod.Unreliable);
+            _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "rel.bin", Data = payload }, DeliveryMethod.Reliable);
+
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => sawUnreliable && sawReliable, 2000), Is.True,
+                "Both packets should have been preserved and delivered since total size was under capacity.");
+        }
+
+        [Test]
+        public void Test23_Loopback_SupportsUnreliableDeliveryMethod()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            bool receivedLoopback = false;
+
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, senderId) =>
+            {
+                if (pkt.Message == "UnreliableLoop" && senderId == ILiminalTransport.SERVER_ID)
+                {
+                    receivedLoopback = true;
+                }
+            }, this);
+
+            _serverManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "UnreliableLoop" }, DeliveryMethod.Unreliable);
+
+            Assert.That(SpinWait.SpinUntil(() => receivedLoopback, 2000), Is.True,
+                "Virtual loopback failed to route an Unreliable packet to itself.");
+        }
+
+        #endregion
+
+        #region Inbound Receive Path Tests
+
+        [Test]
+        public void Test24_Inbound_OversizedUnreliableBatch_DroppedSilently_PeerNotKicked()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            bool sawUnreliable = false;
+            _serverManager.Interpreter.Subscribe<FilePacket>((pkt, id) =>
+            {
+                if (pkt.FileName == "huge_unrel.bin") sawUnreliable = true;
+            }, this);
+
+            byte[] oversizedPayload = new byte[5000];
+            Random.Shared.NextBytes(oversizedPayload);
+
+            Span<byte> framed = stackalloc byte[4 + 2 + oversizedPayload.Length];
+            BinaryPrimitives.WriteInt32LittleEndian(framed.Slice(0, 4), oversizedPayload.Length + 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(framed.Slice(4, 2), (ushort)LiminalPacketLibrary.GetId<FilePacket>());
+            oversizedPayload.CopyTo(framed.Slice(6));
+
+            client.Transport.Send(framed, ILiminalTransport.SERVER_ID, TransportFlags.Unreliable);
+
+            Thread.Sleep(150);
+
+            Assert.That(sawUnreliable, Is.False, "Oversized inbound unreliable packet should have been dropped.");
+            Assert.That(client.Transport.IsConnected, Is.True, "Client should NOT have been kicked for sending an oversized unreliable batch.");
+
+            bool reliableReceived = false;
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
+            {
+                if (pkt.Message == "AfterDropPing") reliableReceived = true;
+            }, this);
+
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "AfterDropPing" }, DeliveryMethod.Reliable);
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => reliableReceived, 2000), Is.True, "Subsequent reliable message failed to arrive after unreliable drop.");
+        }
+
+        [Test]
+        public void Test25_Inbound_PollingDrainsUnreliableBeforeReliable()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            var dispatchOrder = new List<string>();
+
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
+            {
+                lock (dispatchOrder)
+                {
+                    dispatchOrder.Add(pkt.Message);
+                }
+            }, this);
+
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "UnreliableFirst" }, DeliveryMethod.Unreliable);
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "ReliableSecond" }, DeliveryMethod.Reliable);
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() =>
+            {
+                lock (dispatchOrder) return dispatchOrder.Count == 2;
+            }, 2000), Is.True, "Both packets failed to arrive.");
+
+            lock (dispatchOrder)
+            {
+                Assert.That(dispatchOrder[0], Is.EqualTo("UnreliableFirst"));
+                Assert.That(dispatchOrder[1], Is.EqualTo("ReliableSecond"));
+            }
+        }
+
+        [Test]
+        public void Test26_Inbound_ReliableDropsQueuedUnreliable_ToAvoidHiccupRecovery()
+        {
+            _serverConfig.MaxPacketCount = 5;
+            _serverConfig.Hiccup.Enabled = true;
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var clientConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = 5,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(client);
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            int serverReceivedUnreliable = 0;
+            int serverReceivedReliable = 0;
+
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
+            {
+                if (pkt.Message.StartsWith("UnrelQueue")) Interlocked.Increment(ref serverReceivedUnreliable);
+                if (pkt.Message.StartsWith("RelPriority")) Interlocked.Increment(ref serverReceivedReliable);
+            }, this);
+
+            for (int i = 0; i < 4; i++)
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"UnrelQueue_{i}" }, DeliveryMethod.Unreliable);
+            }
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "RelPriority_0" }, DeliveryMethod.Reliable);
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "RelPriority_1" }, DeliveryMethod.Reliable);
+
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref serverReceivedReliable) == 2, 2000), Is.True,
+                $"Expected 2 reliable packets, but got {serverReceivedReliable}");
+
+            Assert.That(Volatile.Read(ref serverReceivedUnreliable), Is.EqualTo(0),
+                "Queued unreliable packets should have been dropped to accommodate reliable traffic.");
+        }
+
+        [Test]
+        public void Test27_Inbound_QueueCapExceeded_DropsIncomingUnreliableWithoutKicking()
+        {
+            _serverConfig.MaxPacketCount = 4;
+
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            int receivedCount = 0;
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref receivedCount), this);
+
+            for (int i = 0; i < 10; i++)
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"Spam_{i}" }, DeliveryMethod.Unreliable);
+            }
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref receivedCount) > 0, 2000), Is.True);
+
+            Thread.Sleep(100);
+
+            Assert.That(client.Transport.IsConnected, Is.True, "Client was kicked when unreliable inbound queue overflowed.");
+
+            Assert.That(Volatile.Read(ref receivedCount), Is.EqualTo(4),
+                $"Inbound queue should have capped queued unreliable packets at 4, but received {receivedCount}.");
+        }
+
+        [Test]
+        public void Test28_Inbound_DisconnectDrainsBothQueues_ZeroMemoryLeak()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "Unrel" }, DeliveryMethod.Unreliable);
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "Rel" }, DeliveryMethod.Reliable);
+            client.SessionManager.Flush();
+
+            Thread.Sleep(50);
+
+            client.Disconnect();
+
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.SessionManager.GetActiveSessionCount() == 0, 2000), Is.True,
+                "Server failed to clean up session on disconnect.");
+
+            Assert.DoesNotThrow(() => _serverManager.ManualPoll());
+        }
+
+        #endregion
     }
 }

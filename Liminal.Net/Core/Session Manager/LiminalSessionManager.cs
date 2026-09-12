@@ -8,6 +8,12 @@ using System.Threading;
 
 namespace Liminal.Net.Core
 {
+    public enum DeliveryMethod : byte
+    {
+        Unreliable = 0,
+        Reliable = 1
+    }
+
     public class LiminalSessionManager : IDisposable, ISessionTelemetryProvider
     {
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
@@ -66,10 +72,10 @@ namespace Liminal.Net.Core
 
         #region Receive Path (Background Threads)
 
-        private void HandleReliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
-        private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data);
+        private void HandleReliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data, DeliveryMethod.Reliable);
+        private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data, DeliveryMethod.Unreliable);
 
-        private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData)
+        private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData, DeliveryMethod deliveryMethod)
         {
             if (_sessionManagerDisposed || !_sessions.TryGetValue(ownerId, out var session)) return;
 
@@ -86,13 +92,89 @@ namespace Liminal.Net.Core
                 {
                     if (session.IsDisposed()) return;
 
-                    if (transportData.Length > _config.MaxPacketSizePerBatch || session.InboundPacketCount >= _config.MaxPacketCount)
+                    if (deliveryMethod == DeliveryMethod.Unreliable)
                     {
-                        if (!EnsureInboundRecoveryLocked(session, ownerId, transportData.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                        if (transportData.Length > _config.MaxPacketSizePerBatch || session.InboundPacketCount >= _config.MaxPacketCount)
                         {
-                            shouldKick = true;
-                            kickReason = failureReason;
+                            LiminalLogger.LogWarning($"[SessionManager] Dropped inbound unreliable batch from client {ownerId}. Batch size or packet queue limit reached.");
                             return;
+                        }
+
+                        var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
+                        if (processedBatch.IsEmpty) return;
+
+                        if (processedBatch.Length > _config.MaxPacketSizePerBatch)
+                        {
+                            LiminalLogger.LogWarning($"[SessionManager] Dropped transformed unreliable batch ({processedBatch.Length}b) from client {ownerId}. Exceeded batch size.");
+                            return;
+                        }
+
+                        int offset = 0;
+                        while (offset + 4 <= processedBatch.Length)
+                        {
+                            int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
+                            if (totalLen < 2 || offset + 4 + totalLen > processedBatch.Length) break;
+
+                            if (session.InboundPacketCount >= _config.MaxPacketCount ||
+                                !session.TryReserveInboundPacketUnreliable(_config.MaxPacketCount))
+                            {
+                                LiminalLogger.LogWarning($"[SessionManager] Inbound queue capacity reached for client {ownerId}. Dropping remaining unreliable packets.");
+                                break;
+                            }
+
+                            ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
+                            int payloadLen = totalLen - 2;
+
+                            byte[] rentedBuffer = null;
+                            try
+                            {
+                                rentedBuffer = _privatePool.Rent(payloadLen);
+                                processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
+                                session.InboundQueueUnreliable.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen, usesRecoveryPool: false));
+                                rentedBuffer = null;
+                            }
+                            catch
+                            {
+                                session.ReleaseInboundPacketUnreliable();
+                                throw;
+                            }
+                            finally
+                            {
+                                if (rentedBuffer != null) _privatePool.Return(rentedBuffer);
+                            }
+
+                            if (countPackets) inboundBatchCount++;
+                            offset += 4 + totalLen;
+                        }
+
+                        return;
+                    }
+
+                    //RELIABLE RECEIVE PATH
+                    bool exceedsNormalThreshold = transportData.Length > _config.MaxPacketSizePerBatch || session.InboundPacketCount >= _config.MaxPacketCount;
+
+                    if (exceedsNormalThreshold)
+                    {
+                        // Drop queued unreliable packets only if it prevents entering Hiccup
+                        bool canAvoidRecovery = !session.InboundRecoveryActive &&
+                                                session.InboundPacketCountUnreliable > 0 &&
+                                                transportData.Length <= _config.MaxPacketSizePerBatch &&
+                                                session.InboundPacketCountReliable < _config.MaxPacketCount;
+
+                        if (canAvoidRecovery)
+                        {
+                            int dropped = session.DropQueuedUnreliableInbound(ReturnPacketBuffer);
+                            LiminalLogger.LogWarning($"[SessionManager] Dropped {dropped} queued unreliable inbound packets for client {ownerId} to prevent Hiccup recovery.");
+                        }
+
+                        if (transportData.Length > _config.MaxPacketSizePerBatch || session.InboundPacketCount >= _config.MaxPacketCount)
+                        {
+                            if (!EnsureInboundRecoveryLocked(session, ownerId, transportData.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                            {
+                                shouldKick = true;
+                                kickReason = failureReason;
+                                return;
+                            }
                         }
                     }
 
@@ -103,48 +185,58 @@ namespace Liminal.Net.Core
                         return;
                     }
 
-                    var processedBatch = _pipeline.ExecuteInboundBatch(session, transportData);
-                    if (processedBatch.IsEmpty) return;
+                    var processedReliableBatch = _pipeline.ExecuteInboundBatch(session, transportData);
+                    if (processedReliableBatch.IsEmpty) return;
 
-                    if (processedBatch.Length > GetInboundStageCapacity(session))
+                    if (processedReliableBatch.Length > GetInboundStageCapacity(session))
                     {
                         shouldKick = true;
                         kickReason = "Inbound transformed batch exceeded the session recovery ceiling.";
                         return;
                     }
 
-                    int offset = 0;
-                    while (offset + 4 <= processedBatch.Length)
+                    int relOffset = 0;
+                    while (relOffset + 4 <= processedReliableBatch.Length)
                     {
-                        int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
-                        if (totalLen < 2 || offset + 4 + totalLen > processedBatch.Length)
-                            break;
+                        int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedReliableBatch.Slice(relOffset, 4));
+                        if (totalLen < 2 || relOffset + 4 + totalLen > processedReliableBatch.Length) break;
 
                         if (session.InboundPacketCount >= GetInboundPacketLimit(session))
                         {
-                            if (!EnsureInboundRecoveryLocked(session, ownerId, processedBatch.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                            // Try dropping queued unreliable before expanding recovery ceiling
+                            if (!session.InboundRecoveryActive && session.InboundPacketCountUnreliable > 0 &&
+                                session.InboundPacketCountReliable < _config.MaxPacketCount)
                             {
-                                shouldKick = true;
-                                kickReason = failureReason;
-                                return;
+                                int dropped = session.DropQueuedUnreliableInbound(ReturnPacketBuffer);
+                                LiminalLogger.LogWarning($"[SessionManager] Dropped {dropped} queued unreliable inbound packets for client {ownerId} to fit reliable packet.");
                             }
 
                             if (session.InboundPacketCount >= GetInboundPacketLimit(session))
                             {
-                                shouldKick = true;
-                                kickReason = "Inbound packet-count recovery ceiling exceeded.";
-                                return;
+                                if (!EnsureInboundRecoveryLocked(session, ownerId, processedReliableBatch.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                                {
+                                    shouldKick = true;
+                                    kickReason = failureReason;
+                                    return;
+                                }
+
+                                if (session.InboundPacketCount >= GetInboundPacketLimit(session))
+                                {
+                                    shouldKick = true;
+                                    kickReason = "Inbound packet-count recovery ceiling exceeded.";
+                                    return;
+                                }
                             }
                         }
 
-                        if (!session.TryReserveInboundPacket(GetInboundPacketLimit(session)))
+                        if (!session.TryReserveInboundPacketReliable(GetInboundPacketLimit(session)))
                         {
                             shouldKick = true;
                             kickReason = "Inbound packet-count reservation failed at the active ceiling.";
                             return;
                         }
 
-                        ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedBatch.Slice(offset + 4, 2));
+                        ushort packetId = BinaryPrimitives.ReadUInt16LittleEndian(processedReliableBatch.Slice(relOffset + 4, 2));
                         int payloadLen = totalLen - 2;
 
                         ArrayPool<byte> payloadPool = payloadLen > _config.MaxPacketSizePerBatch
@@ -155,28 +247,25 @@ namespace Liminal.Net.Core
                         try
                         {
                             rentedBuffer = payloadPool.Rent(payloadLen);
-                            processedBatch.Slice(offset + 6, payloadLen).CopyTo(rentedBuffer);
-                            session.InboundQueue.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen, payloadPool == _recoveryPacketPool));
+                            processedReliableBatch.Slice(relOffset + 6, payloadLen).CopyTo(rentedBuffer);
+                            session.InboundQueueReliable.Enqueue(new InboundPacket(packetId, rentedBuffer, payloadLen, payloadPool == _recoveryPacketPool));
                             rentedBuffer = null;
                         }
                         catch
                         {
-                            session.ReleaseInboundPacket();
+                            session.ReleaseInboundPacketReliable();
                             throw;
                         }
                         finally
                         {
-                            if (rentedBuffer != null)
-                                payloadPool.Return(rentedBuffer);
+                            if (rentedBuffer != null) payloadPool.Return(rentedBuffer);
                         }
 
                         if (session.InboundRecoveryActive)
                             session.Recovery.InboundLimiter.LastActivityTimestamp = Stopwatch.GetTimestamp();
 
-                        if (countPackets)
-                            inboundBatchCount++;
-
-                        offset += 4 + totalLen;
+                        if (countPackets) inboundBatchCount++;
+                        relOffset += 4 + totalLen;
                     }
                 }
             }
@@ -202,8 +291,9 @@ namespace Liminal.Net.Core
 
         #region Write Path (Game Thread)
 
-        public event Action<ushort,Memory<byte>> OnPacketBuffered;
-        public void BufferPacket(ushort senderId, ushort targetId, ushort packetId, ReadOnlySpan<byte> payload)
+        public event Action<ushort, Memory<byte>> OnPacketBuffered;
+
+        public void BufferPacket(ushort senderId, ushort targetId, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable)
         {
             if (_sessionManagerDisposed) return;
 
@@ -236,15 +326,12 @@ namespace Liminal.Net.Core
                     _loopbackQueue.Enqueue((senderId, packet));
 
                     rentedBuffer = null;
-
                     return;
                 }
                 finally
                 {
                     if (rentedBuffer != null)
-                    {
                         _privatePool.Return(rentedBuffer);
-                    }
                 }
             }
 
@@ -260,43 +347,105 @@ namespace Liminal.Net.Core
 
             try
             {
+                Memory<byte> bufferedMemory = default;
+                bool raiseBufferedEvent = false;
+
+
                 lock (session.SendLock)
                 {
                     if (session.IsDisposed()) return;
 
-                    int activeCapacity = GetOutboundBufferCapacity(session);
-                    if (frameSize > activeCapacity || session.RawSendCursor + frameSize > activeCapacity)
+                    if (deliveryMethod == DeliveryMethod.Unreliable)
                     {
-                        int required = Math.Max(frameSize, session.RawSendCursor + frameSize);
-                        if (!EnsureOutboundRecoveryLocked(session, targetId, required, Stopwatch.GetTimestamp(), out string failureReason))
+                        int unreliableCapacity = session.RawSendBufferUnreliable.GetSpan().Length;
+                        int totalCombined = session.RawSendCursorReliable + session.RawSendCursorUnreliable + frameSize;
+
+                        // Drop if unreliable buffer is individually exceeded or if it pushes the combined batch over normal capacity
+                        if (session.RawSendCursorUnreliable + frameSize > unreliableCapacity || totalCombined > _config.MaxPacketSizePerBatch)
                         {
-                            session.RawSendCursor = 0;
-                            shouldKick = true;
-                            kickReason = failureReason;
+                            LiminalLogger.LogWarning($"[SessionManager] Dropped unreliable packet {packetId} ({frameSize}b) for client {targetId}. Outbound capacity limit reached.");
                             return;
                         }
 
-                        activeCapacity = GetOutboundBufferCapacity(session);
-                        if (frameSize > activeCapacity || session.RawSendCursor + frameSize > activeCapacity)
+                        Span<byte> dest = session.RawSendBufferUnreliable.GetSpan().Slice(session.RawSendCursorUnreliable);
+                        BinaryPrimitives.WriteInt32LittleEndian(dest.Slice(0, 4), payload.Length + 2);
+                        BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(4, 2), packetId);
+                        payload.CopyTo(dest.Slice(6));
+
+                        session.RawSendCursorUnreliable += frameSize;
+
+                        if (_telemetryConfig != null && _telemetryConfig.EnablePacketCounting)
                         {
-                            session.RawSendCursor = 0;
-                            shouldKick = true;
-                            kickReason = "Outbound recovery ceiling exceeded.";
-                            return;
+                            bufferedMemory = session.RawSendBufferUnreliable.Memory.Slice(session.RawSendCursorUnreliable - frameSize, frameSize);
+
+                            raiseBufferedEvent = true;
+                        }
+
+                        if (countPackets)
+                            Interlocked.Increment(ref _totalPacketsOutbound);
+
+                        return;
+                    }
+
+                    //RELIABLE DELIVERY PATH
+                    int activeCapacity = GetOutboundBufferCapacity(session);
+                    int totalBuffered = session.RawSendCursorReliable + session.RawSendCursorUnreliable;
+                    int reliableRequired = session.RawSendCursorReliable + frameSize;
+
+                    bool exceedsThreshold = frameSize > activeCapacity ||
+                                            (totalBuffered + frameSize) > activeCapacity ||
+                                            totalBuffered >= _config.MaxPacketSizePerBatch;
+
+                    if (exceedsThreshold)
+                    {
+                        //Only drop unreliable if recovery is NOT already active
+                        //AND dropping it actually keeps the reliable batch within normal capacity.
+                        bool canAvoidRecoveryByDroppingUnreliable = !session.OutboundRecoveryActive && session.RawSendCursorUnreliable > 0 && reliableRequired <= _config.MaxPacketSizePerBatch;
+
+                        if (canAvoidRecoveryByDroppingUnreliable)
+                        {
+                            int droppedBytes = session.RawSendCursorUnreliable;
+                            session.RawSendCursorUnreliable = 0;
+
+                            LiminalLogger.LogWarning(
+                                $"[SessionManager] Dropped {droppedBytes}b of queued unreliable packets for client {targetId} to fit reliable packet {packetId} without triggering Hiccup recovery.");
+                        }
+                        else
+                        {
+                            //Dropping unreliable won't prevent Hiccup recovery, so keep the unreliable queue intact.
+                            int required = Math.Max(frameSize, reliableRequired);
+                            if (!EnsureOutboundRecoveryLocked(session, targetId, required, Stopwatch.GetTimestamp(), out string failureReason))
+                            {
+                                session.RawSendCursorReliable = 0;
+                                session.RawSendCursorUnreliable = 0;
+                                shouldKick = true;
+                                kickReason = failureReason;
+                                return;
+                            }
+
+                            activeCapacity = GetOutboundBufferCapacity(session);
+                            if (frameSize > activeCapacity || reliableRequired > activeCapacity)
+                            {
+                                session.RawSendCursorReliable = 0;
+                                session.RawSendCursorUnreliable = 0;
+                                shouldKick = true;
+                                kickReason = "Outbound recovery ceiling exceeded.";
+                                return;
+                            }
                         }
                     }
 
-                    Span<byte> dest = session.ActiveRawSendBuffer.GetSpan().Slice(session.RawSendCursor);
-                    BinaryPrimitives.WriteInt32LittleEndian(dest.Slice(0, 4), payload.Length + 2);
-                    BinaryPrimitives.WriteUInt16LittleEndian(dest.Slice(4, 2), packetId);
-                    payload.CopyTo(dest.Slice(6));
+                    Span<byte> relDest = session.ActiveRawSendBufferReliable.GetSpan().Slice(session.RawSendCursorReliable);
+                    BinaryPrimitives.WriteInt32LittleEndian(relDest.Slice(0, 4), payload.Length + 2);
+                    BinaryPrimitives.WriteUInt16LittleEndian(relDest.Slice(4, 2), packetId);
+                    payload.CopyTo(relDest.Slice(6));
 
-                    session.RawSendCursor += frameSize;
+                    session.RawSendCursorReliable += frameSize;
 
-                    if (_telemetryConfig.EnablePacketCounting)
+                    if (_telemetryConfig != null && _telemetryConfig.EnablePacketCounting)
                     {
-                        Memory<byte> framedMemory = session.ActiveRawSendBuffer.Memory.Slice(session.RawSendCursor - frameSize, frameSize);
-                        OnPacketBuffered.Invoke(packetId, framedMemory);
+                        bufferedMemory = session.ActiveRawSendBufferReliable.Memory.Slice(session.RawSendCursorReliable - frameSize, frameSize);
+                        raiseBufferedEvent = true;
                     }
 
                     if (session.OutboundRecoveryActive)
@@ -304,6 +453,12 @@ namespace Liminal.Net.Core
 
                     if (countPackets)
                         Interlocked.Increment(ref _totalPacketsOutbound);
+                }
+
+
+                if (raiseBufferedEvent)
+                {
+                    OnPacketBuffered?.Invoke(packetId, bufferedMemory);
                 }
             }
             finally
@@ -335,7 +490,6 @@ namespace Liminal.Net.Core
                 catch (Exception ex)
                 {
                     LiminalLogger.LogError($"[SessionManager] Error flushing session {session.Id}: {ex}");
-
                     _hiccup.Kick(session.Id, LiminalRecoveryDirection.Outbound, "Flush pipeline failure.");
                 }
             }
@@ -345,44 +499,47 @@ namespace Liminal.Net.Core
         {
             bool shouldKick = false;
             string kickReason = null;
-            int bytesToSend = 0;
 
             try
             {
                 lock (session.SendLock)
                 {
-                    if (session.RawSendCursor == 0 || session.IsDisposed()) return;
+                    if ((session.RawSendCursorReliable == 0 && session.RawSendCursorUnreliable == 0) || session.IsDisposed())
+                        return;
 
-                    int activeCapacity = GetOutboundBufferCapacity(session);
-                    if (session.RawSendCursor > activeCapacity)
+                    if (session.RawSendCursorUnreliable > 0)
                     {
-                        if (!EnsureOutboundRecoveryLocked(session, session.Id, session.RawSendCursor, Stopwatch.GetTimestamp(), out string failureReason))
+                        int unBytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursorUnreliable, session.RawSendBufferUnreliable);
+                        session.RawSendCursorUnreliable = 0;
+
+                        if (unBytesToSend > session.RawSendBufferUnreliable.GetSpan().Length)
                         {
-                            session.RawSendCursor = 0;
-                            shouldKick = true;
-                            kickReason = failureReason;
-                            return;
+                            LiminalLogger.LogWarning($"[SessionManager] Transformed unreliable batch exceeded normal capacity for {session.Id}. Dropping.");
+                            unBytesToSend = 0;
                         }
 
-                        activeCapacity = GetOutboundBufferCapacity(session);
-                        if (session.RawSendCursor > activeCapacity)
+                        if (unBytesToSend > 0)
                         {
-                            session.RawSendCursor = 0;
-                            shouldKick = true;
-                            kickReason = "Outbound raw buffer exceeded the recovery ceiling.";
-                            return;
+                            _fragmentor.Send(session.ActiveSendBuffer.GetSpan().Slice(0, unBytesToSend), session.Id, TransportFlags.Unreliable);
                         }
                     }
 
-                    bytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursor);
-                    session.RawSendCursor = 0;
-
-                    if (bytesToSend > GetOutboundBufferCapacity(session))
+                    if (session.RawSendCursorReliable > 0)
                     {
-                        shouldKick = true;
-                        kickReason = "Outbound transformed batch exceeded the recovery ceiling.";
-                        bytesToSend = 0;
-                        return;
+                        int relBytesToSend = _pipeline.ExecuteOutboundBatch(session, session.RawSendCursorReliable,session.ActiveRawSendBufferReliable);
+                        session.RawSendCursorReliable = 0;
+
+                        if (relBytesToSend > GetOutboundBufferCapacity(session))
+                        {
+                            shouldKick = true;
+                            kickReason = "Outbound transformed reliable batch exceeded the recovery ceiling.";
+                            return;
+                        }
+
+                        if (relBytesToSend > 0)
+                        {
+                            _fragmentor.Send(session.ActiveSendBuffer.GetSpan().Slice(0, relBytesToSend), session.Id, TransportFlags.Reliable);
+                        }
                     }
                 }
             }
@@ -392,11 +549,6 @@ namespace Liminal.Net.Core
                 {
                     _hiccup.Kick(session.Id, LiminalRecoveryDirection.Outbound, kickReason);
                 }
-            }
-
-            if (bytesToSend > 0)
-            {
-                _fragmentor.Send(session.ActiveSendBuffer.GetSpan().Slice(0, bytesToSend), session.Id, TransportFlags.Reliable);
             }
         }
 
@@ -431,23 +583,38 @@ namespace Liminal.Net.Core
             foreach (var session in _sessions.Values)
             {
                 if (session.IsDisposed()) continue;
-                if (!session.InboundQueue.IsEmpty)
+
+                while (session.InboundQueueUnreliable.TryDequeue(out var packet))
                 {
-                    while (session.InboundQueue.TryDequeue(out var packet))
+                    session.ReleaseInboundPacketUnreliable();
+                    try
                     {
-                        session.ReleaseInboundPacket();
-                        try
-                        {
-                            _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
-                        }
-                        catch (Exception ex)
-                        {
-                            LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
-                        }
-                        finally
-                        {
-                            ReturnPacketBuffer(packet);
-                        }
+                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                    }
+                    finally
+                    {
+                        ReturnPacketBuffer(packet);
+                    }
+                }
+
+                while (session.InboundQueueReliable.TryDequeue(out var packet))
+                {
+                    session.ReleaseInboundPacketReliable();
+                    try
+                    {
+                        _interpreter.Dispatch(packet.PacketId, session.Id, packet.AsMemory());
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                    }
+                    finally
+                    {
+                        ReturnPacketBuffer(packet);
                     }
                 }
 
@@ -490,9 +657,15 @@ namespace Liminal.Net.Core
                     ReleaseRecoveryForSession(session);
                     session.Dispose();
 
-                    while (session.InboundQueue.TryDequeue(out var packet))
+                    while (session.InboundQueueUnreliable.TryDequeue(out var packet))
                     {
-                        session.ReleaseInboundPacket();
+                        session.ReleaseInboundPacketUnreliable();
+                        ReturnPacketBuffer(packet);
+                    }
+
+                    while (session.InboundQueueReliable.TryDequeue(out var packet))
+                    {
+                        session.ReleaseInboundPacketReliable();
                         ReturnPacketBuffer(packet);
                     }
                 }
@@ -523,9 +696,15 @@ namespace Liminal.Net.Core
                 ReleaseRecoveryForSession(session);
                 session.Dispose();
 
-                while (session.InboundQueue.TryDequeue(out var packet))
+                while (session.InboundQueueUnreliable.TryDequeue(out var packet))
                 {
-                    session.ReleaseInboundPacket();
+                    session.ReleaseInboundPacketUnreliable();
+                    ReturnPacketBuffer(packet);
+                }
+
+                while (session.InboundQueueReliable.TryDequeue(out var packet))
+                {
+                    session.ReleaseInboundPacketReliable();
                     ReturnPacketBuffer(packet);
                 }
             }
@@ -534,7 +713,6 @@ namespace Liminal.Net.Core
             _pendingDisconnects.Clear();
 
             _hiccup.Dispose();
-
         }
 
         private bool disposed = false;

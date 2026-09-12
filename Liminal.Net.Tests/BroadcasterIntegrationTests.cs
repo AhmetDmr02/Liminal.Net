@@ -299,7 +299,11 @@ namespace Liminal.Net.Tests
             var remoteClient1 = CreateAndStartClient();
             var remoteClient2 = CreateAndStartClient();
 
-            Assert.That(SpinWait.SpinUntil(() => remoteClient1.Transport.IsConnected && remoteClient2.Transport.IsConnected, 3000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() =>
+                remoteClient1.Transport.IsConnected &&
+                remoteClient2.Transport.IsConnected &&
+                _serverManager.Transport.IsClientConnected(remoteClient1.localID) &&
+                _serverManager.Transport.IsClientConnected(remoteClient2.localID), 3000), Is.True);
 
             bool hostReceived = false;
             int r1Count = 0, r2Count = 0;
@@ -320,6 +324,7 @@ namespace Liminal.Net.Tests
             _serverManager.SessionManager.Flush();
 
             Assert.That(SpinWait.SpinUntil(() => r1Count == 1 && r2Count == 1, 2000), Is.True);
+
             Thread.Sleep(100);
 
             Assert.Multiple(() =>

@@ -5,6 +5,7 @@ using MessagePack;
 using Microsoft.Coyote.Specifications;
 using Microsoft.Coyote.SystematicTesting;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Threading.Tasks;
 using TestAttribute = Microsoft.Coyote.SystematicTesting.TestAttribute;
 
@@ -41,7 +42,7 @@ namespace Liminal.Net.Tests
 
             int totalDispatched = 0;
 
-            interpreter.OnSendRequest += (sender, target, pid, data) =>
+            interpreter.OnSendRequest += (sender, target, pid, data, DeliveryMethod) =>
             {
                 Interlocked.Increment(ref totalDispatched);
             };
@@ -402,6 +403,303 @@ namespace Liminal.Net.Tests
             });
 
             Task.WaitAll(sendTask1, sendTask2, disposeTask);
+        }
+        [Microsoft.Coyote.SystematicTesting.Test]
+        public static async Task Coyote_SessionManager_DisposeRace_ConcurrentWithTraffic()
+        {
+            var config = new LiminalTransportConfig
+            {
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = 512,
+                MaxConnectionCount = 8,
+                TickRate = 20
+            };
+
+            config.Hiccup.MaxRecoveryScale = 4;
+            config.Hiccup.GraceCount = 1000;
+            config.Hiccup.GraceWindowSeconds = 10f;
+            config.Hiccup.CooldownSeconds = 0f;
+            config.Hiccup.RecoveryHoldSeconds = 0.0001f;
+            config.Hiccup.WarmRecoverySessions = 1;
+
+            var transport = new MockTransport();
+            transport.InitializeTransport(config);
+
+            var interpreter = new LiminalPacketInterpreter(config);
+            var pipeline = new LiminalPacketFramerPipeline(config);
+
+            var manager = new LiminalSessionManager(
+                transport,
+                interpreter,
+                config,
+                pipeline);
+
+            const ushort clientId = 77;
+            transport.TriggerClientConnected(clientId);
+
+            byte[] payload = new byte[16];
+            byte[] frame = new byte[4 + 2 + payload.Length];
+
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), payload.Length + 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(frame.AsSpan(4, 2), 20);
+            payload.CopyTo(frame.AsSpan(6));
+
+            var ticker = new LiminalTicker(config);
+
+            ticker.OnTick += () =>
+            {
+                manager.Poll();
+
+                manager.BufferPacket(
+                    transport.LocalClientId,
+                    clientId,
+                    100,
+                    payload,
+                    DeliveryMethod.Reliable);
+
+                manager.Flush();
+            };
+
+            var tickerTask = Task.Run(async () =>
+            {
+                for (int i = 0; i < 60; i++)
+                {
+                    ticker.TickOnce();
+                    await Task.Yield();
+                }
+            });
+
+            var reliableWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    transport.TriggerReliableReceived(frame, clientId);
+                    await Task.Yield();
+                }
+            });
+
+            var unreliableWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    transport.TriggerUnreliableReceived(frame, clientId);
+                    await Task.Yield();
+                }
+            });
+
+            var disposeTask = Task.Run(async () =>
+            {
+                await Task.Yield();
+                await Task.Yield();
+                manager.Dispose();
+            });
+
+            await Task.WhenAll(tickerTask, reliableWorker, unreliableWorker, disposeTask);
+
+            manager.Flush();
+            manager.Poll();
+
+            Specification.Assert(
+                manager.GetActiveSessionCount() == 0,
+                "Manager did not reach a fully torn-down state after Dispose raced with in-flight traffic.");
+        }
+        [Microsoft.Coyote.SystematicTesting.Test]
+        public static async Task Coyote_SessionManager_ConcurrentThroughputConservation()
+        {
+            var config = new LiminalTransportConfig
+            {
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = 512,
+                MaxConnectionCount = 8,
+                TickRate = 20
+            };
+
+            config.Hiccup.MaxRecoveryScale = 4;
+            config.Hiccup.GraceCount = 1000;
+            config.Hiccup.GraceWindowSeconds = 10f;
+            config.Hiccup.CooldownSeconds = 0f;
+            config.Hiccup.RecoveryHoldSeconds = 0.0001f;
+            config.Hiccup.WarmRecoverySessions = 1;
+
+            var transport = new MockTransport();
+            transport.InitializeTransport(config);
+
+            var interpreter = new LiminalPacketInterpreter(config);
+            var pipeline = new LiminalPacketFramerPipeline(config);
+
+            var manager = new LiminalSessionManager(
+                transport,
+                interpreter,
+                config,
+                pipeline);
+
+            manager.InitializeConfig(new LiminalTelemetryConfig
+            {
+                Flags = TelemetryFlags.PacketCounting,
+                EnablePacketCounting = true
+            });
+
+            long bufferedCount = 0;
+            manager.OnPacketBuffered += (_, _) => Interlocked.Increment(ref bufferedCount);
+
+            const ushort clientId = 77;
+            const ushort churnClientId = 88;
+
+            transport.TriggerClientConnected(clientId);
+
+            byte[] payload = new byte[16];
+            byte[] frame = new byte[4 + 2 + payload.Length];
+
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), payload.Length + 2);
+            BinaryPrimitives.WriteUInt16LittleEndian(frame.AsSpan(4, 2), 20);
+            payload.CopyTo(frame.AsSpan(6));
+
+            var ticker = new LiminalTicker(config);
+            int ticks = 0;
+
+            ticker.OnTick += () =>
+            {
+                ticks++;
+                manager.Poll();
+
+                manager.BufferPacket(
+                    transport.LocalClientId,
+                    clientId,
+                    100,
+                    payload,
+                    DeliveryMethod.Reliable);
+
+                manager.Flush();
+            };
+
+            const int mainTicks = 100;
+            const int drainTicks = 20;
+
+            var tickerTask = Task.Run(async () =>
+            {
+                for (int i = 0; i < mainTicks + drainTicks; i++)
+                {
+                    ticker.TickOnce();
+                    await Task.Yield();
+                }
+            });
+
+            const int reliableInboundCount = 10;
+            const int unreliableInboundCount = 10;
+
+            var reliableWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < reliableInboundCount; i++)
+                {
+                    transport.TriggerReliableReceived(frame, clientId);
+                    await Task.Yield();
+                }
+            });
+
+            var unreliableWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < unreliableInboundCount; i++)
+                {
+                    transport.TriggerUnreliableReceived(frame, clientId);
+                    await Task.Yield();
+                }
+            });
+
+            const int extraReliableSends = 10;
+            const int extraUnreliableSends = 10;
+
+            var extraReliableSender = Task.Run(async () =>
+            {
+                for (int i = 0; i < extraReliableSends; i++)
+                {
+                    manager.BufferPacket(
+                        transport.LocalClientId,
+                        clientId,
+                        101,
+                        payload,
+                        DeliveryMethod.Reliable);
+
+                    await Task.Yield();
+                }
+            });
+
+            var extraUnreliableSender = Task.Run(async () =>
+            {
+                for (int i = 0; i < extraUnreliableSends; i++)
+                {
+                    manager.BufferPacket(
+                        transport.LocalClientId,
+                        clientId,
+                        101,
+                        payload,
+                        DeliveryMethod.Unreliable);
+
+                    await Task.Yield();
+                }
+            });
+
+            var churnWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    transport.TriggerClientConnected(churnClientId);
+                    await Task.Yield();
+                    transport.TriggerClientDisconnected(churnClientId);
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(
+                tickerTask,
+                reliableWorker,
+                unreliableWorker,
+                extraReliableSender,
+                extraUnreliableSender,
+                churnWorker);
+
+            Specification.Assert(
+                ticks == mainTicks + drainTicks,
+                $"Ticker executed {ticks} ticks, expected exactly {mainTicks + drainTicks}.");
+
+            Specification.Assert(
+                manager.GetActiveSessionCount() == 1,
+                "Expected only the primary client's session to remain active after churn settled.");
+
+            var snapshot = manager.GetGlobalSnapshot();
+
+            const long expectedInbound = reliableInboundCount + unreliableInboundCount;
+            const long expectedOutbound =
+                (mainTicks + drainTicks) /* ticker's own send per tick */
+                + extraReliableSends
+                + extraUnreliableSends;
+
+            Specification.Assert(
+                snapshot.TotalPacketsInbound == expectedInbound,
+                $"Expected {expectedInbound} inbound packets accepted under ReceiveLock, got {snapshot.TotalPacketsInbound}. " +
+                "A mismatch here means concurrent reliable/unreliable inbound processing lost or double-counted a packet.");
+
+            Specification.Assert(
+                snapshot.TotalPacketsOutbound == expectedOutbound,
+                $"Expected {expectedOutbound} outbound packets accepted under SendLock, got {snapshot.TotalPacketsOutbound}. " +
+                "A mismatch here means concurrent BufferPacket callers raced past SendLock incorrectly.");
+
+            Specification.Assert(
+                Interlocked.Read(ref bufferedCount) == expectedOutbound,
+                $"OnPacketBuffered fired {bufferedCount} times, expected {expectedOutbound}. " +
+                "This should always match TotalPacketsOutbound - if it doesn't, the two counters are being " +
+                "updated non-atomically with respect to each other somewhere.");
+
+            Specification.Assert(
+                snapshot.LoopbackQueueCount == 0,
+                "Loopback queue leaked packets even though this test never targets the local client ID.");
+
+            manager.Dispose();
+            manager.Flush();
+            manager.Poll();
+
+            Specification.Assert(
+                manager.GetActiveSessionCount() == 0,
+                "Session was not cleaned up after Dispose/Flush/Poll.");
         }
     }
 }
