@@ -11,13 +11,14 @@ public class LatencySimulatorTransport : TcpTransport
     public double OneWayDelayMs { get; set; } = 50.0;
     public double JitterMs { get; set; } = 0.0;
 
-    private readonly PriorityQueue<DelayedPacket, long> _sendQueue = new();
+    private readonly LiminalPriorityQueue<DelayedPacket, long> _sendQueue = new();
     private readonly object _sendLock = new();
     private readonly object _streamWriteLock = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly Thread _drainThread;
     private readonly ArrayPool<byte> _pool = ArrayPool<byte>.Shared;
 
+    private static readonly ThreadLocal<Random> _random = new(() => new Random(Guid.NewGuid().GetHashCode()));
     private struct DelayedPacket
     {
         public byte[] Buffer;
@@ -46,7 +47,8 @@ public class LatencySimulatorTransport : TcpTransport
         byte[] rented = _pool.Rent(data.Length);
         data.CopyTo(rented);
 
-        double jitter = JitterMs > 0 ? (Random.Shared.NextDouble() * 2.0 - 1.0) * JitterMs : 0.0;
+        double jitter = JitterMs > 0 ? (_random.Value.NextDouble() * 2.0 - 1.0) * JitterMs : 0.0;
+
         double totalDelayMs = Math.Max(0.0, OneWayDelayMs + jitter);
         long deliverTimestamp = Stopwatch.GetTimestamp() + (long)(totalDelayMs * Stopwatch.Frequency / 1000.0);
 

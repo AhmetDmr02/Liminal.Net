@@ -906,10 +906,10 @@ namespace Liminal.Net.Core
 
                 lock (_lifecycleLock)
                 {
-                    _disconnectingSessions.TryRemove(
-                        new KeyValuePair<ushort, LiminalSession>(
-                            pending.ClientId,
-                            pending.Session));
+                    if (_disconnectingSessions.TryGetValue(pending.ClientId, out var currentSession) && ReferenceEquals(currentSession, pending.Session))
+                    {
+                        _disconnectingSessions.TryRemove(pending.ClientId, out _);
+                    }
                 }
             }
         }

@@ -251,7 +251,7 @@ namespace Liminal.Net.Core
                     callbacksToRemove = subList.RemovePacketAndGetCallbacks(packetId);
 
                     if (subList.Count == 0)
-                        _subscribers.TryRemove(new KeyValuePair<object, SubscriptionList>(subscriber, subList));
+                        _subscribers.TryRemove(subscriber, out _);
                 }
 
                 if (callbacksToRemove != null)

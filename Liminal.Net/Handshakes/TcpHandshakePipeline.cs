@@ -34,7 +34,7 @@ namespace Liminal.Net.Handshakes
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_timeoutSeconds));
 
                 byte[] header = new byte[8];
-                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
 
                 int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
@@ -48,7 +48,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 byte[] payload = new byte[length];
-                await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
+                await stream.LiminalReadExactlyAsync(payload, 0, length, cts.Token);
 
                 var clientInfo = DeserializeSafe<ConnectionHandshakePacketClient>(payload, out bool success);
                 if (!success)
@@ -100,7 +100,7 @@ namespace Liminal.Net.Handshakes
                 await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token);
 
                 // Wait for Client ACK
-                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
                 length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
@@ -112,7 +112,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 byte[] ackPayload = new byte[length];
-                await stream.ReadExactlyAsync(ackPayload, 0, length, cts.Token);
+                await stream.LiminalReadExactlyAsync(ackPayload, 0, length, cts.Token);
 
                 var ack = DeserializeSafe<ConnectionHandshakeClientAck>(ackPayload, out success);
                 if (!success || !ack.Ack || ack.ClientID != assignedId)
@@ -152,7 +152,7 @@ namespace Liminal.Net.Handshakes
                 await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token);
 
                 byte[] header = new byte[8];
-                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
 
                 int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
@@ -165,7 +165,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 byte[] payload = new byte[length];
-                await stream.ReadExactlyAsync(payload, 0, length, cts.Token);
+                await stream.LiminalReadExactlyAsync(payload, 0, length, cts.Token);
 
                 var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload, out bool success);
                 if (!success)
