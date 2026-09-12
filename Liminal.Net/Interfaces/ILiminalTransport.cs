@@ -58,13 +58,14 @@ namespace Liminal.Net.Interfaces
         #endregion
 
         #region Sending
-        public void SendReliable(Span<byte> data, ushort clientId);
-        public void SendUnreliable(Span<byte> data, ushort clientId);
+        public void Send(Span<byte> data, ushort clientId, TransportFlags flags);
         #endregion
 
         #region Events
         public event DataReceivedHandler OnMessageReceivedReliable;
         public event DataReceivedHandler OnMessageReceivedUnreliable;
+
+        public event DataReceivedHandler OnMessageReceivedFragmented;
 
         public event TransportEventHandler OnServerStarted;
         public event TransportEventHandler OnShutdown;

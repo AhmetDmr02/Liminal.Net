@@ -29,6 +29,8 @@ namespace Liminal.Net.Core
 
         private readonly LiminalPacketInterpreter _interpreter;
 
+        private readonly LiminalPacketFragmentor _fragmentor;
+
         public event Action<ServerStarvationEvent> OnServerStarvation;
 
         public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
@@ -48,8 +50,13 @@ namespace Liminal.Net.Core
 
             _loopbackQueue = new ConcurrentQueue<(ushort SenderId, InboundPacket Packet)>();
 
+            _fragmentor = new LiminalPacketFragmentor(_transport, _config);
+
+            _fragmentor.OnMessageReassembled += HandleReliableMessage;
+
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
+
             _transport.OnClientConnected += HandleClientConnected;
             _transport.OnClientDisconnected += HandleClientDisconnected;
             _transport.OnLocalClientConnected += HandleLocalConnection;
@@ -389,7 +396,7 @@ namespace Liminal.Net.Core
 
             if (bytesToSend > 0)
             {
-                _transport.SendReliable(session.ActiveSendBuffer.GetSpan().Slice(0, bytesToSend), session.Id);
+                _fragmentor.Send(session.ActiveSendBuffer.GetSpan().Slice(0, bytesToSend), session.Id, TransportFlags.Reliable);
             }
         }
 
@@ -496,6 +503,9 @@ namespace Liminal.Net.Core
         {
             if (disposed) return;
             disposed = true;
+
+            _fragmentor.OnMessageReassembled -= HandleReliableMessage;
+            _fragmentor.Dispose();
 
             _transport.OnMessageReceivedReliable -= HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;

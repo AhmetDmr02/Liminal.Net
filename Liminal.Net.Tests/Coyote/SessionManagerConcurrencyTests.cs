@@ -353,5 +353,55 @@ namespace Liminal.Net.Tests
 
             await Task.WhenAll(t1, t2, t3);
         }
+
+        [Microsoft.Coyote.SystematicTesting.Test]
+        public static void Coyote_ExecuteFragmentorStress()
+        {
+            var config = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = 10,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var mockTransport = new MockTransport();
+            var fragmentor = new LiminalPacketFragmentor(mockTransport, config, mtu: 500);
+
+            int sendCount = 0;
+            mockTransport.OnSendHook = (data, clientId, flags) =>
+            {
+                if (System.Threading.Interlocked.Increment(ref sendCount) == 5)
+                {
+                    fragmentor.Dispose();
+                }
+            };
+
+            var sendTask1 = Task.Run(() =>
+            {
+                byte[] largePayload = new byte[1200];
+                for (int i = 0; i < 10; i++)
+                {
+                    fragmentor.Send(largePayload, targetId: 1, TransportFlags.Reliable);
+                }
+            });
+
+            var sendTask2 = Task.Run(() =>
+            {
+                byte[] smallPayload = new byte[100];
+                for (int i = 0; i < 10; i++)
+                {
+                    fragmentor.Send(smallPayload, targetId: 1, TransportFlags.Reliable);
+                }
+            });
+
+            var disposeTask = Task.Run(() =>
+            {
+                fragmentor.Dispose();
+            });
+
+            Task.WaitAll(sendTask1, sendTask2, disposeTask);
+        }
     }
 }

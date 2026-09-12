@@ -1,5 +1,4 @@
 ﻿using Liminal.Net.Interfaces;
-using Liminal.Net.Transports;
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
@@ -16,19 +15,18 @@ namespace Liminal.Net.Core
     {
         public const int FragmentHeaderSize = 6; // ReliableSeq(2) + FragmentIndex(2) + TotalFragments(2)
 
-        private const int DisposalSignaled = -1_000_000;
-        private static readonly long AssemblyTimeoutTicks = Stopwatch.Frequency * 5;
-
         private readonly ILiminalTransport _transport;
         private readonly LiminalTransportConfig _config;
         private readonly int _mtu;
         private readonly int _transportHeaderSize;
         private readonly ArrayPool<byte> _assemblyPool;
         private readonly ArrayPool<byte> _fragmentPool;
-
         private readonly int _maxAssemblySize;
+        private readonly long _assemblyTimeoutTicks;
 
-        private int _disposedState = 0;
+        // 0 = Active, 1 = Disposed
+        private int _disposed = 0;
+        public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
         private readonly ConcurrentDictionary<ushort, PeerChannelState> _peerChannels = new();
         private readonly ConcurrentDictionary<ushort, ushort> _outboundSequences = new();
@@ -37,15 +35,10 @@ namespace Liminal.Net.Core
 
         public event DataReceivedHandler OnMessageReassembled;
 
-        public LiminalPacketFragmentor(ILiminalTransport transport, LiminalTransportConfig config, int mtu = 1400)
+        public LiminalPacketFragmentor(ILiminalTransport transport, LiminalTransportConfig config, int mtu = 1200)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _config = config ?? throw new ArgumentNullException(nameof(config));
-
-            if (mtu <= FragmentHeaderSize + LiminalTransportHeader.BaseHeaderSize)
-            {
-                throw new ArgumentException($"MTU must be larger than headers ({FragmentHeaderSize + LiminalTransportHeader.BaseHeaderSize}b)", nameof(mtu));
-            }
 
             _mtu = mtu;
             _transportHeaderSize = LiminalTransportHeader.BaseHeaderSize + (config.TransportFramingProvider?.CustomHeaderSize ?? 0);
@@ -55,6 +48,9 @@ namespace Liminal.Net.Core
             {
                 throw new ArgumentException($"MTU ({mtu}b) must be larger than all combined headers ({minimumMtu}b)", nameof(mtu));
             }
+
+            double timeoutSeconds = config.ReceiveResponseTimeout > 0 ? config.ReceiveResponseTimeout : 5.0;
+            _assemblyTimeoutTicks = (long)(Stopwatch.Frequency * timeoutSeconds);
 
             int maxRecovery = config.Hiccup?.GetRecoverySize(config.MaxPacketSizePerBatch) ?? config.MaxPacketSizePerBatch;
             _maxAssemblySize = maxRecovery;
@@ -66,107 +62,75 @@ namespace Liminal.Net.Core
 
             _transport.OnClientDisconnected += HandleClientCleanup;
             _transport.OnClientKicked += HandleClientCleanup;
+            _transport.OnMessageReceivedFragmented += IngestFragment;
         }
-
-        #region Gate & Lifetime Synchronization
-
-        private bool TryEnter()
-        {
-            var spinner = new SpinWait();
-            while (true)
-            {
-                int current = Volatile.Read(ref _disposedState);
-                if (current < 0) return false;
-
-                if (Interlocked.CompareExchange(ref _disposedState, current + 1, current) == current)
-                {
-                    return true;
-                }
-
-                spinner.SpinOnce();
-            }
-        }
-
-        private void Exit()
-        {
-            Interlocked.Decrement(ref _disposedState);
-        }
-
-        #endregion
 
         #region Outbound / Send Path
 
         public void Send(Span<byte> data, ushort targetId, TransportFlags flags)
         {
-            if (!TryEnter()) return;
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            int effectivePayloadMtu = _mtu - _transportHeaderSize;
+
+            if (data.Length <= effectivePayloadMtu)
+            {
+                if ((flags & TransportFlags.Reliable) != 0)
+                    _transport.Send(data, targetId, TransportFlags.Reliable);
+                else
+                    _transport.Send(data, targetId, TransportFlags.Unreliable);
+
+                return;
+            }
+
+            if ((flags & TransportFlags.Reliable) == 0)
+            {
+                LiminalLogger.LogWarning($"[Fragmentor] Payload ({data.Length}b) exceeds MTU ({_mtu}b) on Unreliable channel. Auto-swapping to Reliable + Fragmented.");
+                flags |= TransportFlags.Reliable;
+            }
+
+            flags |= TransportFlags.Fragmented;
+
+            int maxFragmentPayload = effectivePayloadMtu - FragmentHeaderSize;
+            int totalFragments = (data.Length + maxFragmentPayload - 1) / maxFragmentPayload;
+
+            if (totalFragments > ushort.MaxValue)
+            {
+                LiminalLogger.LogError($"[Fragmentor] Packet size {data.Length}b requires {totalFragments} fragments. Fatal bounds breach.");
+                TriggerSever(targetId, "Fragment count exceeded 65535.");
+                return;
+            }
+
+            ushort seq = _outboundSequences.AddOrUpdate(targetId, 1, (_, current) => unchecked((ushort)(current + 1)));
+
+            byte[] rentedChunkBuffer = ArrayPool<byte>.Shared.Rent(effectivePayloadMtu);
 
             try
             {
-                int effectivePayloadMtu = _mtu - _transportHeaderSize;
+                Span<byte> chunkSpan = rentedChunkBuffer.AsSpan(0, effectivePayloadMtu);
 
-                if (data.Length <= effectivePayloadMtu)
+                for (ushort index = 0; index < totalFragments; index++)
                 {
-                    if ((flags & TransportFlags.Reliable) != 0)
-                    {
-                        _transport.SendReliable(data, targetId);
-                    }
-                    else
-                    {
-                        _transport.SendUnreliable(data, targetId);
-                    }
-                    return;
-                }
+                    // If disposed while fragmenting, abort early
+                    if (Volatile.Read(ref _disposed) != 0) return;
 
-                if ((flags & TransportFlags.Reliable) == 0)
-                {
-                    LiminalLogger.LogWarning(
-                        $"[Fragmentor] Payload ({data.Length}b) exceeds MTU ({_mtu}b) on Unreliable channel. Auto-swapping to Reliable + Fragmented.");
-                    flags |= TransportFlags.Reliable;
-                }
+                    int offset = index * maxFragmentPayload;
+                    int length = Math.Min(maxFragmentPayload, data.Length - offset);
 
-                flags |= TransportFlags.Fragmented;
+                    BinaryPrimitives.WriteUInt16LittleEndian(chunkSpan.Slice(0, 2), seq);
+                    BinaryPrimitives.WriteUInt16LittleEndian(chunkSpan.Slice(2, 2), index);
+                    BinaryPrimitives.WriteUInt16LittleEndian(chunkSpan.Slice(4, 2), (ushort)totalFragments);
 
-                int maxFragmentPayload = effectivePayloadMtu - FragmentHeaderSize;
-                int totalFragments = (data.Length + maxFragmentPayload - 1) / maxFragmentPayload;
+                    data.Slice(offset, length).CopyTo(chunkSpan.Slice(FragmentHeaderSize));
 
-                if (totalFragments > ushort.MaxValue)
-                {
-                    LiminalLogger.LogError($"[Fragmentor] Packet size {data.Length}b requires {totalFragments} fragments. Fatal bounds breach.");
-                    TriggerSever(targetId, "Fragment count exceeded 65535.");
-                    return;
-                }
+                    Span<byte> outgoingFrame = chunkSpan.Slice(0, FragmentHeaderSize + length);
 
-                ushort seq = _outboundSequences.AddOrUpdate(targetId, 1, (_, current) => unchecked((ushort)(current + 1)));
-
-                byte[] rentedChunkBuffer = ArrayPool<byte>.Shared.Rent(effectivePayloadMtu);
-
-                try
-                {
-                    Span<byte> chunkSpan = rentedChunkBuffer.AsSpan(0, effectivePayloadMtu);
-
-                    for (ushort index = 0; index < totalFragments; index++)
-                    {
-                        int offset = index * maxFragmentPayload;
-                        int length = Math.Min(maxFragmentPayload, data.Length - offset);
-
-                        BinaryPrimitives.WriteUInt16LittleEndian(chunkSpan.Slice(0, 2), seq);
-                        BinaryPrimitives.WriteUInt16LittleEndian(chunkSpan.Slice(2, 2), index);
-                        BinaryPrimitives.WriteUInt16LittleEndian(chunkSpan.Slice(4, 2), (ushort)totalFragments);
-
-                        data.Slice(offset, length).CopyTo(chunkSpan.Slice(FragmentHeaderSize));
-
-                        Span<byte> outgoingFrame = chunkSpan.Slice(0, FragmentHeaderSize + length);
-                        _transport.SendReliable(outgoingFrame, targetId);
-                    }
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(rentedChunkBuffer);
+                    _transport.Send(outgoingFrame, targetId, flags);
                 }
             }
             finally
             {
-                Exit();
+                ArrayPool<byte>.Shared.Return(rentedChunkBuffer);
             }
         }
 
@@ -176,55 +140,50 @@ namespace Liminal.Net.Core
 
         public void IngestFragment(ReadOnlySpan<byte> fragmentSpan, ushort senderId)
         {
-            if (!TryEnter()) return;
+            if (Volatile.Read(ref _disposed) != 0) return;
 
-            try
+            if (fragmentSpan.Length < FragmentHeaderSize || fragmentSpan.Length > _mtu)
             {
-                if (fragmentSpan.Length < FragmentHeaderSize || fragmentSpan.Length > _mtu)
-                {
-                    TriggerSever(senderId, $"Fragment payload ({fragmentSpan.Length}b) is out of valid bounds [{FragmentHeaderSize}b - {_mtu}b].");
-                    return;
-                }
+                TriggerSever(senderId, $"Fragment payload ({fragmentSpan.Length}b) is out of valid bounds [{FragmentHeaderSize}b - {_mtu}b].");
+                return;
+            }
 
-                if (!_peerChannels.TryGetValue(senderId, out var peerState))
-                {
-                    if (!_transport.IsClientConnected(senderId)) return;
+            if (!_peerChannels.TryGetValue(senderId, out var peerState))
+            {
+                if (!_transport.IsClientConnected(senderId) || Volatile.Read(ref _disposed) != 0) return;
 
-                    lock (_peerChannels)
+                lock (_peerChannels)
+                {
+                    if (Volatile.Read(ref _disposed) != 0) return;
+
+                    if (!_peerChannels.TryGetValue(senderId, out peerState))
                     {
-                        if (!_peerChannels.TryGetValue(senderId, out peerState))
-                        {
-                            if (!_transport.IsClientConnected(senderId)) return;
+                        if (!_transport.IsClientConnected(senderId)) return;
 
-                            peerState = CreatePeerChannel(senderId);
-                            _peerChannels[senderId] = peerState;
-                        }
-                    }
-                }
-
-                if (Volatile.Read(ref peerState.IsTerminated) != 0)
-                {
-                    return;
-                }
-
-                byte[] rentedFragmentBuffer = _fragmentPool.Rent(fragmentSpan.Length);
-                fragmentSpan.CopyTo(rentedFragmentBuffer);
-
-                var inboundItem = new InboundFragment(rentedFragmentBuffer, fragmentSpan.Length);
-
-                if (!peerState.Channel.Writer.TryWrite(inboundItem))
-                {
-                    _fragmentPool.Return(rentedFragmentBuffer);
-
-                    if (Volatile.Read(ref peerState.IsTerminated) == 0)
-                    {
-                        TriggerSever(senderId, "Inbound fragment queue overrun. Backpressure failure.");
+                        peerState = CreatePeerChannel(senderId);
+                        _peerChannels[senderId] = peerState;
                     }
                 }
             }
-            finally
+
+            if (Volatile.Read(ref peerState.IsTerminated) != 0)
             {
-                Exit();
+                return;
+            }
+
+            byte[] rentedFragmentBuffer = _fragmentPool.Rent(fragmentSpan.Length);
+            fragmentSpan.CopyTo(rentedFragmentBuffer);
+
+            var inboundItem = new InboundFragment(rentedFragmentBuffer, fragmentSpan.Length);
+
+            if (!peerState.Channel.Writer.TryWrite(inboundItem))
+            {
+                _fragmentPool.Return(rentedFragmentBuffer);
+
+                if (Volatile.Read(ref peerState.IsTerminated) == 0 && Volatile.Read(ref _disposed) == 0)
+                {
+                    TriggerSever(senderId, "Inbound fragment queue overrun. Backpressure failure.");
+                }
             }
         }
 
@@ -243,6 +202,7 @@ namespace Liminal.Net.Core
             state.WorkerTask = Task.Run(() => ProcessPeerFragmentsAsync(state));
             return state;
         }
+
         private async Task ProcessPeerFragmentsAsync(PeerChannelState state)
         {
             var reader = state.Channel.Reader;
@@ -253,24 +213,82 @@ namespace Liminal.Net.Core
 
             try
             {
-                while (await reader.WaitToReadAsync(token).ConfigureAwait(false))
+                while (!token.IsCancellationRequested)
                 {
-                    while (reader.TryRead(out InboundFragment item))
+                    CancellationTokenSource? timeoutCts = null;
+                    CancellationToken readToken = token;
+
+                    if (assemblies.Count > 0)
                     {
-                        try
+                        long now = Stopwatch.GetTimestamp();
+                        long oldestActivity = long.MaxValue;
+
+                        foreach (var pending in assemblies.Values)
                         {
-                            if (!ProcessFragmentSync(state, item, assemblies, effectiveMaxFragmentPayload))
+                            if (pending.LastActivityTicks < oldestActivity)
                             {
-                                return;
+                                oldestActivity = pending.LastActivityTicks;
                             }
                         }
-                        finally
+
+                        long elapsedTicks = now - oldestActivity;
+                        long remainingTicks = _assemblyTimeoutTicks - elapsedTicks;
+
+                        if (remainingTicks <= 0)
                         {
-                            _fragmentPool.Return(item.Buffer);
+                            PruneStaleAssemblies(state, assemblies);
+                            return;
                         }
+
+                        int remainingMs = Math.Max(1, (int)(remainingTicks * 1000 / Stopwatch.Frequency));
+                        timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        timeoutCts.CancelAfter(remainingMs);
+                        readToken = timeoutCts.Token;
                     }
 
-                    PruneStaleAssemblies(assemblies);
+                    bool hasItems;
+                    bool isTimeout = false;
+
+                    try
+                    {
+                        hasItems = await reader.WaitToReadAsync(readToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true && !token.IsCancellationRequested)
+                    {
+                        hasItems = false;
+                        isTimeout = true;
+                    }
+                    finally
+                    {
+                        timeoutCts?.Dispose();
+                    }
+
+                    if (hasItems)
+                    {
+                        while (reader.TryRead(out InboundFragment item))
+                        {
+                            try
+                            {
+                                if (!ProcessFragmentSync(state, item, assemblies, effectiveMaxFragmentPayload))
+                                {
+                                    return;
+                                }
+                            }
+                            finally
+                            {
+                                _fragmentPool.Return(item.Buffer);
+                            }
+                        }
+                    }
+                    else if (!isTimeout)
+                    {
+                        return;
+                    }
+
+                    if (!PruneStaleAssemblies(state, assemblies))
+                    {
+                        return;
+                    }
                 }
             }
             catch (OperationCanceledException) { }
@@ -286,7 +304,6 @@ namespace Liminal.Net.Core
                     if (pending.Buffer != null)
                     {
                         _assemblyPool.Return(pending.Buffer);
-
                         pending.Buffer = null!;
                     }
                 }
@@ -299,7 +316,11 @@ namespace Liminal.Net.Core
             }
         }
 
-        private bool ProcessFragmentSync(PeerChannelState state, InboundFragment item, Dictionary<ushort, PendingAssembly> assemblies, int effectiveMaxFragmentPayload)
+        private bool ProcessFragmentSync(
+            PeerChannelState state,
+            InboundFragment item,
+            Dictionary<ushort, PendingAssembly> assemblies,
+            int effectiveMaxFragmentPayload)
         {
             Span<byte> fragmentSpan = item.Buffer.AsSpan(0, item.Length);
 
@@ -332,15 +353,16 @@ namespace Liminal.Net.Core
 
             if (assemblies.TryGetValue(seq, out var assembly))
             {
-                if (now - assembly.LastActivityTicks > AssemblyTimeoutTicks || assembly.TotalFragments != totalFragments)
+                if (assembly.TotalFragments != totalFragments)
                 {
-                    if (assembly.Buffer != null)
-                    {
-                        _assemblyPool.Return(assembly.Buffer);
-                        assembly.Buffer = null!;
-                    }
-                    assemblies.Remove(seq);
-                    assembly = null;
+                    TriggerSever(state.ClientId, $"Sequence collision or total fragment mismatch on seq {seq} ({totalFragments} != {assembly.TotalFragments}).");
+                    return false;
+                }
+
+                if (now - assembly.LastActivityTicks > _assemblyTimeoutTicks)
+                {
+                    TriggerSever(state.ClientId, $"Fragment reassembly timed out on seq {seq}.");
+                    return false;
                 }
             }
 
@@ -406,41 +428,32 @@ namespace Liminal.Net.Core
             return true;
         }
 
-        private void PruneStaleAssemblies(Dictionary<ushort, PendingAssembly> assemblies)
+        private bool PruneStaleAssemblies(PeerChannelState state, Dictionary<ushort, PendingAssembly> assemblies)
         {
-            if (assemblies.Count == 0) return;
+            if (assemblies.Count == 0) return true;
 
             long now = Stopwatch.GetTimestamp();
-            List<ushort>? expiredKeys = null;
 
             foreach (var (seq, pending) in assemblies)
             {
-                if (now - pending.LastActivityTicks > AssemblyTimeoutTicks)
+                if (now - pending.LastActivityTicks >= _assemblyTimeoutTicks)
                 {
-                    (expiredKeys ??= new List<ushort>()).Add(seq);
-                    if (pending.Buffer != null)
-                    {
-                        _assemblyPool.Return(pending.Buffer);
-
-                        pending.Buffer = null!;
-                    }
+                    TriggerSever(state.ClientId, $"Fragment reassembly timed out on sequence {seq}.");
+                    return false;
                 }
             }
 
-            if (expiredKeys != null)
-            {
-                for (int i = 0; i < expiredKeys.Count; i++)
-                {
-                    assemblies.Remove(expiredKeys[i]);
-                }
-            }
+            return true;
         }
+
         #endregion
 
         #region Kicking & Fault Invalidation
 
         private void TriggerSever(ushort clientId, string reason)
         {
+            if (Volatile.Read(ref _disposed) != 0) return;
+
             LiminalLogger.LogError($"[Fragmentor-Fault] Severing client {clientId}. Reason: {reason}");
 
             HandleClientCleanup(clientId);
@@ -484,26 +497,15 @@ namespace Liminal.Net.Core
 
         public void Dispose()
         {
-            int current;
-            while (true)
+            // Atomically transition from 0 to 1; if already 1, exit immediately.
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
             {
-                current = Volatile.Read(ref _disposedState);
-                if (current < 0) return; // Already disposing/disposed
-
-                if (Interlocked.CompareExchange(ref _disposedState, current + DisposalSignaled, current) == current)
-                {
-                    break;
-                }
-            }
-
-            var spinner = new SpinWait();
-            while (Volatile.Read(ref _disposedState) != DisposalSignaled)
-            {
-                spinner.SpinOnce();
+                return;
             }
 
             _transport.OnClientDisconnected -= HandleClientCleanup;
             _transport.OnClientKicked -= HandleClientCleanup;
+            _transport.OnMessageReceivedFragmented -= IngestFragment;
 
             foreach (var id in _peerChannels.Keys)
             {

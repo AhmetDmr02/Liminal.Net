@@ -187,7 +187,7 @@ namespace Liminal.Net.Tests
                     break;
                 }
 
-                timeoutServer.Transport.SendReliable(largePayload, assignedId);
+                timeoutServer.Transport.Send(largePayload, assignedId,TransportFlags.Reliable);
                 Thread.Sleep(5);
             }
 
@@ -245,7 +245,7 @@ namespace Liminal.Net.Tests
                     break;
                 }
 
-                client.Transport.SendReliable(largePayload, ILiminalTransport.SERVER_ID);
+                client.Transport.Send(largePayload, ILiminalTransport.SERVER_ID,TransportFlags.Reliable);
                 Thread.Sleep(5);
             }
 

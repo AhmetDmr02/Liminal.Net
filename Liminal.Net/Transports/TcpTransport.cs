@@ -45,6 +45,13 @@ namespace Liminal.Net.Transports
         public ClientHandshakeOrchestrator<TcpClient> ClientHandshaker { get; set; } = DefaultHandshakes.ClientTcpHandshake;
 
         #region Events
+        protected DataReceivedHandler _onFragmented;
+        public event DataReceivedHandler OnMessageReceivedFragmented
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onFragmented, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onFragmented, value);
+        }
+
         protected DataReceivedHandler _onReliable;
         public event DataReceivedHandler OnMessageReceivedReliable
         {
@@ -337,17 +344,15 @@ namespace Liminal.Net.Transports
 
         #region Sending
         private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
-        public virtual void SendReliable(Span<byte> data, ushort targetId)
+        public virtual void Send(Span<byte> data, ushort targetId, TransportFlags flags)
         {
-            SendInternal(data, targetId, TransportFlags.Reliable);
-        }
+            if (flags == TransportFlags.Unreliable)
+            {
+                //TcpTransport is inherently reliable
+                flags = TransportFlags.Reliable;
+            }
 
-        /// <summary>
-        /// TCP is a reliable transport it will default to SendReliable
-        /// </summary>
-        public virtual void SendUnreliable(Span<byte> data, ushort targetId)
-        {
-            SendInternal(data, targetId, TransportFlags.Unreliable);
+            SendInternal(data, targetId, flags);
         }
 
         protected virtual void SendInternal(Span<byte> data, ushort targetId, TransportFlags flags)
@@ -880,6 +885,7 @@ namespace Liminal.Net.Transports
                         break;
 
                     case var f when (f & TransportFlags.Fragmented) != 0:
+                        _onFragmented?.Invoke(payloadSpan, incomingId);
                         break;
 
                     case var f when (f & TransportFlags.Reliable) != 0:
