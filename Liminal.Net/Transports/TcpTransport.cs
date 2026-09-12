@@ -641,20 +641,25 @@ namespace Liminal.Net.Transports
 
             _sockets.AddOrUpdate(clientId, client, (key, old) =>
             {
-                LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
+                LiminalLogger.LogWarning(
+                    $"[Transport] Replacing existing socket for client {clientId}");
 
-                TryClaimDisconnect(old);
+                if (TryClaimDisconnect(old))
+                {
+                    Interlocked.Decrement(ref _totalConnections);
+                }
 
                 try { old.Close(); } catch { }
-                Interlocked.Decrement(ref _totalConnections);
+
                 return client;
             });
 
-            sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
 
             _clientIdResolver.ConfirmRegistration(clientId);
 
             _onClientConnected?.Invoke(clientId);
+
+            sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
 
             _ = Task.Run(async () => ReceiveLoop(clientId, client));
 
@@ -810,11 +815,15 @@ namespace Liminal.Net.Transports
                             LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
                         }
                     }
-                    else if (!_isServer)
+                    else // incomingId == SERVER_ID
                     {
-                        LiminalLogger.Log("[Transport] Lost connection to host. Shutting down...");
-                        _onLocalClientDisconnected?.Invoke(_localClientId);
-                        Shutdown();
+                        if (_isClient)
+                        {
+                            LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
+
+                            _onLocalClientDisconnected?.Invoke(_localClientId);
+                            Shutdown();
+                        }
                     }
 
                     _finalizedConnections.TryRemove(client, out _);

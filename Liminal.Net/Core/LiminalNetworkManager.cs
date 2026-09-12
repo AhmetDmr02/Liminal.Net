@@ -144,7 +144,7 @@ namespace Liminal.Net.Core
 
             _transport.StartServer(_config.Default_Host, _config.Default_Port);
 
-            _transport.StartClient("127.0.0.1", _config.Default_Port);
+            _transport.StartClient(_config.Default_Host, _config.Default_Port);
 
             _ticker.OnTick += HostTick;
             _ticker.Start();
