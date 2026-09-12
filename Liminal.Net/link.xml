@@ -1,0 +1,4 @@
+<linker>
+<!-- Put your own custom dll's here too -->
+  <assembly fullname="Assembly-CSharp" preserve="all"/>
+</linker>

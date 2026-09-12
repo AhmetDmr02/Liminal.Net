@@ -21,7 +21,7 @@ namespace Liminal.Net.Core
                 throw new ArgumentOutOfRangeException(nameof(length), "Length must be greater than zero.");
 
             _length = length;
-            _ptr = (byte*)NativeMemory.Alloc((nuint)length);
+            _ptr = (byte*)Marshal.AllocHGlobal(length);
         }
 
         ~LiminalNativeBuffer()
@@ -113,7 +113,7 @@ namespace Liminal.Net.Core
 
             if (ptr != null)
             {
-                NativeMemory.Free(ptr);
+                Marshal.FreeHGlobal((IntPtr)ptr);
             }
         }
     }

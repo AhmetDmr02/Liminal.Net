@@ -1,6 +1,7 @@
-﻿using Liminal.Net.Interfaces;
-using Liminal.Net.Core;
+﻿using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
 using System;
+using System.Diagnostics;
 
 namespace Liminal.Net.Core
 {
@@ -29,11 +30,21 @@ namespace Liminal.Net.Core
         public LiminalPacketInterpreter Interpreter { get; private set; }
 
         private LiminalPacketFramerPipeline _pipeline;
+
         private LiminalTicker _ticker;
+        private LiminalPhaseAligner _phaseAligner;
+
+        public LiminalTelemetryManager TelemetryManager { get; private set; }
+        private readonly LiminalTelemetryConfig _telemetryConfig;
+
+        public DisconnectReasonCoordinator DisconnectCoordinator { get; private set; }
+
+        public event Action<ushort, DisconnectReason, string> OnDisconnectResolved;
 
         public ushort localID => _transport.LocalClientId;
 
-        public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config)
+        public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config,
+        LiminalTelemetryConfig telemetryConfig = null)
         {
             Instance = this;
 
@@ -42,6 +53,7 @@ namespace Liminal.Net.Core
 
             _transport = transport;
             _config = config;
+            _telemetryConfig = telemetryConfig ?? new LiminalTelemetryConfig { Flags = TelemetryFlags.None };
 
             Interpreter = new LiminalPacketInterpreter(_config);
 
@@ -67,14 +79,45 @@ namespace Liminal.Net.Core
 
             _pipeline = new LiminalPacketFramerPipeline(_config);
             SessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
+            DisconnectCoordinator = new DisconnectReasonCoordinator(_transport, Interpreter);
+
+            DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
             _ticker = new LiminalTicker(_config);
+
+            if (_transport is ITransportTelemetryProvider telemetryProvider)
+            {
+                telemetryProvider.NextTickProvider = () => _ticker.NextTickTimestamp;
+            }
+
+            _phaseAligner = new LiminalPhaseAligner(_config);
+
+            TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
+        }
+
+        private void HandleDisconnectResolved(ushort id, DisconnectReason reason, string message)
+        {
+            OnDisconnectResolved?.Invoke(id, reason, message);
         }
 
         private void ShutdownSystems()
         {
             _ticker?.Stop();
+
+            TelemetryManager?.Dispose();
+            TelemetryManager = null;
+
             SessionManager?.Dispose();
+
+            // Last flush to trigger internal dispose
+            SessionManager?.Flush();
+
+            if (DisconnectCoordinator != null)
+            {
+                DisconnectCoordinator.OnResolved -= HandleDisconnectResolved;
+                DisconnectCoordinator.Dispose();
+                DisconnectCoordinator = null;
+            }
 
             //We actually wanna keep subscriptions around
             //Interpreter?.ClearAllHandlers();
@@ -101,12 +144,13 @@ namespace Liminal.Net.Core
 
             _transport.StartServer(_config.Default_Host, _config.Default_Port);
 
-            _transport.StartClient("127.0.0.1", _config.Default_Port);
+            _transport.StartClient(_config.Default_Host, _config.Default_Port);
 
             _ticker.OnTick += HostTick;
             _ticker.Start();
 
-            LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port}");
+
+            LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
         }
 
         public void StartServer(string ip, int port)
@@ -190,6 +234,22 @@ namespace Liminal.Net.Core
             var sm = SessionManager;
 
             sm?.Poll();
+
+            if (Role == NetworkRole.Client && _phaseAligner != null && TelemetryManager != null)
+            {
+                double wireRtt = TelemetryManager.WireRTT;
+                if (wireRtt > 0.0)
+                {
+                    // The tick is firing right now, so clientCountdownMs for this batch is 0
+                    long slew = _phaseAligner.CalculateSlewAdjustment(
+                        wireRtt,
+                        TelemetryManager.ServerCountdownMs,
+                        clientCountdownMs: 0.0);
+
+                    _ticker.ApplySlew(slew);
+                }
+            }
+
             sm?.Flush();
         }
 

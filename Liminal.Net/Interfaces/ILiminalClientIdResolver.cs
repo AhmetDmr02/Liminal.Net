@@ -5,6 +5,8 @@ namespace Liminal.Net.Interfaces
 {
     public interface ILiminalClientIdResolver
     {
+        public void Initialize(ILiminalTransport transport);
+
         /// <summary>
         /// Resolves the client id from the payload 
         /// NOTE: It can only read from plain text part of the payload
@@ -20,18 +22,8 @@ namespace Liminal.Net.Interfaces
         /// <returns>The client id</returns>
         public ushort GenerateClientId();
 
-        /// <summary>
-        /// Releases the client id
-        /// </summary>
-        /// <param name="targetId">The client id</param>
-        public bool UnregisterId(ushort targetId);
+        public void ConfirmRegistration(ushort targetId);
 
-        /// <summary>
-        /// Registers the client
-        /// </summary>
-        public bool RegisterId(ushort targetId,ConnectionPair connectionPair);
-        public bool TryGetConnectionPair(ushort targetId, out ConnectionPair connectionPair);
-        public bool IsConnectionActive(ushort targetId);
         public void ResetResolver();
     }
 }

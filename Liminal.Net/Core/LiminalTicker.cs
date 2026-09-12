@@ -7,18 +7,45 @@ namespace Liminal.Net.Core
     public class LiminalTicker
     {
         private readonly LiminalTransportConfig _config;
-        private readonly Stopwatch _stopwatch = new();
-
         public event Action OnTick;
 
         private volatile bool _isRunning;
         private Thread _tickThread;
+
+        private long _nextTickTimestamp;
+        public long NextTickTimestamp => Volatile.Read(ref _nextTickTimestamp);
+
+        public long NominalTickTicks => Stopwatch.Frequency / _config.TickRate;
+
+        private long _slewAdjustmentTicks = 0;
 
         public LiminalTicker(LiminalTransportConfig config)
         {
             _config = config;
         }
 
+        public void ApplySlew(long adjustmentTicks)
+        {
+            Interlocked.Exchange(ref _slewAdjustmentTicks, adjustmentTicks);
+        }
+        //For testing
+        public void TickOnce()
+        {
+            long currentSlew = Interlocked.Exchange(
+                ref _slewAdjustmentTicks,
+                0);
+
+            long nextTick = Volatile.Read(ref _nextTickTimestamp);
+
+            if (nextTick == 0)
+                nextTick = Stopwatch.GetTimestamp();
+
+            nextTick += NominalTickTicks + currentSlew;
+
+            Volatile.Write(ref _nextTickTimestamp, nextTick);
+
+            OnTick?.Invoke();
+        }
         public void Start()
         {
             if (_isRunning) return;
@@ -28,12 +55,12 @@ namespace Liminal.Net.Core
             {
                 Name = "Liminal Network Ticker",
                 IsBackground = true,
-                Priority = ThreadPriority.Highest // Bumped priority for stability
+                Priority = ThreadPriority.Highest
             };
             _tickThread.Start();
         }
 
-        public void Stop()
+        public virtual void Stop()
         {
             if (!_isRunning) return;
             _isRunning = false;
@@ -48,19 +75,27 @@ namespace Liminal.Net.Core
             _tickThread = null;
         }
 
-        private void RunLoop()
+        protected virtual void RunLoop()
         {
-            long targetTickTicks = Stopwatch.Frequency / _config.TickRate;
+            long nominalTickTicks = NominalTickTicks;
 
-            _stopwatch.Start();
-            long nextTick = _stopwatch.ElapsedTicks;
+            long nextTick = Stopwatch.GetTimestamp();
+            Volatile.Write(ref _nextTickTimestamp, nextTick);
 
             while (_isRunning)
             {
-                long currentTicks = _stopwatch.ElapsedTicks;
+                long currentTicks = Stopwatch.GetTimestamp();
 
                 if (currentTicks >= nextTick)
                 {
+                    // Consume any pending slew adjustment
+                    long currentSlew = Interlocked.Exchange(ref _slewAdjustmentTicks, 0);
+
+                    // Advance to next boundary BEFORE invoking OnTick
+                    // so OnTick sees the upcoming tick's deadline
+                    nextTick += (nominalTickTicks + currentSlew);
+                    Volatile.Write(ref _nextTickTimestamp, nextTick);
+
                     try
                     {
                         OnTick?.Invoke();
@@ -70,29 +105,24 @@ namespace Liminal.Net.Core
                         LiminalLogger.LogError($"[Ticker] Crash: {ex}");
                     }
 
-                    nextTick += targetTickTicks;
-
-                    if (currentTicks > nextTick + (targetTickTicks * 3))
+                    if (currentTicks > nextTick + (nominalTickTicks * 3))
                     {
-                        nextTick = currentTicks + targetTickTicks;
+                        nextTick = currentTicks + nominalTickTicks;
+                        Volatile.Write(ref _nextTickTimestamp, nextTick);
                     }
                 }
                 else
                 {
                     long ticksRemaining = nextTick - currentTicks;
-
                     long msRemaining = ticksRemaining * 1000 / Stopwatch.Frequency;
 
-                    if (msRemaining > 16)
-                    {
-                        Thread.Sleep(1);
-                    }
-                    else
-                    {
-                        Thread.SpinWait(10);
-                    }
+                    if (msRemaining > 16) Thread.Sleep(1);
+                    else Thread.SpinWait(10);
                 }
+
             }
+
+
         }
     }
 }

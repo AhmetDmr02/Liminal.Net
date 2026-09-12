@@ -4,29 +4,30 @@ using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
 using NUnit.Framework;
-using NUnit.Framework.Legacy;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Liminal.Net.Tests
 {
     [TestFixture]
-    public class TransportIntegrationTests
+    public class ConcurrencyAndStressTests
     {
         private LiminalNetworkManager _serverManager;
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
         private LiminalTransportConfig _serverConfig;
 
         // Prevent port exhaustion between tests
-        private static int _portCounter = 7770;
+        private static int _portCounter = 7800;
         private int _currentTestPort;
 
         [SetUp]
         public void Setup()
         {
             _currentTestPort = Interlocked.Increment(ref _portCounter);
-            _clientManagers = new ();
+            _clientManagers = new();
 
             _serverConfig = new LiminalTransportConfig
             {
@@ -52,7 +53,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient()
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
         {
             var config = new LiminalTransportConfig
             {
@@ -64,318 +65,12 @@ namespace Liminal.Net.Tests
                 HandshakeTimeout = 15,
                 ConnectionTimeout = 15
             };
-            var client = new LiminalNetworkManager(new TcpTransport(), config);
+            var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
             client.StartClient("127.0.0.1", _currentTestPort);
             return client;
         }
 
-        [Test]
-        public void Test01_ServerStartAndStop_ClearsState()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
-
-            _serverManager.Shutdown();
-            Assert.That(_serverManager.Transport.IsConnected, Is.False);
-            Assert.That(_serverManager.Role, Is.EqualTo(NetworkRole.None));
-        }
-
-        [Test]
-        public void Test02_ClientConnect_WithoutServer_FailsGracefully()
-        {
-            var client = CreateAndStartClient();
-
-            bool connected = SpinWait.SpinUntil(() => client.Transport.IsConnected, 1000);
-            Assert.That(connected, Is.False, "Client magically connected to a non-existent server.");
-
-            bool roleReset = SpinWait.SpinUntil(() => client.Role == NetworkRole.None, 6000);
-
-            Assert.That(roleReset, Is.True, "Client role did not reset to None after the connection timeout.");
-        }
-
-        [Test]
-        public void Test03_ClientConnect_And_Disconnect_FiresEvents()
-        {
-            bool serverSawConnect = false;
-            bool serverSawDisconnect = false;
-
-            _serverManager.Transport.OnClientConnected += (id) => serverSawConnect = true;
-            _serverManager.Transport.OnClientDisconnected += (id) => serverSawDisconnect = true;
-
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => serverSawConnect, 2000), Is.True, "Server missed connect event.");
-
-            client.Disconnect();
-            Assert.That(SpinWait.SpinUntil(() => serverSawDisconnect, 2000), Is.True, "Server missed disconnect event.");
-        }
-
-        [Test]
-        public void Test04_SendReliable_SmallPayload_Delivered()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-
-            bool received = false;
-            client.Interpreter.Subscribe<ChatPacket>((pkt, id) => { received = (pkt.Message == "Ping"); }, this);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
-            _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "Ping" });
-            Assert.That(SpinWait.SpinUntil(() => received, 2000), Is.True, "Packet not delivered.");
-        }
-
-        [Test]
-        public void Test05_SendReliable_FilePayload_DeliveredIntact()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-
-            byte[] sentData = new byte[1024]; // 1KB test file
-            for (int i = 0; i < sentData.Length; i++) sentData[i] = (byte)(i % 255);
-
-            bool fileMatched = false;
-            client.Interpreter.Subscribe<FilePacket>((pkt, id) =>
-            {
-                if (pkt.FileName == "test.bin" && pkt.Data.Length == 1024 && pkt.Data[50] == sentData[50])
-                    fileMatched = true;
-            }, this);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
-            _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "test.bin", Data = sentData });
-            Assert.That(SpinWait.SpinUntil(() => fileMatched, 2000), Is.True, "File packet corrupted or dropped.");
-        }
-
-        [Test]
-        public void Test06_SendReliable_ExceedsMaxPacketSize_DropsGracefully()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
-            byte[] oversizedData = new byte[5000];
-
-            Assert.DoesNotThrow(() =>
-            {
-                _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "huge.bin", Data = oversizedData });
-            });
-        }
-
-        [Test]
-        public void Test07_ServerKicksClient_ClientReceivesDisconnect()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
-            bool clientSawDisconnect = false;
-            client.Transport.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
-
-            _serverManager.Transport.Kick(1);
-
-            Assert.That(SpinWait.SpinUntil(() => clientSawDisconnect, 2000), Is.True, "Client did not detect being kicked.");
-            Assert.That(client.Transport.IsConnected, Is.False);
-        }
-
-        [Test]
-        public void Test08_ServerShutdown_DropsAllActiveClients()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var c1 = CreateAndStartClient();
-            var c2 = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => c1.Transport.IsConnected && c2.Transport.IsConnected, 2000), Is.True);
-
-            _serverManager.Shutdown();
-
-            Assert.That(SpinWait.SpinUntil(() => !c1.Transport.IsConnected, 2000), Is.True, "Client 1 stayed alive.");
-            Assert.That(SpinWait.SpinUntil(() => !c2.Transport.IsConnected, 2000), Is.True, "Client 2 stayed alive.");
-        }
-
-        [Test]
-        public void Test09_MultipleClients_ConnectAndReceiveDistinctIds()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-
-            var clients = new List<LiminalNetworkManager>();
-            var assignedIds = new ConcurrentBag<ushort>();
-
-            for (int i = 0; i < 3; i++)
-            {
-                var config = new LiminalTransportConfig
-                {
-                    Default_Host = "127.0.0.1",
-                    Default_Port = _currentTestPort,
-                    TickRate = 60,
-                    MaxPacketSizePerBatch = 4096,
-                    ClientIdResolver = new BaseResolver()
-                };
-                var c = new LiminalNetworkManager(new TcpTransport(), config);
-                _clientManagers.Add(c);
-                clients.Add(c);
-
-                c.Transport.OnLocalClientConnected += (id) => assignedIds.Add(id);
-
-                c.StartClient("127.0.0.1", _currentTestPort);
-            }
-
-            Assert.That(SpinWait.SpinUntil(() => assignedIds.Count == 3, 2000), Is.True, "Failed to capture all 3 connection events.");
-            CollectionAssert.AllItemsAreUnique(assignedIds, "Resolver handed out duplicate IDs.");
-        }
-
-        [Test]
-        public void Test10_RapidSpam_DoesNotCorruptBuffer()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-
-            int receivedCount = 0;
-            client.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref receivedCount), this);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
-            for (int i = 0; i < 100; i++)
-            {
-                _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "Spam" });
-            }
-
-            Assert.That(SpinWait.SpinUntil(() => receivedCount == 100, 3000), Is.True, $"Only received {receivedCount}/100 packets.");
-        }
-
-        [Test]
-        public void Test11_HostMode_InitializesAndConnectsLocalClient()
-        {
-            _serverManager.StartHost();
-
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True, "Host failed to start or Local Client failed to connect to itself.");
-
-            Assert.That(_serverManager.Role, Is.EqualTo(NetworkRole.Host));
-
-            var tcpTransport = (TcpTransport)_serverManager.Transport;
-            Assert.That(tcpTransport.IsServer, Is.True);
-            Assert.That(tcpTransport.IsClient, Is.True);
-
-            Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.GreaterThanOrEqualTo(1), "Host SessionManager failed to register the local client session.");
-        }
-
-        [Test]
-        public void Test12_HostMode_RemoteClientCanConnectToHost()
-        {
-            ushort remoteClientId = 0;
-            _serverManager.Transport.OnClientConnected += (id) =>
-            {
-                if (id != _serverManager.localID) remoteClientId = id;
-            };
-
-            _serverManager.StartHost();
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
-
-            var remoteClient = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected, 2000), Is.True);
-
-            Assert.That(SpinWait.SpinUntil(() => remoteClientId != 0, 2000), Is.True, "Host did not detect the remote client connecting.");
-        }
-
-        [Test]
-        public void Test13_HostMode_TwoWayCommunicationWithRemoteClient()
-        {
-            ushort remoteClientId = 0;
-            _serverManager.Transport.OnClientConnected += (id) =>
-            {
-                if (id != _serverManager.localID) remoteClientId = id;
-            };
-
-            _serverManager.StartHost();
-            var remoteClient = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => remoteClientId != 0, 2000), Is.True);
-
-            bool hostReceived = false;
-            bool remoteReceived = false;
-
-            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
-            {
-                if (pkt.Message == "FromRemote" && id == remoteClientId) hostReceived = true;
-            }, this);
-
-            remoteClient.Interpreter.Subscribe<ChatPacket>((pkt, id) =>
-            {
-                if (pkt.Message == "FromHost" && id == ILiminalTransport.SERVER_ID) remoteReceived = true;
-            }, this);
-
-            remoteClient.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "FromRemote" });
-
-            _serverManager.Interpreter.SendCommand(remoteClientId, new ChatPacket { Message = "FromHost" });
-
-            Assert.That(SpinWait.SpinUntil(() => hostReceived, 2000), Is.True, "Host failed to receive packet from Remote Client.");
-            Assert.That(SpinWait.SpinUntil(() => remoteReceived, 2000), Is.True, "Remote Client failed to receive packet from Host.");
-        }
-
-        [Test]
-        public void Test14_ServerOnly_VirtualLoopback_DeliversToSelf()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True, "Server failed to start.");
-
-            bool receivedSelf = false;
-
-            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, senderId) =>
-            {
-                if (pkt.Message == "ServerSelfLoop" && senderId == ILiminalTransport.SERVER_ID)
-                {
-                    receivedSelf = true;
-                }
-            }, this);
-
-            _serverManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "ServerSelfLoop" });
-
-            Assert.That(SpinWait.SpinUntil(() => receivedSelf, 2000), Is.True, "Server did not receive its own virtual loopback packet.");
-        }
-
-        [Test]
-        public void Test15_ClientOnly_VirtualLoopback_DeliversToSelf()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            var client = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True, "Client failed to connect.");
-
-            ushort myId = client.localID;
-            Assert.That(myId, Is.Not.EqualTo(0), "Client was not assigned a valid ID.");
-
-            bool receivedSelf = false;
-            client.Interpreter.Subscribe<ChatPacket>((pkt, senderId) =>
-            {
-                if (pkt.Message == "ClientSelfLoop" && senderId == myId)
-                {
-                    receivedSelf = true;
-                }
-            }, this);
-
-            client.Interpreter.SendCommand(myId, new ChatPacket { Message = "ClientSelfLoop" });
-
-            Assert.That(SpinWait.SpinUntil(() => receivedSelf, 2000), Is.True, "Client did not receive its own virtual loopback packet.");
-        }
-
-        [Test]
-        public void Test16_VirtualLoopback_InvalidTarget_DropsSilently()
-        {
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True, "Server failed to start.");
-
-            Assert.DoesNotThrow(() =>
-            {
-                _serverManager.Interpreter.SendCommand(999, new ChatPacket { Message = "IntoTheVoid" });
-            }, "Sending to an invalid target caused an exception instead of dropping silently.");
-
-            Assert.DoesNotThrow(() =>
-            {
-                _serverManager.ManualPoll();
-            }, "Polling after a dropped packet caused an exception.");
-        }
         [Test]
         public void Test17_Framer_Concurrency_Stress()
         {
@@ -493,6 +188,7 @@ namespace Liminal.Net.Tests
                 return input.Length;
             }
         }
+
         [Test]
         public void Test18_UngracefulSocketClose_TriggersFatalLog()
         {
@@ -511,6 +207,7 @@ namespace Liminal.Net.Tests
 
             Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(0), "Session should be removed.");
         }
+
         // Carried Over To The Coyote Tests
         //[Test]
         //public void Test19_ConcurrentClientConnections_NoDuplicateIds()
@@ -590,17 +287,10 @@ namespace Liminal.Net.Tests
 
             Thread.Sleep(500);
 
-            int activeCount = 0;
-            for (ushort id = 1; id < 100; id++)
-            {
-                if (_serverConfig.ClientIdResolver.IsConnectionActive(id))
-                {
-                    activeCount++;
-                }
-            }
+            int activeCount = _serverManager.Transport.ConnectedClientCount;
 
-            Assert.That(activeCount, Is.LessThanOrEqualTo(2),
-                $"Resolver leak detected: {activeCount} clients still registered after disconnect.");
+            Assert.That(activeCount, Is.EqualTo(0),
+                $"Socket leak detected: {activeCount} clients still connected in transport after disconnect.");
 
             LiminalLogger.Log($"[Test20] Successfully completed {ITERATIONS} rapid connect/disconnect cycles.");
         }
@@ -655,17 +345,12 @@ namespace Liminal.Net.Tests
             startGate.Set();
             Thread.Sleep(2000);
 
-            int registeredCount = maliciousResolver.GetRegisteredCount();
-            var connectedList = connectedIds.ToList();
+            int confirmedCount = maliciousResolver.ConfirmedCount;
+            int activeSocketsInTransport = testServer.Transport.ConnectedClientCount;
 
-            Assert.That(registeredCount, Is.LessThanOrEqualTo(1),
-                $"RACE CONDITION: {registeredCount} clients registered with the same ID 42. " +
-                $"Expected: 1, Connected events fired: {connectedList.Count}");
-
-            if (connectedList.Count > 0)
-            {
-                Assert.That(connectedList.All(id => id == 42), Is.True);
-            }
+            // Transport replaces colliding IDs cleanly (AddOrUpdate), so exactly 1 remains in memory
+            Assert.That(activeSocketsInTransport, Is.EqualTo(1),
+                $"Expected 1 active socket in transport for ID 42, but found {activeSocketsInTransport}.");
 
             testServer.Shutdown();
             lock (clients)
@@ -676,15 +361,18 @@ namespace Liminal.Net.Tests
                 }
             }
 
-            LiminalLogger.Log($"[Test21] Collision test complete. Resolver gave 5x ID 42, but only {registeredCount} registered.");
+            LiminalLogger.Log($"[Test21] Collision test complete. Resolver handed out ID 42 5x, transport retained exactly {activeSocketsInTransport} socket.");
         }
 
         private class ForceCollisionResolver : ILiminalClientIdResolver
         {
-            private readonly ushort _targetId;
+            private volatile ushort _targetId;
             private readonly int _duplicateCount;
             private int _callCount = 0;
-            private readonly ConcurrentDictionary<ushort, ConnectionPair> _registered = new();
+            private int _confirmedCount = 0;
+
+            public int ConfirmedCount => Volatile.Read(ref _confirmedCount);
+            public void SetTargetId(ushort newTargetId) => _targetId = newTargetId;
 
             public ForceCollisionResolver(ushort targetId, int duplicateCount)
             {
@@ -692,48 +380,28 @@ namespace Liminal.Net.Tests
                 _duplicateCount = duplicateCount;
             }
 
+            public void Initialize(ILiminalTransport transport) { }
+
             public ushort GenerateClientId()
             {
                 int count = Interlocked.Increment(ref _callCount);
                 return count <= _duplicateCount ? _targetId : (ushort)0;
             }
 
-            public bool IsConnectionActive(ushort clientId)
+            public void ConfirmRegistration(ushort targetId)
             {
-                return _registered.ContainsKey(clientId);
+                Interlocked.Increment(ref _confirmedCount);
             }
 
-            public bool RegisterId(ushort clientId, ConnectionPair connectionPair)
-            {
-                return _registered.TryAdd(clientId, connectionPair);
-            }
-
-            public bool UnregisterId(ushort clientId)
-            {
-                return _registered.TryRemove(clientId, out _);
-            }
+            public ushort ResolveId(Span<byte> payload) => 0;
 
             public void ResetResolver()
             {
-                _registered.Clear();
-                _callCount = 0;
-            }
-
-            public ushort ResolveId(Span<byte> payload)
-            {
-                return 0;
-            }
-
-            public bool TryGetConnectionPair(ushort clientId, out ConnectionPair connectionPair)
-            {
-                return _registered.TryGetValue(clientId, out connectionPair);
-            }
-
-            public int GetRegisteredCount()
-            {
-                return _registered.ContainsKey(_targetId) ? 1 : 0;
+                Interlocked.Exchange(ref _callCount, 0);
+                Interlocked.Exchange(ref _confirmedCount, 0);
             }
         }
+
         [Test]
         public void Test22_Chaos_Teardown_Under_Heavy_Load()
         {
@@ -742,6 +410,8 @@ namespace Liminal.Net.Tests
             _serverConfig.OutboundPacketProcessors.Add(chaosTransformer);
 
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) => { }, this);
 
             int clientCount = 10;
             var activeClients = new List<LiminalNetworkManager>();
@@ -794,9 +464,9 @@ namespace Liminal.Net.Tests
             Thread.Sleep(500);
 
             var teardownTasks = new List<Task>
-    {
-        Task.Run(() => _serverManager.Shutdown())
-    };
+            {
+                Task.Run(() => _serverManager.Shutdown())
+            };
 
             for (int i = 0; i < clientCount; i++)
             {
@@ -838,6 +508,127 @@ namespace Liminal.Net.Tests
                 if (Random.Shared.Next(10) < 3) Thread.Yield();
                 return input.Length;
             }
-        } 
+        }
+
+        [Test]
+        public void Test26_InboundQueue_WithinMaxPacketCount_ProcessesSuccessfully()
+        {
+            const int maxPacketCount = 10;
+            const int sentPackets = 5;
+
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = maxPacketCount,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var customServer = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            customServer.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            int serverReceivedCount = 0;
+            customServer.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref serverReceivedCount), this);
+
+            for (int i = 0; i < sentPackets; i++)
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"SafeBatch_{i}" });
+            }
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => serverReceivedCount == sentPackets, 2000), Is.True,
+                $"Server only processed {serverReceivedCount}/{sentPackets} packets within the threshold.");
+            Assert.That(client.Transport.IsConnected, Is.True, "Client was kicked unexpectedly under the packet limit.");
+
+            customServer.Shutdown();
+        }
+
+        [Test]
+        public void Test27_InboundQueue_ExceedingMaxPacketCount_KicksOffendingClient()
+        {
+            const int maxPacketCount = 5;
+            const int overflowPackets = 15;
+
+            var serverConfig = new LiminalTransportConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                MaxPacketCount = maxPacketCount,
+                Hiccup = { Enabled = false },
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var customServer = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            customServer.StartServer("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
+
+            customServer.Interpreter.Subscribe<ChatPacket>((pkt, id) => { LiminalLogger.Log($"Server received packet: {pkt.Message}"); }, this);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            bool serverKickedClient = false;
+            customServer.Transport.OnClientKicked += (id) => serverKickedClient = true;
+
+            // Send more packets in a single batch than the server's InboundQueue MaxPacketCount can tolerate
+            for (int i = 0; i < overflowPackets; i++)
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"Flood_{i}" });
+            }
+            client.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => serverKickedClient, 2000), Is.True,
+                "Server failed to kick client after exceeding InboundQueue MaxPacketCount.");
+            Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 2000), Is.True,
+                "Client remained connected after exceeding InboundQueue capacity limit.");
+
+            customServer.Shutdown();
+        }
+
+        [Test]
+        public void Test43_SessionManager_WhenShutDown_IsGarbageCollected()
+        {
+            WeakReference weakSessionManager = IsolateNetworkRun();
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            Assert.That(weakSessionManager.IsAlive, Is.False, "FATAL: SessionManager was not garbage collected! Event memory leak detected.");
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private WeakReference IsolateNetworkRun()
+        {
+            var config = new LiminalTransportConfig { TickRate = 60, ClientIdResolver = new BaseResolver() };
+            var transport = new TcpTransport();
+            var manager = new LiminalNetworkManager(transport, config);
+
+            manager.StartClient("127.0.0.1", 7777);
+
+            var weak = new WeakReference(manager.SessionManager);
+
+            manager.Shutdown();
+
+            manager.StartClient("127.0.0.1", 7777);
+
+            LiminalNetworkManager.Instance = null;
+
+            return weak;
+        }
     }
 }

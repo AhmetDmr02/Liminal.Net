@@ -4,13 +4,13 @@ using MessagePack;
 namespace Liminal.Net.Test
 {
     [MessagePackObject]
-    [LiminalPacket(id: 5)]
+    [LiminalPacket]
     public struct ChatPacket
     {
         [Key(0)]
         public string Message;
     }
-    [LiminalPacket(6)]
+    [LiminalPacket]
     [MessagePackObject]
     public struct FilePacket
     {
