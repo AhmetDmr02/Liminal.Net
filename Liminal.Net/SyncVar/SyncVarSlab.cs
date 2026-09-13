@@ -24,21 +24,48 @@ namespace Liminal.Net.SyncVar
 
         public (int pageIndex, int pageOffset) AllocateSlot(int size)
         {
-            int linearOffset = Interlocked.Add(ref _allocatedBytes, size) - size;
+            if (size > PageSize)
+                throw new ArgumentException($"[SyncVarSlab] Slot size {size} exceeds PageSize {PageSize}.");
 
-            int pageIndex = linearOffset / PageSize;
-            int pageOffset = linearOffset % PageSize;
+            while (true)
+            {
+                int currentAllocated = Volatile.Read(ref _allocatedBytes);
+                int pageIndex = currentAllocated / PageSize;
+                int pageOffset = currentAllocated % PageSize;
 
-            if (pageIndex >= MaxPages)
-                throw new OutOfMemoryException("[SyncVarSlab] Exceeded maximum slab capacity.");
+                if (pageOffset + size > PageSize)
+                {
+                    int newPageIndex = pageIndex + 1;
+                    if (newPageIndex >= MaxPages)
+                        throw new OutOfMemoryException("[SyncVarSlab] Exceeded maximum slab capacity.");
 
+                    int nextAllocated = (newPageIndex * PageSize) + size;
+
+                    if (Interlocked.CompareExchange(ref _allocatedBytes, nextAllocated, currentAllocated) == currentAllocated)
+                    {
+                        EnsurePageAllocated(newPageIndex);
+                        return (newPageIndex, 0);
+                    }
+                }
+                else
+                {
+                    int nextAllocated = currentAllocated + size;
+                    if (Interlocked.CompareExchange(ref _allocatedBytes, nextAllocated, currentAllocated) == currentAllocated)
+                    {
+                        EnsurePageAllocated(pageIndex);
+                        return (pageIndex, pageOffset);
+                    }
+                }
+            }
+        }
+
+        private void EnsurePageAllocated(int pageIndex)
+        {
             if (Volatile.Read(ref _pages[pageIndex]) == null)
             {
                 var newPage = new byte[PageSize];
                 Interlocked.CompareExchange(ref _pages[pageIndex], newPage, null);
             }
-
-            return (pageIndex, pageOffset);
         }
 
         public byte[] GetPage(int pageIndex) => Volatile.Read(ref _pages[pageIndex]);
@@ -50,13 +77,15 @@ namespace Liminal.Net.SyncVar
 
         public byte[] ExtractSnapshot(int totalBytes)
         {
-            byte[] snapshot = new byte[totalBytes];
+            int allocated = Volatile.Read(ref _allocatedBytes);
+            int bytesToCopy = Math.Max(totalBytes, allocated);
+            byte[] snapshot = new byte[bytesToCopy];
             int copied = 0;
             int pageIndex = 0;
 
-            while (copied < totalBytes && pageIndex < MaxPages)
+            while (copied < bytesToCopy && pageIndex < MaxPages)
             {
-                int toCopy = Math.Min(PageSize, totalBytes - copied);
+                int toCopy = Math.Min(PageSize, bytesToCopy - copied);
                 var page = Volatile.Read(ref _pages[pageIndex]);
                 if (page != null)
                 {
@@ -76,12 +105,7 @@ namespace Liminal.Net.SyncVar
 
             while (copied < snapshot.Length && pageIndex < MaxPages)
             {
-                if (Volatile.Read(ref _pages[pageIndex]) == null)
-                {
-                    var newPage = new byte[PageSize];
-                    Interlocked.CompareExchange(ref _pages[pageIndex], newPage, null);
-                }
-
+                EnsurePageAllocated(pageIndex);
                 int toCopy = Math.Min(PageSize, snapshot.Length - copied);
                 snapshot.Slice(copied, toCopy).CopyTo(_pages[pageIndex].AsSpan(0, toCopy));
                 copied += toCopy;
@@ -101,10 +125,6 @@ namespace Liminal.Net.SyncVar
         }
     }
 
-    /// <summary>
-    /// Reusable thread-local buffer writer that allows MessagePack to serialize directly
-    /// into a slab page slot without allocating temporary byte[] arrays.
-    /// </summary>
     internal sealed class FixedBufferWriter : IBufferWriter<byte>
     {
         [ThreadStatic]

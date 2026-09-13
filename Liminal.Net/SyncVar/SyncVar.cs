@@ -1,4 +1,5 @@
 ﻿using Liminal.Net.Core;
+using Liminal.Net.Interfaces;
 using MessagePack;
 using System;
 using System.Buffers;
@@ -25,10 +26,9 @@ namespace Liminal.Net.SyncVar
 
         void AllocateSlots(int size);
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
-        bool TryReadSlotForWire(Span<byte> destination, out uint version, out int length);
+        bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
         void ApplyRemoteBytes(ReadOnlySpan<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options);
     }
-
 
     public class SyncVar<T> : ISyncVarInternal
     {
@@ -37,8 +37,10 @@ namespace Liminal.Net.SyncVar
         private const int STATE_SWAPPING = 2;
 
         private readonly object _authLock = new();
+        private readonly SyncVarManager _manager;
 
         private readonly (int PageIndex, int PageOffset)[] _slots = new (int, int)[2];
+        private readonly int[] _slotCapacities = new int[2];
         private readonly int[] _slotLengths = new int[2];
         private readonly uint[] _slotVersions = new uint[2];
 
@@ -47,18 +49,18 @@ namespace Liminal.Net.SyncVar
 
         private T _value;
         private uint _version;
-
         private ushort[] _authIds = Array.Empty<ushort>();
 
         public event Action<bool> OnAuthorityChanged;
 
         public ushort Id { get; set; }
         public string Token { get; }
-        public uint Version => _slotVersions[Volatile.Read(ref _frontIndex)];
+        public uint Version => Volatile.Read(ref _version);
         public int ActivePageIndex => _slots[Volatile.Read(ref _frontIndex)].PageIndex;
         public int ActivePageOffset => _slots[Volatile.Read(ref _frontIndex)].PageOffset;
         public int Length => _slotLengths[Volatile.Read(ref _frontIndex)];
         public ushort[] AuthIds => Volatile.Read(ref _authIds);
+        public SyncVarManager Manager => _manager;
 
         public event Action<T, T> OnValueChanged;
 
@@ -66,11 +68,19 @@ namespace Liminal.Net.SyncVar
         {
             get
             {
-                var manager = LiminalNetworkManager.Instance;
-                if (manager == null || manager.Role == NetworkRole.None) return true;
-                if (manager.Role == NetworkRole.Server || manager.Role == NetworkRole.Host) return true;
+                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                if (netManager == null || netManager.Role == NetworkRole.None) return true;
 
-                return IsAuthorized(manager.localID);
+                // Server/Host is ALWAYS authorized
+                if (netManager.Role == NetworkRole.Server ||
+                    netManager.Role == NetworkRole.Host ||
+                    netManager.Transport?.IsServer == true ||
+                    netManager.localID == ILiminalTransport.SERVER_ID)
+                {
+                    return true;
+                }
+
+                return IsAuthorized(netManager.localID);
             }
         }
 
@@ -81,21 +91,23 @@ namespace Liminal.Net.SyncVar
             {
                 if (!HasAuthority)
                 {
-                    var manager = LiminalNetworkManager.Instance;
-                    ushort myId = manager?.localID ?? 0;
-                LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
-                return; 
+                    var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                    ushort myId = netManager?.localID ?? 0;
+                    LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
+                    return;
                 }
 
                 WriteFromOwningThread(value);
             }
         }
 
-        public SyncVar(string token, T initialValue = default)
+        public SyncVar(string token, T initialValue = default, SyncVarManager manager = null)
         {
             Token = token ?? throw new ArgumentNullException(nameof(token));
             _value = initialValue;
-            SyncVarManager.Instance.RegisterSyncVar(this);
+
+            _manager = manager ?? SyncVarManager.GetManagerForRegistration();
+            _manager.RegisterSyncVar(this);
         }
 
         public void SetAuthIds(params ushort[] clientIds)
@@ -123,6 +135,7 @@ namespace Liminal.Net.SyncVar
                 CommitAuthUpdate(cleanList.ToArray());
             }
         }
+
         public void AddAuthority(ushort clientId)
         {
             lock (_authLock)
@@ -180,6 +193,7 @@ namespace Liminal.Net.SyncVar
                 CommitAuthUpdate(next);
             }
         }
+
         public void ApplyAuthUpdateFromRemote(ushort[] newAuthIds)
         {
             lock (_authLock)
@@ -197,6 +211,8 @@ namespace Liminal.Net.SyncVar
 
         public bool IsAuthorized(ushort clientId)
         {
+            if (clientId == ILiminalTransport.SERVER_ID) return true;
+
             var auth = Volatile.Read(ref _authIds);
             if (auth == null || auth.Length == 0) return false;
             for (int i = 0; i < auth.Length; i++)
@@ -217,17 +233,21 @@ namespace Liminal.Net.SyncVar
                 OnAuthorityChanged?.Invoke(currentAuth);
             }
 
-            var manager = LiminalNetworkManager.Instance;
-            if (manager != null && (manager.Role == NetworkRole.Server || manager.Role == NetworkRole.Host))
+            var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+            if (netManager != null && (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
             {
-                SyncVarManager.Instance.BroadcastAuthChange(Id, newAuthIds);
+                _manager.BroadcastAuthChange(Id, newAuthIds);
             }
         }
 
         public void AllocateSlots(int size)
         {
-            _slots[0] = SyncVarManager.Instance.Slab.AllocateSlot(size);
-            _slots[1] = SyncVarManager.Instance.Slab.AllocateSlot(size);
+            int capacity = Math.Max(size + 128, 256);
+
+            _slots[0] = _manager.Slab.AllocateSlot(capacity);
+            _slots[1] = _manager.Slab.AllocateSlot(capacity);
+            _slotCapacities[0] = capacity;
+            _slotCapacities[1] = capacity;
             _slotLengths[0] = size;
             _slotLengths[1] = size;
         }
@@ -239,17 +259,19 @@ namespace Liminal.Net.SyncVar
             int backIndex = 1 - Volatile.Read(ref _frontIndex);
             var (page, offset) = _slots[backIndex];
 
-            // Use thread-local writer to serialize directly into slab page memory (Zero GC)
             var writer = FixedBufferWriter.ThreadInstance;
-            byte[] pageArray = SyncVarManager.Instance.Slab.GetPage(page);
-            writer.Reset(pageArray, offset, _slotLengths[backIndex]);
-            MessagePackSerializer.Serialize(writer, newValue, SyncVarManager.Instance.SerializerOptions);
+            byte[] pageArray = _manager.Slab.GetPage(page);
+            writer.Reset(pageArray, offset, _slotCapacities[backIndex]);
+            MessagePackSerializer.Serialize(writer, newValue, _manager.SerializerOptions);
 
+            int writtenLength = writer.WrittenCount;
             uint newVersion = _version + 1;
+
+            _slotLengths[backIndex] = writtenLength;
             _slotVersions[backIndex] = newVersion;
             T old = _value;
             _value = newValue;
-            _version = newVersion;
+            Volatile.Write(ref _version, newVersion);
 
             var spinner = new SpinWait();
             while (Interlocked.CompareExchange(ref _gate, STATE_SWAPPING, STATE_IDLE) != STATE_IDLE)
@@ -266,12 +288,12 @@ namespace Liminal.Net.SyncVar
                 Volatile.Write(ref _gate, STATE_IDLE);
             }
 
-            SyncVarManager.Instance.DirtyBitset.SetDirty(Id);
+            _manager.DirtyBitset.SetDirty(Id);
 
             OnValueChanged?.Invoke(old, newValue);
         }
 
-        public bool TryReadSlotForWire(Span<byte> destination, out uint version, out int length)
+        public bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version)
         {
             var spinner = new SpinWait();
             while (Interlocked.CompareExchange(ref _gate, STATE_READING, STATE_IDLE) != STATE_IDLE)
@@ -283,11 +305,14 @@ namespace Liminal.Net.SyncVar
             {
                 int front = Volatile.Read(ref _frontIndex);
                 var (page, offset) = _slots[front];
-                length = _slotLengths[front];
+                int length = _slotLengths[front];
                 version = _slotVersions[front];
 
-                var span = SyncVarManager.Instance.Slab.GetSpan(page, offset, length);
-                span.CopyTo(destination);
+                var span = _manager.Slab.GetSpan(page, offset, length);
+                writer.WriteUInt16(Id);
+                writer.WriteUInt32(version);
+                writer.WriteInt32(length);
+                writer.WriteRaw(span);
                 return true;
             }
             finally
@@ -303,11 +328,13 @@ namespace Liminal.Net.SyncVar
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes.ToArray(), options);
             T old = _value;
             _value = deserialized;
-            _version = newVersion;
+            Volatile.Write(ref _version, newVersion);
 
             int front = Volatile.Read(ref _frontIndex);
             var (page, offset) = _slots[front];
-            incomingBytes.CopyTo(SyncVarManager.Instance.Slab.GetSpan(page, offset, incomingBytes.Length));
+            incomingBytes.CopyTo(_manager.Slab.GetSpan(page, offset, incomingBytes.Length));
+            _slotLengths[front] = incomingBytes.Length;
+            _slotVersions[front] = newVersion;
 
             OnValueChanged?.Invoke(old, deserialized);
         }

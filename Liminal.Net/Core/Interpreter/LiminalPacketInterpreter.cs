@@ -16,6 +16,7 @@ namespace Liminal.Net.Core
         private readonly object _subscriptionGate = new();
 
         private readonly LiminalNetworkConfig _config;
+        private readonly LiminalNetworkManager _manager;
 
         private interface IPacketDispatcher
         {
@@ -184,9 +185,10 @@ namespace Liminal.Net.Core
             }
         }
 
-        public LiminalPacketInterpreter(LiminalNetworkConfig config)
+        public LiminalPacketInterpreter(LiminalNetworkManager manager, LiminalNetworkConfig config)
         {
-            _config = config;
+            _manager = manager ?? throw new ArgumentNullException(nameof(manager));
+            _config = config ?? throw new ArgumentNullException(nameof(config));
         }
 
         private LiminalNativeBufferWriter RentWriter()
@@ -428,7 +430,7 @@ namespace Liminal.Net.Core
         public void SendCommand<TSendStruct>(ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
             ushort defaultSender;
-            var manager = LiminalNetworkManager.Instance;
+            var manager = _manager;
 
             if (manager.Role == NetworkRole.Client)
             {
@@ -448,7 +450,7 @@ namespace Liminal.Net.Core
 
         public void SendCommandAsClient<TSendStruct>(ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
-            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionId, packet, deliveryMethod);
+            SendCommandFrom(_manager.localID, targetSessionId, packet, deliveryMethod);
         }
 
         public void SendCommandAsServer<TSendStruct>(ushort targetSessionId, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
@@ -493,7 +495,7 @@ namespace Liminal.Net.Core
                 return;
 
             ushort defaultSender;
-            var manager = LiminalNetworkManager.Instance;
+            var manager = _manager;
 
             if (manager.Role == NetworkRole.Client)
             {
@@ -519,7 +521,7 @@ namespace Liminal.Net.Core
 
         public void SendCommandAsClient<TSendStruct>(ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct
         {
-            SendCommandFrom(LiminalNetworkManager.Instance.localID, targetSessionIds, packet, deliveryMethod);
+            SendCommandFrom(_manager.localID, targetSessionIds, packet, deliveryMethod);
         }
 
         public void SendCommandFrom<TSendStruct>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, TSendStruct packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TSendStruct : struct

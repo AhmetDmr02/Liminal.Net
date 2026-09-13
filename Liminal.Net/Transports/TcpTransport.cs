@@ -319,29 +319,31 @@ namespace Liminal.Net.Transports
             }
         }
 
-        private void TeardownSendQueue(ushort clientId)
+        private void TeardownSendQueue(ushort clientId, ClientSendState ownedState = null)
         {
-            if (_sendQueues.TryRemove(clientId, out var state))
+            ClientSendState state;
+
+            if (ownedState != null)
             {
-                try
+                if (!((ICollection<KeyValuePair<ushort, ClientSendState>>)_sendQueues)
+                        .Remove(new KeyValuePair<ushort, ClientSendState>(clientId, ownedState)))
                 {
-                    state.LifetimeCts.Cancel();
+                    return;
                 }
-                catch (ObjectDisposedException) { }
-
-                state.Channel.Writer.TryComplete();
-
-                if (state.WriterTask != null)
-                {
-                    _ = state.WriterTask.ContinueWith(
-                        _ => state.Dispose(),
-                        TaskContinuationOptions.ExecuteSynchronously);
-                }
-                else
-                {
-                    state.Dispose();
-                }
+                state = ownedState;
             }
+            else if (!_sendQueues.TryRemove(clientId, out state))
+            {
+                return;
+            }
+
+            try { state.LifetimeCts.Cancel(); } catch (ObjectDisposedException) { }
+            state.Channel.Writer.TryComplete();
+
+            if (state.WriterTask != null)
+                _ = state.WriterTask.ContinueWith(_ => state.Dispose(), TaskContinuationOptions.ExecuteSynchronously);
+            else
+                state.Dispose();
         }
         #endregion
 
@@ -736,7 +738,7 @@ namespace Liminal.Net.Transports
 
             sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
 
-            _ = Task.Run(async () => ReceiveLoop(clientId, client));
+            _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
@@ -751,7 +753,7 @@ namespace Liminal.Net.Transports
 
             sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(ILiminalTransport.SERVER_ID, client, sendState));
 
-            _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client));
+            _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client, sendState));
 
             _onLocalClientConnected?.Invoke(assignedId);
 
@@ -768,7 +770,7 @@ namespace Liminal.Net.Transports
             SocketError
         }
 
-        private async Task ReceiveLoop(ushort incomingId, TcpClient client)
+        private async Task ReceiveLoop(ushort incomingId, TcpClient client, ClientSendState ownedSendState)
         {
             // Fixed for the lifetime of this receive loop.
             using var ingestBuffer = new LiminalNativeBuffer(
@@ -870,7 +872,7 @@ namespace Liminal.Net.Transports
 
                     try { client.Close(); } catch { }
 
-                    TeardownSendQueue(incomingId);
+                    TeardownSendQueue(incomingId, ownedSendState);
 
                     if (!isServerConn)
                     {

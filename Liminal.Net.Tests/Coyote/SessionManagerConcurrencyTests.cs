@@ -6,6 +6,7 @@ using Microsoft.Coyote.Specifications;
 using Microsoft.Coyote.SystematicTesting;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Threading;
 using System.Threading.Tasks;
 using TestAttribute = Microsoft.Coyote.SystematicTesting.TestAttribute;
 
@@ -20,16 +21,17 @@ namespace Liminal.Net.Tests
             {
                 MaxPacketSizePerBatch = 64,
                 MaxPacketCount = 10,
-                MaxConnectionCount = 4
+                MaxConnectionCount = 4,
+                ClientIdResolver = new BaseResolver()
             };
             config.Hiccup.MaxRecoveryScale = 4;
             config.Hiccup.GraceCount = 500;
             config.Hiccup.RecoveryHoldSeconds = 0.0001f;
 
             var transport = new MockTransport();
-            var interpreter = new LiminalPacketInterpreter(config);
-            var pipeline = new LiminalPacketFramerPipeline(config);
-            var manager = new LiminalSessionManager(transport, interpreter, config, pipeline);
+            var netManager = new LiminalNetworkManager(transport, config);
+            var interpreter = netManager.Interpreter;
+            var manager = netManager.SessionManager;
 
             ushort clientId = 42;
             transport.TriggerClientConnected(clientId);
@@ -42,7 +44,7 @@ namespace Liminal.Net.Tests
 
             int totalDispatched = 0;
 
-            interpreter.OnSendRequest += (sender, target, pid, data, DeliveryMethod) =>
+            interpreter.OnSendRequest += (sender, target, pid, data, deliveryMethod) =>
             {
                 Interlocked.Increment(ref totalDispatched);
             };
@@ -104,8 +106,10 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestInterpreterSubscriptionRace()
         {
-            var config = new LiminalNetworkConfig();
-            var interpreter = new LiminalPacketInterpreter(config);
+            var config = new LiminalNetworkConfig { ClientIdResolver = new BaseResolver() };
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var interpreter = netManager.Interpreter;
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
             if (chatPacketId == 0)
@@ -166,7 +170,6 @@ namespace Liminal.Net.Tests
 
             await Task.WhenAll(tasks);
 
-            // Clean teardown check
             interpreter.ClearAllHandlers();
             int finalHitsBefore = Volatile.Read(ref totalInvocations);
             interpreter.Dispatch(chatPacketId, 1, serializedChat);
@@ -178,8 +181,10 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task HuntGhostSubscriptionRace()
         {
-            var config = new LiminalNetworkConfig();
-            var interpreter = new LiminalPacketInterpreter(config);
+            var config = new LiminalNetworkConfig { ClientIdResolver = new BaseResolver() };
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var interpreter = netManager.Interpreter;
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
             if (chatPacketId == 0)
@@ -251,7 +256,8 @@ namespace Liminal.Net.Tests
             {
                 MaxPacketSizePerBatch = 64,
                 MaxPacketCount = 10,
-                MaxConnectionCount = 4
+                MaxConnectionCount = 4,
+                ClientIdResolver = new BaseResolver()
             };
 
             config.Hiccup.MaxRecoveryScale = 50;
@@ -262,9 +268,8 @@ namespace Liminal.Net.Tests
             config.Hiccup.WarmRecoverySessions = 1;
 
             var transport = new MockTransport();
-            var interpreter = new LiminalPacketInterpreter(config);
-            var pipeline = new LiminalPacketFramerPipeline(config);
-            var manager = new LiminalSessionManager(transport, interpreter, config, pipeline);
+            var netManager = new LiminalNetworkManager(transport, config);
+            var manager = netManager.SessionManager;
 
             ushort[] clientIds = { 21, 22, 23, 24 };
             foreach (var id in clientIds)
@@ -373,7 +378,7 @@ namespace Liminal.Net.Tests
             int sendCount = 0;
             mockTransport.OnSendHook = (data, clientId, flags) =>
             {
-                if (System.Threading.Interlocked.Increment(ref sendCount) == 5)
+                if (Interlocked.Increment(ref sendCount) == 5)
                 {
                     fragmentor.Dispose();
                 }
@@ -404,6 +409,7 @@ namespace Liminal.Net.Tests
 
             Task.WaitAll(sendTask1, sendTask2, disposeTask);
         }
+
         [Microsoft.Coyote.SystematicTesting.Test]
         public static async Task Coyote_SessionManager_DisposeRace_ConcurrentWithTraffic()
         {
@@ -412,7 +418,8 @@ namespace Liminal.Net.Tests
                 MaxPacketSizePerBatch = 4096,
                 MaxPacketCount = 512,
                 MaxConnectionCount = 8,
-                TickRate = 20
+                TickRate = 20,
+                ClientIdResolver = new BaseResolver()
             };
 
             config.Hiccup.MaxRecoveryScale = 4;
@@ -423,16 +430,8 @@ namespace Liminal.Net.Tests
             config.Hiccup.WarmRecoverySessions = 1;
 
             var transport = new MockTransport();
-            transport.InitializeTransport(config);
-
-            var interpreter = new LiminalPacketInterpreter(config);
-            var pipeline = new LiminalPacketFramerPipeline(config);
-
-            var manager = new LiminalSessionManager(
-                transport,
-                interpreter,
-                config,
-                pipeline);
+            var netManager = new LiminalNetworkManager(transport, config);
+            var manager = netManager.SessionManager;
 
             const ushort clientId = 77;
             transport.TriggerClientConnected(clientId);
@@ -503,6 +502,7 @@ namespace Liminal.Net.Tests
                 manager.GetActiveSessionCount() == 0,
                 "Manager did not reach a fully torn-down state after Dispose raced with in-flight traffic.");
         }
+
         [Microsoft.Coyote.SystematicTesting.Test]
         public static async Task Coyote_SessionManager_ConcurrentThroughputConservation()
         {
@@ -511,7 +511,8 @@ namespace Liminal.Net.Tests
                 MaxPacketSizePerBatch = 4096,
                 MaxPacketCount = 512,
                 MaxConnectionCount = 8,
-                TickRate = 20
+                TickRate = 20,
+                ClientIdResolver = new BaseResolver()
             };
 
             config.Hiccup.MaxRecoveryScale = 4;
@@ -522,16 +523,8 @@ namespace Liminal.Net.Tests
             config.Hiccup.WarmRecoverySessions = 1;
 
             var transport = new MockTransport();
-            transport.InitializeTransport(config);
-
-            var interpreter = new LiminalPacketInterpreter(config);
-            var pipeline = new LiminalPacketFramerPipeline(config);
-
-            var manager = new LiminalSessionManager(
-                transport,
-                interpreter,
-                config,
-                pipeline);
+            var netManager = new LiminalNetworkManager(transport, config);
+            var manager = netManager.SessionManager;
 
             manager.InitializeConfig(new LiminalTelemetryConfig
             {
@@ -669,25 +662,21 @@ namespace Liminal.Net.Tests
 
             const long expectedInbound = reliableInboundCount + unreliableInboundCount;
             const long expectedOutbound =
-                (mainTicks + drainTicks) /* ticker's own send per tick */
+                (mainTicks + drainTicks)
                 + extraReliableSends
                 + extraUnreliableSends;
 
             Specification.Assert(
                 snapshot.TotalPacketsInbound == expectedInbound,
-                $"Expected {expectedInbound} inbound packets accepted under ReceiveLock, got {snapshot.TotalPacketsInbound}. " +
-                "A mismatch here means concurrent reliable/unreliable inbound processing lost or double-counted a packet.");
+                $"Expected {expectedInbound} inbound packets accepted under ReceiveLock, got {snapshot.TotalPacketsInbound}.");
 
             Specification.Assert(
                 snapshot.TotalPacketsOutbound == expectedOutbound,
-                $"Expected {expectedOutbound} outbound packets accepted under SendLock, got {snapshot.TotalPacketsOutbound}. " +
-                "A mismatch here means concurrent BufferPacket callers raced past SendLock incorrectly.");
+                $"Expected {expectedOutbound} outbound packets accepted under SendLock, got {snapshot.TotalPacketsOutbound}.");
 
             Specification.Assert(
                 Interlocked.Read(ref bufferedCount) == expectedOutbound,
-                $"OnPacketBuffered fired {bufferedCount} times, expected {expectedOutbound}. " +
-                "This should always match TotalPacketsOutbound - if it doesn't, the two counters are being " +
-                "updated non-atomically with respect to each other somewhere.");
+                $"OnPacketBuffered fired {bufferedCount} times, expected {expectedOutbound}.");
 
             Specification.Assert(
                 snapshot.LoopbackQueueCount == 0,
@@ -701,11 +690,14 @@ namespace Liminal.Net.Tests
                 manager.GetActiveSessionCount() == 0,
                 "Session was not cleaned up after Dispose/Flush/Poll.");
         }
+
         [Test]
         public static async Task Coyote_Interpreter_ReentrantDispatchAndTeardownRace()
         {
-            var config = new LiminalNetworkConfig();
-            var interpreter = new LiminalPacketInterpreter(config);
+            var config = new LiminalNetworkConfig { ClientIdResolver = new BaseResolver() };
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var interpreter = netManager.Interpreter;
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
             if (chatPacketId == 0)

@@ -128,6 +128,13 @@ namespace Liminal.Net.Handshakes
                 Drop(client, "Handshake Timeout");
                 return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out");
             }
+            catch (ObjectDisposedException)
+            {
+                // the timeout CTS's internal timer fired at nearly the
+                // same instant the handshake completed and disposed it.
+                Drop(client, "Handshake Timeout (CTS teardown race)");
+                return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out");
+            }
             catch (Exception ex)
             {
                 Drop(client, $"Fatal Handshake Error: {ex.Message}");
@@ -202,6 +209,11 @@ namespace Liminal.Net.Handshakes
             catch (OperationCanceledException)
             {
                 Drop(client, "Connection attempt timed out.");
+                return HandshakeResult.Fail(DisconnectReason.Timeout, "Connection attempt timed out.");
+            }
+            catch (ObjectDisposedException)
+            {
+                Drop(client, "Connection attempt timed out (CTS teardown race).");
                 return HandshakeResult.Fail(DisconnectReason.Timeout, "Connection attempt timed out.");
             }
             catch (Exception ex)

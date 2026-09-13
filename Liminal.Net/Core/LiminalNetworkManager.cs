@@ -41,16 +41,16 @@ namespace Liminal.Net.Core
 
         public event Action<ushort, DisconnectReason, string> OnDisconnectResolved;
 
-        public static event Action OnManagerPreInitialize;
-        public static event Action OnManagerPostInitialize;
+        public event Action OnManagerPreInitialize;
+        public event Action OnManagerPostInitialize;
 
-        public static event Action OnManagerShutdown;
+        public event Action OnManagerShutdown;
 
-        public static event Action OnPreFlush;
-        public static event Action OnPostFlush;
+        public event Action OnPreFlush;
+        public event Action OnPostFlush;
 
-        public static event Action OnPrePoll;
-        public static event Action OnPostPoll;
+        public event Action OnPrePoll;
+        public event Action OnPostPoll;
 
         public ushort localID => _transport.LocalClientId;
 
@@ -59,8 +59,6 @@ namespace Liminal.Net.Core
         public LiminalNetworkManager(ILiminalTransport transport, LiminalNetworkConfig config,
         LiminalTelemetryConfig telemetryConfig = null)
         {
-            Instance = this;
-
             if (transport == null) throw new ArgumentNullException(nameof(transport));
             if (config == null) throw new ArgumentNullException(nameof(config));
 
@@ -68,7 +66,7 @@ namespace Liminal.Net.Core
             _config = config;
             _telemetryConfig = telemetryConfig ?? new LiminalTelemetryConfig { Flags = TelemetryFlags.None };
 
-            Interpreter = new LiminalPacketInterpreter(_config);
+            Interpreter = new LiminalPacketInterpreter(this, _config);
 
             _transport.InitializeTransport(config);
             _transport.OnShutdown += HandleTransportShutdown;
@@ -108,7 +106,7 @@ namespace Liminal.Net.Core
             _phaseAligner = new LiminalPhaseAligner(_config);
             TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
 
-            SyncVarManager = Liminal.Net.SyncVar.SyncVarManager.Initialize(_config);
+            SyncVarManager = Liminal.Net.SyncVar.SyncVarManager.Initialize(this, _config);
 
             OnManagerPostInitialize?.Invoke();
         }

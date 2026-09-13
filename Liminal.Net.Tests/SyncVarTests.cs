@@ -22,6 +22,7 @@ namespace Liminal.Net.Tests
         [Key(2)] public float CoordY;
         [Key(3)] public float CoordZ;
 
+        [IgnoreMember]
         public bool IsConsistent => CoordX.Equals(CoordY) && CoordY.Equals(CoordZ);
 
         public bool Equals(TestStatePayload other) =>
