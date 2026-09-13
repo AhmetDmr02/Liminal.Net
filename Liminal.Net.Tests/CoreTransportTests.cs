@@ -324,16 +324,34 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test13_HostMode_TwoWayCommunicationWithRemoteClient()
         {
+            ushort hostLocalId = 0;
+            var hostLocalReady = new ManualResetEventSlim(false);
+
             ushort remoteClientId = 0;
-            _serverManager.Transport.OnClientConnected += (id) =>
+            var remoteReady = new ManualResetEventSlim(false);
+
+            _serverManager.Transport.OnLocalClientConnected += id =>
             {
-                if (id != _serverManager.localID) remoteClientId = id;
+                hostLocalId = id;
+                hostLocalReady.Set();
+            };
+
+            _serverManager.Transport.OnClientConnected += id =>
+            {
+                if (hostLocalId != 0 && id != hostLocalId)
+                {
+                    remoteClientId = id;
+                    remoteReady.Set();
+                }
             };
 
             _serverManager.StartHost();
-            var remoteClient = CreateAndStartClient();
+            Assert.That(hostLocalReady.Wait(2000), Is.True,
+                "Host's local client role never completed handshake.");
 
-            Assert.That(SpinWait.SpinUntil(() => remoteClientId != 0, 2000), Is.True);
+            var remoteClient = CreateAndStartClient();
+            Assert.That(remoteReady.Wait(2000), Is.True,
+                "Host never saw the remote client as a distinct peer.");
 
             bool hostReceived = false;
             bool remoteReceived = false;
@@ -348,12 +366,15 @@ namespace Liminal.Net.Tests
                 if (pkt.Message == "FromHost" && id == ILiminalTransport.SERVER_ID) remoteReceived = true;
             }, this);
 
-            remoteClient.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "FromRemote" });
+            remoteClient.Interpreter.SendCommand(ILiminalTransport.SERVER_ID,
+                new ChatPacket { Message = "FromRemote" });
+            _serverManager.Interpreter.SendCommand(remoteClientId,
+                new ChatPacket { Message = "FromHost" });
 
-            _serverManager.Interpreter.SendCommand(remoteClientId, new ChatPacket { Message = "FromHost" });
-
-            Assert.That(SpinWait.SpinUntil(() => hostReceived, 2000), Is.True, "Host failed to receive packet from Remote Client.");
-            Assert.That(SpinWait.SpinUntil(() => remoteReceived, 2000), Is.True, "Remote Client failed to receive packet from Host.");
+            Assert.That(SpinWait.SpinUntil(() => hostReceived, 2000), Is.True,
+                "Host failed to receive packet from Remote Client.");
+            Assert.That(SpinWait.SpinUntil(() => remoteReceived, 2000), Is.True,
+                "Remote Client failed to receive packet from Host.");
         }
 
         [Test]

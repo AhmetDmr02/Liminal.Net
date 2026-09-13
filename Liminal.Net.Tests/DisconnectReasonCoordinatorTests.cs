@@ -526,10 +526,10 @@ namespace Liminal.Net.Tests
                 await stream.WriteAsync(full, cts.Token);
 
                 byte[] header = new byte[8];
-                await stream.ReadExactlyAsync(header, 0, 8, cts.Token);
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
                 int len = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 byte[] respPayload = new byte[len];
-                await stream.ReadExactlyAsync(respPayload, 0, len, cts.Token);
+                await stream.LiminalReadExactlyAsync(respPayload, 0, len, cts.Token);
 
                 var serverResp = MessagePackSerializer.Deserialize<ConnectionHandshakePacketServer>(respPayload);
                 return HandshakeResult.Fail(serverResp.RejectReason, serverResp.RejectMessage);
@@ -581,11 +581,18 @@ namespace Liminal.Net.Tests
 
                 await stream.WriteAsync(maliciousHeader);
 
-                byte[] dummy = new byte[8];
-                int read = await stream.ReadAsync(dummy);
-                return read <= 0
-                    ? HandshakeResult.Fail(DisconnectReason.ConnectionLost, "Socket severed abruptly")
-                    : HandshakeResult.Ok(1);
+                try
+                {
+                    byte[] dummy = new byte[8];
+                    int read = await stream.ReadAsync(dummy);
+                    return read <= 0
+                        ? HandshakeResult.Fail(DisconnectReason.ConnectionLost, "Socket severed abruptly")
+                        : HandshakeResult.Ok(1);
+                }
+                catch (Exception)
+                {
+                    return HandshakeResult.Fail(DisconnectReason.ConnectionLost, "Socket severed abruptly");
+                }
             };
 
             var client = new LiminalNetworkManager(clientTransport, clientConfig);

@@ -38,4 +38,10 @@ namespace Liminal.Net.BasePackets
         [Key(1)]
         public ushort ClientID { get; set; }
     }
+
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct ConnectionHandshakeReadyConfirmed
+    {
+    }
 }

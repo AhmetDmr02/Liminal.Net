@@ -1,4 +1,5 @@
 using Liminal.Net.Core;
+using Liminal.Net.Handshakes;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
 using System;
@@ -11,20 +12,15 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace Liminal.Net.Transports
 {
-    //Example empty framing context
     public readonly struct EmptyFramingContext { }
     public class TcpTransport : TcpTransport<EmptyFramingContext> { }
 
-    /// <summary>
-    /// It uses tcp by default
-    /// </summary>
     public class TcpTransport<TContext> : ILiminalTransport, ITransportTelemetryProvider, ILiminalTransportDisconnectDiagnostics where TContext : struct
     {
         protected volatile ushort _localClientId = 0;
@@ -40,6 +36,7 @@ namespace Liminal.Net.Transports
         public bool IsClient => _isClient;
 
         protected TcpListener _listener;
+        private CancellationTokenSource _clientConnectCts;
 
         public ServerHandshakeOrchestrator<TcpClient> ServerHandshaker { get; set; } = DefaultHandshakes.ServerTcpHandshake;
         public ClientHandshakeOrchestrator<TcpClient> ClientHandshaker { get; set; } = DefaultHandshakes.ClientTcpHandshake;
@@ -131,7 +128,6 @@ namespace Liminal.Net.Transports
 
         internal readonly ConcurrentDictionary<ushort, TcpClient> _sockets = new();
 
-
         private readonly ConcurrentDictionary<TcpClient, byte> _finalizedConnections = new();
         private bool TryClaimDisconnect(TcpClient client) => _finalizedConnections.TryAdd(client, 0);
 
@@ -140,9 +136,6 @@ namespace Liminal.Net.Transports
         public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
         public int ConnectedClientCount => _sockets.Count;
 
-        /// <summary>
-        /// Lifecycle state for outbound frames.
-        /// </summary>
         public TContext OutboundContext { get; set; }
 
         protected ILiminalTransportFramingProvider<TContext> _framing;
@@ -159,7 +152,6 @@ namespace Liminal.Net.Transports
             _config.Validate();
 
             _framing = config.TransportFramingProvider as ILiminalTransportFramingProvider<TContext>;
-
             _totalHeaderSize = LiminalTransportHeader.GetHeaderSize(_framing);
 
             _clientIdResolver = _config.ClientIdResolver;
@@ -168,8 +160,8 @@ namespace Liminal.Net.Transports
 
         public virtual void StartServer(string ip, int port)
         {
-            IPAddress adress = string.IsNullOrEmpty(ip) ? IPAddress.Any : IPAddress.Parse(ip);
-            _listener = new TcpListener(adress, port);
+            IPAddress address = string.IsNullOrEmpty(ip) ? IPAddress.Any : IPAddress.Parse(ip);
+            _listener = new TcpListener(address, port);
             _listener.Start(100);
 
             _isServer = true;
@@ -184,12 +176,17 @@ namespace Liminal.Net.Transports
         {
             try
             {
+                _clientConnectCts?.Cancel();
+                _clientConnectCts?.Dispose();
+                _clientConnectCts = new CancellationTokenSource();
+
                 TcpClient client = new TcpClient();
                 client.NoDelay = true;
 
                 _isClient = true;
 
-                _ = Task.Run(() => TryToConnectAsync(client, (ip,port)));
+                var token = _clientConnectCts.Token;
+                _ = Task.Run(() => TryToConnectAsync(client, (ip, port), token), token);
             }
             catch (Exception ex)
             {
@@ -208,17 +205,24 @@ namespace Liminal.Net.Transports
                 return;
             }
 
-            if (!_isServer && _isConnected)
+            if (_isClient)
             {
+                _clientConnectCts?.Cancel();
+
                 ushort disconnectedId = _localClientId;
+                bool wasConnected = _isConnected;
                 _isConnected = false;
 
-                _onLocalClientDisconnected?.Invoke(disconnectedId);
-                Shutdown();
+                if (wasConnected)
+                {
+                    _onLocalClientDisconnected?.Invoke(disconnectedId);
+                }
 
-                LiminalLogger.Log($"[Transport] Disconnected from server.");
+                Shutdown();
+                LiminalLogger.Log("[Transport] Disconnected from server.");
             }
         }
+
         public virtual void Kick(ushort clientId)
         {
             if (!_isServer)
@@ -232,12 +236,11 @@ namespace Liminal.Net.Transports
 
             if (clientId == LocalClientId && LocalClientId != ILiminalTransport.SERVER_ID)
             {
-                LiminalLogger.LogWarning(
-                    $"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
-
+                LiminalLogger.LogWarning($"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
                 Shutdown();
                 return;
             }
+
             if (_sockets.TryGetValue(clientId, out var clientSocket))
             {
                 _onClientKicked?.Invoke(clientId);
@@ -257,8 +260,7 @@ namespace Liminal.Net.Transports
             }
             else
             {
-                LiminalLogger.LogError(
-                    $"[Transport] Couldn't find socket for client {clientId}");
+                LiminalLogger.LogError($"[Transport] Couldn't find socket for client {clientId}");
             }
         }
 
@@ -266,13 +268,17 @@ namespace Liminal.Net.Transports
         {
             if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
             {
-                return; // Already shutting down
+                return;
             }
 
             LiminalLogger.Log($"[Transport-Debug] Shutdown initiated by thread '{Thread.CurrentThread.Name ?? Thread.CurrentThread.ManagedThreadId.ToString()}'. Stack:\n{Environment.StackTrace}", LiminalLogger.LogLevel.Detailed);
 
             try
             {
+                _clientConnectCts?.Cancel();
+                _clientConnectCts?.Dispose();
+                _clientConnectCts = null;
+
                 _isConnected = false;
                 _isServer = false;
                 _isClient = false;
@@ -284,12 +290,7 @@ namespace Liminal.Net.Transports
 
                     if (_sockets.TryRemove(id, out var clientSocket))
                     {
-                        try
-                        {
-                            clientSocket.Close();
-                        }
-                        catch { }
-
+                        try { clientSocket.Close(); } catch { }
                         LiminalLogger.Log($"[Transport] Client {id} cleared.");
                     }
                 }
@@ -301,15 +302,11 @@ namespace Liminal.Net.Transports
 
                 if (_listener != null)
                 {
-                    try
-                    {
-                        _listener.Stop();
-                    }
-                    catch { }
+                    try { _listener.Stop(); } catch { }
                     _listener = null;
                 }
-                _onShutdown?.Invoke();
 
+                _onShutdown?.Invoke();
             }
             finally
             {
@@ -349,6 +346,7 @@ namespace Liminal.Net.Transports
 
         #region Sending
         private readonly ArrayPool<byte> _sendBytePool = ArrayPool<byte>.Create(1024 * 128, 50);
+
         public virtual void Send(Span<byte> data, ushort targetId, TransportFlags flags)
         {
             SendInternal(data, targetId, flags);
@@ -369,13 +367,12 @@ namespace Liminal.Net.Transports
             TContext contextSnapshot = OutboundContext;
 
             byte[] rentedBuffer = _sendBytePool.Rent(totalSize);
-
             Span<byte> fullPacket = rentedBuffer.AsSpan(0, totalSize);
             bool queued = false;
+
             try
             {
                 LiminalTransportHeader.WriteHeader(fullPacket, flags, data.Length, in contextSnapshot, _framing);
-
                 data.CopyTo(fullPacket.Slice(headerSize));
 
                 var packet = new OutboundPacket(rentedBuffer, totalSize);
@@ -383,7 +380,6 @@ namespace Liminal.Net.Transports
                 if (!sendState.Channel.Writer.TryWrite(packet))
                 {
                     LiminalLogger.LogWarning($"[Transport] Send queue rejected packet for client {targetId}. kicking.");
-
                     return;
                 }
 
@@ -402,7 +398,8 @@ namespace Liminal.Net.Transports
                 }
             }
         }
-        private async Task ProcessSendQueueAsync(ushort clientId,TcpClient client, ClientSendState state)
+
+        private async Task ProcessSendQueueAsync(ushort clientId, TcpClient client, ClientSendState state)
         {
             var reader = state.Channel.Reader;
             var stream = client.GetStream();
@@ -412,10 +409,7 @@ namespace Liminal.Net.Transports
             bool timeoutEnabled = timeoutSeconds > 0;
             TimeSpan timeoutSpan = TimeSpan.FromSeconds(timeoutSeconds);
 
-            IoDeadlineWatchdog sendWatchdog =
-                timeoutEnabled
-                    ? new IoDeadlineWatchdog(client)
-                    : null;
+            IoDeadlineWatchdog sendWatchdog = timeoutEnabled ? new IoDeadlineWatchdog(client) : null;
 
             try
             {
@@ -432,28 +426,17 @@ namespace Liminal.Net.Transports
 
                             try
                             {
-                                await stream.WriteAsync(
-                                    packet.Buffer.AsMemory(0, packet.Length))
-                                    .ConfigureAwait(false);
+                                await stream.WriteAsync(packet.Buffer.AsMemory(0, packet.Length), lifetimeToken).ConfigureAwait(false);
                             }
-                            catch (Exception ex) when (
-                                ex is ObjectDisposedException ||
-                                ex is IOException ||
-                                ex is SocketException)
+                            catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
                             {
                                 if (sendWatchdog != null && sendWatchdog.TimedOut)
                                 {
-                                    LiminalLogger.LogWarning(
-                                        $"[Transport] Send timed out on client {clientId} " +
-                                        $"(exceeded {timeoutSeconds}s).");
-
+                                    LiminalLogger.LogWarning($"[Transport] Send timed out on client {clientId} (exceeded {timeoutSeconds}s).");
                                     OnTransportDisconnectReason?.Invoke(clientId, DisconnectReason.Timeout, $"Send timed out ({timeoutSeconds}s).");
 
-                                    if (IsServer)
-                                        Kick(clientId);
-                                    else
-                                        Shutdown();
-
+                                    if (IsServer) Kick(clientId);
+                                    else Shutdown();
                                     return;
                                 }
 
@@ -467,9 +450,7 @@ namespace Liminal.Net.Transports
 
                             if ((_telemetryConfig?.Flags & TelemetryFlags.ByteCounting) != 0)
                             {
-                                Interlocked.Add(
-                                    ref _totalBytesOutbound,
-                                    packet.Length);
+                                Interlocked.Add(ref _totalBytesOutbound, packet.Length);
                             }
 
                             packetCompleted = true;
@@ -483,30 +464,22 @@ namespace Liminal.Net.Transports
                             return;
                     }
 
-                    // Flush after draining the channel.
                     if (timeoutEnabled)
                         sendWatchdog.Arm(timeoutSpan);
 
                     try
                     {
-                        await stream.FlushAsync()
-                            .ConfigureAwait(false);
+                        await stream.FlushAsync(lifetimeToken).ConfigureAwait(false);
                     }
-                    catch (Exception ex) when (ex is ObjectDisposedException || ex is IOException || ex is SocketException)
+                    catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
                     {
                         if (sendWatchdog != null && sendWatchdog.TimedOut)
                         {
-                            LiminalLogger.LogWarning(
-                                $"[Transport] Send flush timed out on client {clientId} " +
-                                $"(exceeded {timeoutSeconds}s).");
-
+                            LiminalLogger.LogWarning($"[Transport] Send flush timed out on client {clientId} (exceeded {timeoutSeconds}s).");
                             OnTransportDisconnectReason?.Invoke(clientId, DisconnectReason.Timeout, $"Send flush timed out ({timeoutSeconds}s).");
 
-                            if (IsServer)
-                                Kick(clientId);
-                            else
-                                Shutdown();
-
+                            if (IsServer) Kick(clientId);
+                            else Shutdown();
                             return;
                         }
 
@@ -519,39 +492,24 @@ namespace Liminal.Net.Transports
                     }
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) { }
+            catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
             {
-                // Normal queue lifetime cancellation during teardown.
-            }
-            catch (Exception ex) when (
-                ex is ObjectDisposedException ||
-                ex is IOException ||
-                ex is SocketException)
-            {
-                LiminalLogger.LogWarning(
-                    $"[Transport] Outbound writer aborted on client {clientId}: " +
-                    $"{ex.Message}");
+                LiminalLogger.LogWarning($"[Transport] Outbound writer aborted on client {clientId}: {ex.Message}");
 
-                if (IsServer)
-                    Kick(clientId);
-                else
-                    Shutdown();
+                if (IsServer) Kick(clientId);
+                else Shutdown();
             }
             catch (Exception ex)
             {
-                LiminalLogger.LogError(
-                    $"[Transport] Unexpected outbound writer failure on {clientId}: " +
-                    $"{ex.Message}");
+                LiminalLogger.LogError($"[Transport] Unexpected outbound writer failure on {clientId}: {ex.Message}");
 
-                if (IsServer)
-                    Kick(clientId);
-                else
-                    Shutdown();
+                if (IsServer) Kick(clientId);
+                else Shutdown();
             }
             finally
             {
-                if (sendWatchdog != null)
-                    sendWatchdog.Dispose();
+                sendWatchdog?.Dispose();
 
                 while (reader.TryRead(out OutboundPacket discarded))
                 {
@@ -560,25 +518,39 @@ namespace Liminal.Net.Transports
             }
         }
 
-        protected async Task TryToConnectAsync(TcpClient client, (string ip, int port) connectionInfo)
+        protected async Task TryToConnectAsync(TcpClient client, (string ip, int port) connectionInfo, CancellationToken cancelToken = default)
         {
             try
             {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancelToken);
 
-                using (cts.Token.Register(() => { try { client.Close(); } catch { } }))
+                using (linkedCts.Token.Register(() => { try { client.Close(); } catch { } }))
                 {
-                    await client.ConnectAsync(connectionInfo.ip, connectionInfo.port);
+                    await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, linkedCts.Token).ConfigureAwait(false);
+                }
+
+                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                {
+                    try { client.Close(); } catch { }
+                    return;
                 }
 
                 _onHandshakeInitialized?.Invoke();
 
-                HandshakeResult result = await ClientHandshaker(client, _config);
+                HandshakeResult result = await ClientHandshaker(client, _config).ConfigureAwait(false);
+
+                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                {
+                    try { client.Close(); } catch { }
+                    return;
+                }
 
                 if (result.Success)
                 {
                     _localClientId = result.ClientId;
                     _isConnected = true;
+
                     PromoteLocalClient(_localClientId, client);
                 }
                 else
@@ -591,6 +563,10 @@ namespace Liminal.Net.Transports
                     Shutdown();
                 }
             }
+            catch (OperationCanceledException)
+            {
+                try { client.Close(); } catch { }
+            }
             catch (Exception ex)
             {
                 try { client.Close(); } catch { }
@@ -601,7 +577,6 @@ namespace Liminal.Net.Transports
         #endregion
 
         #region Receiving
-
         private int _totalConnections = 0;
 
         protected async Task AcceptConnectionsAsync(TcpListener listener)
@@ -614,7 +589,7 @@ namespace Liminal.Net.Transports
 
                 try
                 {
-                    client = await listener.AcceptTcpClientAsync();
+                    client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
                     client.NoDelay = true;
 
                     var acceptedClient = client;
@@ -626,9 +601,11 @@ namespace Liminal.Net.Transports
                         {
                             _onHandshakeInitialized?.Invoke();
 
-                            HandshakeResult result = await ServerHandshaker(
+                            var pipeline = new TcpHandshakePipeline(_clientIdResolver, _config);
+
+                            HandshakeResult result = await pipeline.TryVerifyClientAsync(
                                 acceptedClient,
-                                _config,
+                                _config.Version,
                                 () =>
                                 {
                                     while (true)
@@ -643,15 +620,15 @@ namespace Liminal.Net.Transports
                                             return true;
                                         }
                                     }
+                                },
+                                assignedId =>
+                                {
+                                    PromoteClient(assignedId, acceptedClient);
+                                    promoted = true;
                                 }
-                            );
+                            ).ConfigureAwait(false);
 
-                            if (result.Success)
-                            {
-                                PromoteClient(result.ClientId, acceptedClient);
-                                promoted = true;
-                            }
-                            else
+                            if (!result.Success)
                             {
                                 LiminalLogger.LogWarning($"[Transport] Handshake rejected client: {result.FailureReason} - {result.FailureMessage}");
                                 try { acceptedClient.Close(); } catch { }
@@ -718,8 +695,7 @@ namespace Liminal.Net.Transports
 
             _sockets.AddOrUpdate(clientId, client, (key, old) =>
             {
-                LiminalLogger.LogWarning(
-                    $"[Transport] Replacing existing socket for client {clientId}");
+                LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
 
                 if (TryClaimDisconnect(old))
                 {
@@ -727,60 +703,40 @@ namespace Liminal.Net.Transports
                 }
 
                 try { old.Close(); } catch { }
-
                 return client;
             });
 
-
             _clientIdResolver.ConfirmRegistration(clientId);
 
-            _onClientConnected?.Invoke(clientId);
-
             sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
-
             _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
 
+            _onClientConnected?.Invoke(clientId);
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
+
         private void PromoteLocalClient(ushort assignedId, TcpClient client)
         {
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
 
             var sendState = new ClientSendState();
             _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
-
             _sockets[ILiminalTransport.SERVER_ID] = client;
 
             sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(ILiminalTransport.SERVER_ID, client, sendState));
-
             _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client, sendState));
 
             _onLocalClientConnected?.Invoke(assignedId);
-
             LiminalLogger.Log($"[Transport] Successfully connected to server. Local ID: {assignedId}");
-        }
-
-        private enum LoopExitReason
-        {
-            GracefulClosure,
-            BufferOverflow,
-            MalformedHeader,
-            InvalidPayloadSize,
-            Timeout,
-            SocketError
         }
 
         private async Task ReceiveLoop(ushort incomingId, TcpClient client, ClientSendState ownedSendState)
         {
-            // Fixed for the lifetime of this receive loop.
-            using var ingestBuffer = new LiminalNativeBuffer(
-                _config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch));
-
+            using var ingestBuffer = new LiminalNativeBuffer(_config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch));
             var stream = client.GetStream();
             int bytesInBuffer = 0;
 
-            bool isHostSelfLoop = _isServer && _isClient &&
-                (incomingId == ILiminalTransport.SERVER_ID || incomingId == _localClientId);
+            bool isHostSelfLoop = _isServer && _isClient && (incomingId == ILiminalTransport.SERVER_ID || incomingId == _localClientId);
 
             int timeoutSeconds = (int)_config.ReceiveResponseTimeout;
             bool timeoutEnabled = timeoutSeconds > 0 && !isHostSelfLoop;
@@ -790,11 +746,7 @@ namespace Liminal.Net.Transports
 
             try
             {
-                try
-                {
-                    client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                }
-                catch { }
+                try { client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true); } catch { }
 
                 while (client.Connected && _isConnected)
                 {
@@ -818,7 +770,7 @@ namespace Liminal.Net.Transports
                         {
                             read = await stream.ReadAsync(receiveTarget).ConfigureAwait(false);
                         }
-                        catch (Exception ex) when (ex is ObjectDisposedException || ex is IOException || ex is SocketException)
+                        catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
                         {
                             if (recvWatchdog.TimedOut)
                             {
@@ -827,7 +779,6 @@ namespace Liminal.Net.Transports
                                 Kick(incomingId);
                                 return;
                             }
-
                             throw;
                         }
                         finally
@@ -840,8 +791,7 @@ namespace Liminal.Net.Transports
                         read = await stream.ReadAsync(receiveTarget).ConfigureAwait(false);
                     }
 
-                    if (read <= 0)
-                        break;
+                    if (read <= 0) break;
 
                     if ((_telemetryConfig?.Flags & TelemetryFlags.ByteCounting) != 0)
                         Interlocked.Add(ref _totalBytesInbound, read);
@@ -853,7 +803,7 @@ namespace Liminal.Net.Transports
                         break;
                 }
             }
-            catch (Exception ex) when (ex is ObjectDisposedException || ex is IOException || ex is SocketException)
+            catch (Exception ex) when (ex is ObjectDisposedException or IOException or SocketException)
             {
                 if (recvWatchdog == null || !recvWatchdog.TimedOut)
                     LiminalLogger.LogWarning($"[Transport-Debug] Socket closed/dropped on {incomingId}. Reason: {ex.GetType().Name} - {ex.Message}");
@@ -901,9 +851,6 @@ namespace Liminal.Net.Transports
             }
         }
 
-        /// <summary>
-        /// Helper class to help us migrate for previous versions of C#
-        /// </summary>
         private void ProcessIngestBufferSynchronous(ushort incomingId, LiminalNativeBuffer ingestBuffer, ref int bytesInBuffer)
         {
             Span<byte> bufferSpan = ingestBuffer.GetSpan();
@@ -987,7 +934,6 @@ namespace Liminal.Net.Transports
                 bytesInBuffer = remaining;
             }
         }
-
         #endregion
 
         #region Telemetry
@@ -996,14 +942,16 @@ namespace Liminal.Net.Transports
         private long _totalBytesOutbound;
 
         public Func<long> NextTickProvider { get; set; }
+
         public GlobalTransportTelemetrySnapshot GetGlobalTransportSnapshot()
         {
             return new GlobalTransportTelemetrySnapshot(
-                    totalBytesInbound: Volatile.Read(ref _totalBytesInbound),
-                    totalBytesOutbound: Volatile.Read(ref _totalBytesOutbound),
-                    packetLossRate: 0.0f // We have no way to reach internal status of the OS stack so we can't calculate this in tcp
-                );
+                totalBytesInbound: Volatile.Read(ref _totalBytesInbound),
+                totalBytesOutbound: Volatile.Read(ref _totalBytesOutbound),
+                packetLossRate: 0.0f
+            );
         }
+
         public void InitializeConfig(LiminalTelemetryConfig config)
         {
             _telemetryConfig = config;
@@ -1018,7 +966,7 @@ namespace Liminal.Net.Transports
             return _wireRttMap.TryGetValue(clientId, out rttMs);
         }
 
-        private static readonly long WirePingTimeoutTicks = Stopwatch.Frequency * 3; // 3 sec timeout
+        private static readonly long WirePingTimeoutTicks = Stopwatch.Frequency * 3;
 
         public void SendWirePing(ushort targetId)
         {
@@ -1042,7 +990,6 @@ namespace Liminal.Net.Transports
             uint seq = unchecked(++_wireSeqCounter);
             _wireInFlight[targetId] = (seq, now);
 
-            // [0.4] Seq | [4.12] SentTicks | [12.16] ServerCountdownMs
             Span<byte> pingPayload = stackalloc byte[16];
             BinaryPrimitives.WriteUInt32LittleEndian(pingPayload.Slice(0, 4), seq);
             BinaryPrimitives.WriteInt64LittleEndian(pingPayload.Slice(4, 8), now);
@@ -1054,9 +1001,6 @@ namespace Liminal.Net.Transports
         private double _serverCountdownSnapshotMs;
         private long _serverCountdownReceivedTicks;
 
-        /// <summary>
-        /// Real-time server countdown accounting for elapsed time since the last pong.
-        /// </summary>
         public double ServerCountdownMs
         {
             get
@@ -1095,7 +1039,6 @@ namespace Liminal.Net.Transports
                 double tickIntervalMs = 1000.0 / (_config?.TickRate ?? 20);
                 double owtMs = rttMs / 2.0;
 
-                // Adjust for one-way wire transit
                 double adjustedCountdown = (serverRemainingMs - owtMs) % tickIntervalMs;
                 if (adjustedCountdown < 0) adjustedCountdown += tickIntervalMs;
 
@@ -1104,7 +1047,6 @@ namespace Liminal.Net.Transports
             }
         }
         #endregion
-
 
         private readonly struct OutboundPacket
         {
@@ -1178,9 +1120,7 @@ namespace Liminal.Net.Transports
                     _armed = true;
                     Volatile.Write(ref _timedOut, 0);
 
-                    _deadlineTicks = Stopwatch.GetTimestamp() +
-                        (long)(timeout.TotalSeconds * Stopwatch.Frequency);
-
+                    _deadlineTicks = Stopwatch.GetTimestamp() + (long)(timeout.TotalSeconds * Stopwatch.Frequency);
                     _timer.Change(timeout, Timeout.InfiniteTimeSpan);
                 }
             }
@@ -1254,4 +1194,3 @@ namespace Liminal.Net.Transports
         }
     }
 }
-

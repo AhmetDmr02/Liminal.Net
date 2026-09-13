@@ -26,7 +26,7 @@ namespace Liminal.Net.Handshakes
             _config = config;
         }
 
-        public virtual async Task<HandshakeResult> TryVerifyClientAsync(TcpClient client, ushort serverVersion, Func<bool> canAcceptConnection)
+        public virtual async Task<HandshakeResult> TryVerifyClientAsync(TcpClient client, ushort serverVersion, Func<bool> canAcceptConnection, Action<ushort> onClientValidated = null)
         {
             try
             {
@@ -34,13 +34,12 @@ namespace Liminal.Net.Handshakes
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_timeoutSeconds));
 
                 byte[] header = new byte[8];
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
 
                 int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
                 ushort firstPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>();
 
-                // Protocol / security violations drop with forceRst: true
                 if (length <= 0 || length > _maxHandshakeSize || packetId != firstPacketId)
                 {
                     Drop(client, $"Security Violation: ID {packetId}, Length {length}", forceRst: true);
@@ -48,7 +47,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 byte[] payload = new byte[length];
-                await stream.LiminalReadExactlyAsync(payload, 0, length, cts.Token);
+                await stream.LiminalReadExactlyAsync(payload, 0, length, cts.Token).ConfigureAwait(false);
 
                 var clientInfo = DeserializeSafe<ConnectionHandshakePacketClient>(payload, out bool success);
                 if (!success)
@@ -59,21 +58,21 @@ namespace Liminal.Net.Handshakes
 
                 if (clientInfo.ClientVersion != serverVersion)
                 {
-                    await SendRejectionAsync(stream, DisconnectReason.VersionMismatch, $"Server requires v{serverVersion}");
+                    await SendRejectionAsync(stream, DisconnectReason.VersionMismatch, $"Server requires v{serverVersion}").ConfigureAwait(false);
                     Drop(client, $"Version Mismatch: {clientInfo.ClientVersion}");
                     return HandshakeResult.Fail(DisconnectReason.VersionMismatch, $"Server version: {serverVersion}");
                 }
 
                 if (clientInfo.PacketRegistryHash != LiminalPacketLibrary.RegistryHash)
                 {
-                    await SendRejectionAsync(stream, DisconnectReason.ProtocolViolation, "Packet registry mismatch.");
+                    await SendRejectionAsync(stream, DisconnectReason.ProtocolViolation, "Packet registry mismatch.").ConfigureAwait(false);
                     Drop(client, "Packet Registry Mismatch");
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Packet Registry Mismatch");
                 }
 
                 if (!canAcceptConnection())
                 {
-                    await SendRejectionAsync(stream, DisconnectReason.ServerFull, "Server reached maximum player capacity.");
+                    await SendRejectionAsync(stream, DisconnectReason.ServerFull, "Server reached maximum player capacity.").ConfigureAwait(false);
                     Drop(client, "Server full");
                     return HandshakeResult.Fail(DisconnectReason.ServerFull, "Server is full");
                 }
@@ -82,7 +81,7 @@ namespace Liminal.Net.Handshakes
                 assignedId = assignedId == 0 ? _resolver.GenerateClientId() : assignedId;
                 if (assignedId == 0)
                 {
-                    await SendRejectionAsync(stream, DisconnectReason.Custom, "Unable to assign Client ID.");
+                    await SendRejectionAsync(stream, DisconnectReason.Custom, "Unable to assign Client ID.").ConfigureAwait(false);
                     Drop(client, "Unable to Assign Client ID");
                     return HandshakeResult.Fail(DisconnectReason.Custom, "Failed to allocate ID");
                 }
@@ -97,10 +96,14 @@ namespace Liminal.Net.Handshakes
                 };
 
                 ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
-                await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token);
+                await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token).ConfigureAwait(false);
 
-                // Wait for Client ACK
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
+                ushort fourthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
+                var readyPacket = new ConnectionHandshakeReadyConfirmed();
+                await SendPacketAsync(stream, fourthPacketId, readyPacket, cts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
+
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
                 length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
@@ -112,7 +115,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 byte[] ackPayload = new byte[length];
-                await stream.LiminalReadExactlyAsync(ackPayload, 0, length, cts.Token);
+                await stream.LiminalReadExactlyAsync(ackPayload, 0, length, cts.Token).ConfigureAwait(false);
 
                 var ack = DeserializeSafe<ConnectionHandshakeClientAck>(ackPayload, out success);
                 if (!success || !ack.Ack || ack.ClientID != assignedId)
@@ -120,6 +123,9 @@ namespace Liminal.Net.Handshakes
                     Drop(client, "Client Rejected ID/ACK", forceRst: true);
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Invalid ACK");
                 }
+
+                // Both endpoints are confirmed ready. Promote on server before raising events.
+                onClientValidated?.Invoke(assignedId);
 
                 return HandshakeResult.Ok(assignedId);
             }
@@ -130,8 +136,6 @@ namespace Liminal.Net.Handshakes
             }
             catch (ObjectDisposedException)
             {
-                // the timeout CTS's internal timer fired at nearly the
-                // same instant the handshake completed and disposed it.
                 Drop(client, "Handshake Timeout (CTS teardown race)");
                 return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out");
             }
@@ -156,10 +160,10 @@ namespace Liminal.Net.Handshakes
                     PacketRegistryHash = LiminalPacketLibrary.RegistryHash
                 };
 
-                await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token);
+                await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token).ConfigureAwait(false);
 
                 byte[] header = new byte[8];
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
 
                 int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
@@ -172,7 +176,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 byte[] payload = new byte[length];
-                await stream.LiminalReadExactlyAsync(payload, 0, length, cts.Token);
+                await stream.LiminalReadExactlyAsync(payload, 0, length, cts.Token).ConfigureAwait(false);
 
                 var serverResponse = DeserializeSafe<ConnectionHandshakePacketServer>(payload, out bool success);
                 if (!success)
@@ -181,7 +185,6 @@ namespace Liminal.Net.Handshakes
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Malformed server response");
                 }
 
-                // Explicit server rejection
                 if (serverResponse.AssignedClientID == 0)
                 {
                     Drop(client, $"Server rejected connection: {serverResponse.RejectReason} ({serverResponse.RejectMessage})");
@@ -196,13 +199,31 @@ namespace Liminal.Net.Handshakes
 
                 ushort assignedId = serverResponse.AssignedClientID;
 
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
+                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+
+                ushort fourthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
+                if (packetId != fourthPacketId || length < 0 || length > _maxHandshakeSize)
+                {
+                    Drop(client, $"Protocol Violation: Expected ReadyConfirmed (ID {fourthPacketId}, Length {length})", forceRst: true);
+                    return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Ready violation");
+                }
+
+                if (length > 0)
+                {
+                    byte[] readyPayload = new byte[length];
+                    await stream.LiminalReadExactlyAsync(readyPayload, 0, length, cts.Token).ConfigureAwait(false);
+                }
+
                 ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
                 var ack = new ConnectionHandshakeClientAck
                 {
                     ClientID = assignedId,
                     Ack = true
                 };
-                await SendPacketAsync(stream, thirdPacketId, ack, cts.Token);
+                await SendPacketAsync(stream, thirdPacketId, ack, cts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 return HandshakeResult.Ok(assignedId);
             }
