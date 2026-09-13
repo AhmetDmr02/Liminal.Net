@@ -16,7 +16,7 @@ namespace Liminal.Net.Tests
     {
         private LiminalNetworkManager _serverManager;
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
-        private LiminalTransportConfig _serverConfig;
+        private LiminalNetworkConfig _serverConfig;
 
         private static int _portCounter = 8880;
         private int _currentTestPort;
@@ -27,7 +27,7 @@ namespace Liminal.Net.Tests
             _currentTestPort = Interlocked.Increment(ref _portCounter);
             _clientManagers = new ConcurrentBag<LiminalNetworkManager>();
 
-            _serverConfig = new LiminalTransportConfig
+            _serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -59,7 +59,7 @@ namespace Liminal.Net.Tests
 
         private LiminalNetworkManager CreateAndStartClient(ILiminalTransport transport, uint tickRate = 20)
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -85,13 +85,13 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test01_ProportionalCushion_ScalesWithTickRate()
         {
-            var config20Hz = new LiminalTransportConfig { TickRate = 20 };
+            var config20Hz = new LiminalNetworkConfig { TickRate = 20 };
             var aligner20Hz = new LiminalPhaseAligner(config20Hz);
 
-            var config30Hz = new LiminalTransportConfig { TickRate = 30 };
+            var config30Hz = new LiminalNetworkConfig { TickRate = 30 };
             var aligner30Hz = new LiminalPhaseAligner(config30Hz);
 
-            var config60Hz = new LiminalTransportConfig { TickRate = 60 };
+            var config60Hz = new LiminalNetworkConfig { TickRate = 60 };
             var aligner60Hz = new LiminalPhaseAligner(config60Hz);
 
             Assert.That(aligner20Hz.GetProportionalCushionMs(), Is.EqualTo(20.0).Within(0.001));
@@ -102,7 +102,7 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test02_PhaseAligner_DeadbandPreventsMicroAdjustments()
         {
-            var config = new LiminalTransportConfig { TickRate = 20 };
+            var config = new LiminalNetworkConfig { TickRate = 20 };
             var aligner = new LiminalPhaseAligner(config);
 
             long adjustment = aligner.CalculateSlewAdjustment(
@@ -117,7 +117,7 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test03_PhaseAligner_ClampsToMaxSlewLimit()
         {
-            var config = new LiminalTransportConfig { TickRate = 20 };
+            var config = new LiminalNetworkConfig { TickRate = 20 };
             var aligner = new LiminalPhaseAligner(config);
 
             long oneMsTicks = Stopwatch.Frequency / 1000;
@@ -141,7 +141,7 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test04_Ticker_ApplySlew_StretchesAndCompressesInterval()
         {
-            var config = new LiminalTransportConfig { TickRate = 20 };
+            var config = new LiminalNetworkConfig { TickRate = 20 };
             var ticker = new LiminalTicker(config);
 
             long oneMsTicks = Stopwatch.Frequency / 1000;

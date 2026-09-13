@@ -28,7 +28,7 @@ namespace Liminal.Net.Core
         private readonly ConcurrentDictionary<ushort, LiminalSession> _disconnectingSessions = new();
 
         private readonly ILiminalTransport _transport;
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
         private readonly LiminalPacketFramerPipeline _pipeline;
         private readonly ArrayPool<byte> _privatePool;
         private readonly ArrayPool<byte> _recoveryPacketPool;
@@ -48,7 +48,7 @@ namespace Liminal.Net.Core
 
         private readonly object _lifecycleLock = new();
 
-        public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalTransportConfig config, LiminalPacketFramerPipeline pipeline)
+        public LiminalSessionManager(ILiminalTransport transport, LiminalPacketInterpreter interpreter, LiminalNetworkConfig config, LiminalPacketFramerPipeline pipeline)
         {
             _transport = transport;
             _config = config;

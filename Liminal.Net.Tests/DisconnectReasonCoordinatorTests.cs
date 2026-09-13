@@ -20,7 +20,7 @@ namespace Liminal.Net.Tests
     {
         private LiminalNetworkManager _serverManager;
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
-        private LiminalTransportConfig _serverConfig;
+        private LiminalNetworkConfig _serverConfig;
 
         // Prevent port exhaustion between tests
         private static int _portCounter = 7910;
@@ -32,7 +32,7 @@ namespace Liminal.Net.Tests
             _currentTestPort = Interlocked.Increment(ref _portCounter);
             _clientManagers = new();
 
-            _serverConfig = new LiminalTransportConfig
+            _serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -58,7 +58,7 @@ namespace Liminal.Net.Tests
 
         private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -266,7 +266,7 @@ namespace Liminal.Net.Tests
             _serverManager = new LiminalNetworkManager(new TcpTransport<SecureFramingContext>(), _serverConfig);
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
-            var clientConfig = new LiminalTransportConfig
+            var clientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -402,7 +402,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected, 2000), Is.True);
 
             // Prepare second client that should get rejected due to capacity
-            var client2Config = new LiminalTransportConfig
+            var client2Config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -449,7 +449,7 @@ namespace Liminal.Net.Tests
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
-            var outdatedClientConfig = new LiminalTransportConfig
+            var outdatedClientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -494,7 +494,7 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
-            var clientConfig = new LiminalTransportConfig
+            var clientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -560,7 +560,7 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
-            var clientConfig = new LiminalTransportConfig
+            var clientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,

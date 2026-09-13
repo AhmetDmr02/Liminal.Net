@@ -5,7 +5,7 @@ namespace Liminal.Net.Core
 {
     public class LiminalPhaseAligner
     {
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
 
         // Base reference: 20ms cushion on a 50ms tick (20 Hz) = 40% (0.4f)
         private const float BaseCushionRatio = 20f / 50f;
@@ -13,7 +13,7 @@ namespace Liminal.Net.Core
         //Max slew per tick: 1ms in stopwatch ticks
         private readonly long _maxSlewPerTickTicks;
 
-        public LiminalPhaseAligner(LiminalTransportConfig config)
+        public LiminalPhaseAligner(LiminalNetworkConfig config)
         {
             _config = config;
             _maxSlewPerTickTicks = Stopwatch.Frequency / 1000;

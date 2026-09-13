@@ -31,7 +31,7 @@ namespace Liminal.Net
             Console.Title = "Liminal.Net Console";
             LiminalLogger.Log("Initializing...");
 
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = 7777,
@@ -117,7 +117,7 @@ namespace Liminal.Net
             Console.Title = $"{roleLabel}Wire: {wireText} | E2E: {e2eText} | Sent: {_totalSent} | Recv: {Interlocked.Read(ref _totalReceived)}";
         }
 
-        private static void ProcessCommand(string input, LiminalTransportConfig config)
+        private static void ProcessCommand(string input, LiminalNetworkConfig config)
         {
             if (string.IsNullOrWhiteSpace(input)) return;
             string[] args = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);

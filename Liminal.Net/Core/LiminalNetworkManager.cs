@@ -24,7 +24,7 @@ namespace Liminal.Net.Core
         private readonly ILiminalTransport _transport;
         public ILiminalTransport Transport => _transport;
 
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
 
         public LiminalSessionManager SessionManager { get; private set; }
         public LiminalPacketInterpreter Interpreter { get; private set; }
@@ -46,10 +46,17 @@ namespace Liminal.Net.Core
 
         public static event Action OnManagerShutdown;
 
+        public static event Action OnPreFlush;
+        public static event Action OnPostFlush;
+
+        public static event Action OnPrePoll;
+        public static event Action OnPostPoll;
 
         public ushort localID => _transport.LocalClientId;
 
-        public LiminalNetworkManager(ILiminalTransport transport, LiminalTransportConfig config,
+        public Liminal.Net.SyncVar.SyncVarManager SyncVarManager { get; private set; }
+
+        public LiminalNetworkManager(ILiminalTransport transport, LiminalNetworkConfig config,
         LiminalTelemetryConfig telemetryConfig = null)
         {
             Instance = this;
@@ -99,8 +106,9 @@ namespace Liminal.Net.Core
             }
 
             _phaseAligner = new LiminalPhaseAligner(_config);
-
             TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
+
+            SyncVarManager = Liminal.Net.SyncVar.SyncVarManager.Initialize(_config);
 
             OnManagerPostInitialize?.Invoke();
         }
@@ -136,6 +144,7 @@ namespace Liminal.Net.Core
 
             //_ticker = null;
             //SessionManager = null;
+            SyncVarManager = null;
 
             _config.ClientIdResolver.ResetResolver();
         }
@@ -228,16 +237,27 @@ namespace Liminal.Net.Core
         {
             var sm = SessionManager;
 
+            OnPrePoll?.Invoke();
             sm?.Poll();
+            OnPostPoll?.Invoke();
+
+            OnPreFlush?.Invoke();
             sm?.Flush();
+            OnPostFlush?.Invoke();
         }
 
         private void ServerTick()
         {
             var sm = SessionManager;
 
+
+            OnPrePoll?.Invoke();
             sm?.Poll();
+            OnPostPoll?.Invoke();
+
+            OnPreFlush?.Invoke();
             sm?.Flush();
+            OnPostFlush?.Invoke();
         }
 
         private void ClientBackgroundTick()
@@ -245,7 +265,9 @@ namespace Liminal.Net.Core
             //For now
             var sm = SessionManager;
 
+            OnPrePoll?.Invoke();
             sm?.Poll();
+            OnPostPoll?.Invoke();
 
             if (Role == NetworkRole.Client && _phaseAligner != null && TelemetryManager != null)
             {
@@ -262,7 +284,9 @@ namespace Liminal.Net.Core
                 }
             }
 
+            OnPreFlush?.Invoke();
             sm?.Flush();
+            OnPostFlush?.Invoke();
         }
 
         /// <summary>
@@ -272,7 +296,10 @@ namespace Liminal.Net.Core
         {
             if (Role == NetworkRole.Client)
             {
+
+                OnPrePoll?.Invoke();
                 SessionManager?.Poll();
+                OnPostFlush?.Invoke();
             }
         }
 

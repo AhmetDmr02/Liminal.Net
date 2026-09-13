@@ -18,12 +18,12 @@ namespace Liminal.Net.Tests
     [TestFixture]
     public class LiminalPacketFragmentorTests
     {
-        private LiminalTransportConfig _defaultConfig;
+        private LiminalNetworkConfig _defaultConfig;
 
         [SetUp]
         public void Setup()
         {
-            _defaultConfig = new LiminalTransportConfig
+            _defaultConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = 9050,
@@ -514,7 +514,7 @@ namespace Liminal.Net.Tests
             var serverFramer = new SecureFramingProvider();
             var clientFramer = new SecureFramingProvider();
 
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = port,
@@ -526,7 +526,7 @@ namespace Liminal.Net.Tests
                 HandshakeTimeout = 5
             };
 
-            var clientConfig = new LiminalTransportConfig
+            var clientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = port,
@@ -618,12 +618,12 @@ namespace Liminal.Net.Tests
             public bool IsServer { get; set; } = false;
             public bool IsClient => !IsServer;
             public bool IsConnected => true;
-            public LiminalTransportConfig Config => null;
+            public LiminalNetworkConfig Config => null;
             public int ConnectedClientCount => ConnectedClients.Count;
 
             public bool IsClientConnected(ushort clientId) => ConnectedClients.Contains(clientId);
 
-            public void InitializeTransport(LiminalTransportConfig config) { }
+            public void InitializeTransport(LiminalNetworkConfig config) { }
             public void StartServer(string ip, int port) => IsServer = true;
             public void StartClient(string ip, int port) => IsServer = false;
             public void Disconnect() { }

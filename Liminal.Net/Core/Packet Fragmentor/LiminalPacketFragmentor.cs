@@ -16,7 +16,7 @@ namespace Liminal.Net.Core
         public const int FragmentHeaderSize = 6; // ReliableSeq(2) + FragmentIndex(2) + TotalFragments(2)
 
         private readonly ILiminalTransport _transport;
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
         private readonly int _mtu;
         private readonly int _transportHeaderSize;
         private readonly ArrayPool<byte> _assemblyPool;
@@ -35,7 +35,7 @@ namespace Liminal.Net.Core
 
         public event DataReceivedHandler OnMessageReassembled;
 
-        public LiminalPacketFragmentor(ILiminalTransport transport, LiminalTransportConfig config, int mtu = 1200)
+        public LiminalPacketFragmentor(ILiminalTransport transport, LiminalNetworkConfig config, int mtu = 1200)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             _config = config ?? throw new ArgumentNullException(nameof(config));

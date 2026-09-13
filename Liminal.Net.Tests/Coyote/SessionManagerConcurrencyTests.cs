@@ -16,7 +16,7 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestSessionManagerFullPipelineChaos()
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 MaxPacketSizePerBatch = 64,
                 MaxPacketCount = 10,
@@ -104,7 +104,7 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestInterpreterSubscriptionRace()
         {
-            var config = new LiminalTransportConfig();
+            var config = new LiminalNetworkConfig();
             var interpreter = new LiminalPacketInterpreter(config);
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
@@ -178,7 +178,7 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task HuntGhostSubscriptionRace()
         {
-            var config = new LiminalTransportConfig();
+            var config = new LiminalNetworkConfig();
             var interpreter = new LiminalPacketInterpreter(config);
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
@@ -247,7 +247,7 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestHiccupSharedPoolContentionAcrossSessions()
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 MaxPacketSizePerBatch = 64,
                 MaxPacketCount = 10,
@@ -358,7 +358,7 @@ namespace Liminal.Net.Tests
         [Microsoft.Coyote.SystematicTesting.Test]
         public static void Coyote_ExecuteFragmentorStress()
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 TickRate = 60,
@@ -407,7 +407,7 @@ namespace Liminal.Net.Tests
         [Microsoft.Coyote.SystematicTesting.Test]
         public static async Task Coyote_SessionManager_DisposeRace_ConcurrentWithTraffic()
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 MaxPacketSizePerBatch = 4096,
                 MaxPacketCount = 512,
@@ -506,7 +506,7 @@ namespace Liminal.Net.Tests
         [Microsoft.Coyote.SystematicTesting.Test]
         public static async Task Coyote_SessionManager_ConcurrentThroughputConservation()
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 MaxPacketSizePerBatch = 4096,
                 MaxPacketCount = 512,
@@ -704,7 +704,7 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task Coyote_Interpreter_ReentrantDispatchAndTeardownRace()
         {
-            var config = new LiminalTransportConfig();
+            var config = new LiminalNetworkConfig();
             var interpreter = new LiminalPacketInterpreter(config);
 
             ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();

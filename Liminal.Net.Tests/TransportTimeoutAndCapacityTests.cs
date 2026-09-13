@@ -18,7 +18,7 @@ namespace Liminal.Net.Tests
     {
         private LiminalNetworkManager _serverManager;
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
-        private LiminalTransportConfig _serverConfig;
+        private LiminalNetworkConfig _serverConfig;
 
         // Prevent port exhaustion between tests
         private static int _portCounter = 7850;
@@ -30,7 +30,7 @@ namespace Liminal.Net.Tests
             _currentTestPort = Interlocked.Increment(ref _portCounter);
             _clientManagers = new();
 
-            _serverConfig = new LiminalTransportConfig
+            _serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -56,7 +56,7 @@ namespace Liminal.Net.Tests
 
         private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -77,7 +77,7 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test28_ServerReceiveTimeout_SilentClient_GetsKicked()
         {
-            var serverTimeoutConfig = new LiminalTransportConfig
+            var serverTimeoutConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -114,7 +114,7 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
-            var clientTimeoutConfig = new LiminalTransportConfig
+            var clientTimeoutConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -145,7 +145,7 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test30_ServerSendTimeout_UnresponsiveClientBuffer_DropsConnection()
         {
-            var serverSendConfig = new LiminalTransportConfig
+            var serverSendConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -203,7 +203,7 @@ namespace Liminal.Net.Tests
             var rawListener = new TcpListener(IPAddress.Parse("127.0.0.1"), _currentTestPort);
             rawListener.Start();
 
-            var clientSendConfig = new LiminalTransportConfig
+            var clientSendConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -263,7 +263,7 @@ namespace Liminal.Net.Tests
             const int maxConnections = 3;
             const int totalAttemptingClients = 10;
 
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -289,7 +289,7 @@ namespace Liminal.Net.Tests
             {
                 tasks[i] = Task.Run(() =>
                 {
-                    var clientConfig = new LiminalTransportConfig
+                    var clientConfig = new LiminalNetworkConfig
                     {
                         Default_Host = "127.0.0.1",
                         Default_Port = _currentTestPort,
@@ -329,7 +329,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => customServer.Transport.ConnectedClientCount == maxConnections - 1, 2000), Is.True,
                 "Transport failed to drop ConnectedClientCount after graceful disconnect.");
 
-            var lateClientConfig = new LiminalTransportConfig
+            var lateClientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -362,7 +362,7 @@ namespace Liminal.Net.Tests
             const int maxConnections = 2;
             const int collidingAttempts = 8;
             var collisionResolver = new ForceCollisionResolver(targetId: 42, duplicateCount: 100);
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -390,7 +390,7 @@ namespace Liminal.Net.Tests
 
                 tasks[i] = Task.Run(() =>
                 {
-                    var cfg = new LiminalTransportConfig
+                    var cfg = new LiminalNetworkConfig
                     {
                         Default_Host = "127.0.0.1",
                         Default_Port = _currentTestPort,
@@ -420,7 +420,7 @@ namespace Liminal.Net.Tests
                 "Expected exactly 1 socket surviving in the dictionary for ID 42.");
 
             collisionResolver.SetTargetId(999);
-            var testClient = new LiminalNetworkManager(new TcpTransport(), new LiminalTransportConfig
+            var testClient = new LiminalNetworkManager(new TcpTransport(), new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -481,7 +481,7 @@ namespace Liminal.Net.Tests
         {
             const int maxConnections = 1;
 
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,

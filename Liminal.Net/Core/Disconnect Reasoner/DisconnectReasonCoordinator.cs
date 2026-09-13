@@ -19,7 +19,7 @@ namespace Liminal.Net.Core
         private readonly ILiminalTransport _transport;
         private readonly LiminalPacketInterpreter _interpreter;
         private readonly ILiminalTransportDisconnectDiagnostics _diagnostics;
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
 
         private readonly ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message)> _resolved = new();
         private readonly ConcurrentDictionary<ushort, TaskCompletionSource<bool>> _pendingAcks = new();

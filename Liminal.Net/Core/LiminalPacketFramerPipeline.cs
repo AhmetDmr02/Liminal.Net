@@ -10,7 +10,7 @@ namespace Liminal.Net.Core
         private readonly List<ILiminalInboundTransformer> _inboundChain;
         private readonly List<ILiminalOutboundTransformer> _outboundChain;
 
-        public LiminalPacketFramerPipeline(LiminalTransportConfig config)
+        public LiminalPacketFramerPipeline(LiminalNetworkConfig config)
         {
             _inboundChain = config.InboundPacketProcessors.ToList();
             _outboundChain = config.OutboundPacketProcessors.ToList();

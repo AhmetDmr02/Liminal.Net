@@ -18,7 +18,7 @@ namespace Liminal.Net.Tests
     {
         private LiminalNetworkManager _serverManager;
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
-        private LiminalTransportConfig _serverConfig;
+        private LiminalNetworkConfig _serverConfig;
 
         // Prevent port exhaustion between tests
         private static int _portCounter = 7940;
@@ -30,7 +30,7 @@ namespace Liminal.Net.Tests
             _currentTestPort = Interlocked.Increment(ref _portCounter);
             _clientManagers = new();
 
-            _serverConfig = new LiminalTransportConfig
+            _serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -56,7 +56,7 @@ namespace Liminal.Net.Tests
 
         private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -385,7 +385,7 @@ namespace Liminal.Net.Tests
                 PollIntervalInSeconds = 0.05f
             };
 
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -406,7 +406,7 @@ namespace Liminal.Net.Tests
             _serverManager = new LiminalNetworkManager(serverSimTransport, serverConfig, telemetryConfig);
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
-            var clientConfig = new LiminalTransportConfig
+            var clientConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,

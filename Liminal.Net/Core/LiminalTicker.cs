@@ -6,7 +6,7 @@ namespace Liminal.Net.Core
 {
     public class LiminalTicker
     {
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
         public event Action OnTick;
 
         private volatile bool _isRunning;
@@ -19,7 +19,7 @@ namespace Liminal.Net.Core
 
         private long _slewAdjustmentTicks = 0;
 
-        public LiminalTicker(LiminalTransportConfig config)
+        public LiminalTicker(LiminalNetworkConfig config)
         {
             _config = config;
         }

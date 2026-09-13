@@ -541,7 +541,7 @@ namespace Liminal.Net.Tests
         #endregion
 
 
-        private LiminalNetworkManager StartServer(LiminalTransportConfig config)
+        private LiminalNetworkManager StartServer(LiminalNetworkConfig config)
         {
             var manager = new LiminalNetworkManager(new TcpTransport(), config);
             _managers.Add(manager);
@@ -550,7 +550,7 @@ namespace Liminal.Net.Tests
             return manager;
         }
 
-        private LiminalNetworkManager StartClient(int port, LiminalTransportConfig config)
+        private LiminalNetworkManager StartClient(int port, LiminalNetworkConfig config)
         {
             config.Default_Port = port;
             var manager = new LiminalNetworkManager(new TcpTransport(), config);
@@ -560,9 +560,9 @@ namespace Liminal.Net.Tests
             return manager;
         }
 
-        private static LiminalTransportConfig CreateConfig(int port, int maxPacketSize, int maxPacketCount, int recoveryScale)
+        private static LiminalNetworkConfig CreateConfig(int port, int maxPacketSize, int maxPacketCount, int recoveryScale)
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = port,

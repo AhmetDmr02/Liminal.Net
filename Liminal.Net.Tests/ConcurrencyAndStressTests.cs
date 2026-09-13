@@ -17,7 +17,7 @@ namespace Liminal.Net.Tests
     {
         private LiminalNetworkManager _serverManager;
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
-        private LiminalTransportConfig _serverConfig;
+        private LiminalNetworkConfig _serverConfig;
 
         // Prevent port exhaustion between tests
         private static int _portCounter = 7800;
@@ -29,7 +29,7 @@ namespace Liminal.Net.Tests
             _currentTestPort = Interlocked.Increment(ref _portCounter);
             _clientManagers = new();
 
-            _serverConfig = new LiminalTransportConfig
+            _serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -55,7 +55,7 @@ namespace Liminal.Net.Tests
 
         private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
         {
-            var config = new LiminalTransportConfig
+            var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -300,7 +300,7 @@ namespace Liminal.Net.Tests
         {
             var maliciousResolver = new ForceCollisionResolver(targetId: 42, duplicateCount: 5);
 
-            var testConfig = new LiminalTransportConfig
+            var testConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -326,7 +326,7 @@ namespace Liminal.Net.Tests
                 {
                     startGate.Wait();
 
-                    var clientConfig = new LiminalTransportConfig
+                    var clientConfig = new LiminalNetworkConfig
                     {
                         Default_Host = "127.0.0.1",
                         Default_Port = _currentTestPort,
@@ -516,7 +516,7 @@ namespace Liminal.Net.Tests
             const int maxPacketCount = 10;
             const int sentPackets = 5;
 
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -558,7 +558,7 @@ namespace Liminal.Net.Tests
             const int maxPacketCount = 5;
             const int overflowPackets = 15;
 
-            var serverConfig = new LiminalTransportConfig
+            var serverConfig = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = _currentTestPort,
@@ -614,7 +614,7 @@ namespace Liminal.Net.Tests
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
         private WeakReference IsolateNetworkRun()
         {
-            var config = new LiminalTransportConfig { TickRate = 60, ClientIdResolver = new BaseResolver() };
+            var config = new LiminalNetworkConfig { TickRate = 60, ClientIdResolver = new BaseResolver() };
             var transport = new TcpTransport();
             var manager = new LiminalNetworkManager(transport, config);
 

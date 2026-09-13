@@ -16,7 +16,7 @@ namespace Liminal.Net.Core
 
     internal sealed class LiminalHiccupController : IDisposable
     {
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
         private readonly ILiminalTransport _transport;
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions;
         private readonly LiminalInboundRecoveryPool _inboundPool;
@@ -28,7 +28,7 @@ namespace Liminal.Net.Core
 
         internal LiminalHiccupController(
             ILiminalTransport transport,
-            LiminalTransportConfig config,
+            LiminalNetworkConfig config,
             ConcurrentDictionary<ushort, LiminalSession> sessions)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));

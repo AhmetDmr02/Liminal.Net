@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace Liminal.Net.Core
 {
-    public class LiminalTransportConfig
+    public class LiminalNetworkConfig
     {
         /// <summary>
         /// The default host
@@ -70,6 +70,16 @@ namespace Liminal.Net.Core
         /// The number of seconds to wait for a client to disconnect before forcing a kick
         /// </summary>
         public int WaitForKickGracePeriod = 10;
+
+        /// <summary>
+        /// The maximum size of page on a SyncVar packet
+        /// </summary>
+        public int SyncVarMaxPageSize = 65536;
+
+        /// <summary>
+        /// The maximum number of pages on a SyncVar packet
+        /// </summary>
+        public int SyncVarMaxPageCount = 256; // 65536 * 256 = 16 MB max capacity
 
         public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
         public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();

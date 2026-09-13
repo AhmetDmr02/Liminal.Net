@@ -123,8 +123,8 @@ namespace Liminal.Net.Transports
         }
         #endregion
 
-        protected LiminalTransportConfig _config;
-        public LiminalTransportConfig Config => _config;
+        protected LiminalNetworkConfig _config;
+        public LiminalNetworkConfig Config => _config;
 
         protected ILiminalClientIdResolver _clientIdResolver;
         public ILiminalClientIdResolver ClientIdResolver => _clientIdResolver;
@@ -153,7 +153,7 @@ namespace Liminal.Net.Transports
         private readonly ConcurrentDictionary<ushort, ClientSendState> _sendQueues = new();
 
         #region Initialization
-        public virtual void InitializeTransport(LiminalTransportConfig config)
+        public virtual void InitializeTransport(LiminalNetworkConfig config)
         {
             _config = config;
             _config.Validate();

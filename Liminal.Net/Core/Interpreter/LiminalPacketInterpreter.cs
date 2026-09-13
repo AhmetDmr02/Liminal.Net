@@ -15,7 +15,7 @@ namespace Liminal.Net.Core
         private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
         private readonly object _subscriptionGate = new();
 
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
 
         private interface IPacketDispatcher
         {
@@ -184,7 +184,7 @@ namespace Liminal.Net.Core
             }
         }
 
-        public LiminalPacketInterpreter(LiminalTransportConfig config)
+        public LiminalPacketInterpreter(LiminalNetworkConfig config)
         {
             _config = config;
         }

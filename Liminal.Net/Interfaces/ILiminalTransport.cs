@@ -10,8 +10,8 @@ namespace Liminal.Net.Interfaces
     public delegate void TransportEventHandler();
     public delegate void ClientConnectionHandler(ushort clientId);
 
-    public delegate Task<HandshakeResult> ClientHandshakeOrchestrator<T>(T connection, LiminalTransportConfig config);
-    public delegate Task<HandshakeResult> ServerHandshakeOrchestrator<T>(T connection, LiminalTransportConfig config, Func<bool> canAccept);
+    public delegate Task<HandshakeResult> ClientHandshakeOrchestrator<T>(T connection, LiminalNetworkConfig config);
+    public delegate Task<HandshakeResult> ServerHandshakeOrchestrator<T>(T connection, LiminalNetworkConfig config, Func<bool> canAccept);
 
     public interface ILiminalTransport
     {
@@ -24,7 +24,7 @@ namespace Liminal.Net.Interfaces
 
         public bool IsConnected { get; }
 
-        public LiminalTransportConfig Config { get; }
+        public LiminalNetworkConfig Config { get; }
 
         #region Connection State
         public bool IsClientConnected(ushort clientId);
@@ -32,7 +32,7 @@ namespace Liminal.Net.Interfaces
         #endregion
 
         #region Initialization
-        public void InitializeTransport(LiminalTransportConfig config);
+        public void InitializeTransport(LiminalNetworkConfig config);
         #endregion
 
         #region Connection

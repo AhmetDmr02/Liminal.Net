@@ -12,7 +12,7 @@ namespace Liminal.Net.Tests
         public bool IsConnected => true;
         public int ConnectedClientCount => 1;
 
-        public LiminalTransportConfig Config => _conf;
+        public LiminalNetworkConfig Config => _conf;
 
         public event DataReceivedHandler? OnMessageReceivedReliable;
         public event DataReceivedHandler? OnMessageReceivedUnreliable;
@@ -30,9 +30,9 @@ namespace Liminal.Net.Tests
 
         public Action<byte[], ushort, TransportFlags>? OnSendHook;
 
-        private LiminalTransportConfig _conf;
+        private LiminalNetworkConfig _conf;
 
-        public void InitializeTransport(LiminalTransportConfig config)
+        public void InitializeTransport(LiminalNetworkConfig config)
         {
             _conf = config;
         }

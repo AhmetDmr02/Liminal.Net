@@ -16,9 +16,9 @@ namespace Liminal.Net.Handshakes
         private readonly ILiminalClientIdResolver _resolver;
         private readonly float _timeoutSeconds;
         private readonly int _maxHandshakeSize;
-        private readonly LiminalTransportConfig _config;
+        private readonly LiminalNetworkConfig _config;
 
-        public TcpHandshakePipeline(ILiminalClientIdResolver resolver, LiminalTransportConfig config, int maxHandshakeSize = 256, float timeoutS = 5)
+        public TcpHandshakePipeline(ILiminalClientIdResolver resolver, LiminalNetworkConfig config, int maxHandshakeSize = 256, float timeoutS = 5)
         {
             _resolver = resolver;
             _timeoutSeconds = timeoutS;

@@ -7,13 +7,13 @@ namespace Liminal.Net.Core
 {
     public static class DefaultHandshakes
     {
-        public static async Task<HandshakeResult> ServerTcpHandshake(TcpClient client, LiminalTransportConfig config, Func<bool> canAccept)
+        public static async Task<HandshakeResult> ServerTcpHandshake(TcpClient client, LiminalNetworkConfig config, Func<bool> canAccept)
         {
             var pipeline = new TcpHandshakePipeline(config.ClientIdResolver, config, config.MaxHandshakeSize, (int)config.HandshakeTimeout);
             return await pipeline.TryVerifyClientAsync(client, config.Version, canAccept);
         }
 
-        public static async Task<HandshakeResult> ClientTcpHandshake(TcpClient client, LiminalTransportConfig config)
+        public static async Task<HandshakeResult> ClientTcpHandshake(TcpClient client, LiminalNetworkConfig config)
         {
             try
             {
