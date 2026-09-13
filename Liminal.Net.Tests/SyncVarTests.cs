@@ -436,5 +436,152 @@ namespace Liminal.Net.Tests
 
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 20, 2000), Is.True);
         }
+        #region SetDirty, Authority Guard & Exclusion List Tests
+
+        [Test]
+        public void Test13_SetDirty_WithAuthority_BumpsVersionAndFlushesDelta()
+        {
+            string token = $"setdirty_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 50);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 50, 2000), Is.True);
+
+            uint initialVersion = serverVar.Version;
+            bool clientFired = false;
+
+            clientVar.OnValueChanged += (oldVal, newVal) =>
+            {
+                if (newVal == 50) clientFired = true;
+            };
+
+            // Call SetDirty even though the primitive value itself did not change
+            serverVar.SetDirty();
+
+            Assert.That(serverVar.Version, Is.GreaterThan(initialVersion), "SetDirty did not increment variable version.");
+            Assert.That(SpinWait.SpinUntil(() => clientFired, 2000), Is.True, "SetDirty failed to flush delta across network.");
+        }
+
+        [Test]
+        public void Test14_SetDirty_WithoutAuthority_BlockedLocally()
+        {
+            string token = $"unauth_setdirty_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 75);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 75, 2000), Is.True);
+            Assert.That(clientVar.HasAuthority, Is.False);
+
+            uint clientVersionBefore = clientVar.Version;
+            uint serverVersionBefore = serverVar.Version;
+
+            clientVar.SetDirty();
+
+            Assert.That(clientVar.Version, Is.EqualTo(clientVersionBefore), "Unauthorized SetDirty bumped local version.");
+            Thread.Sleep(150);
+            Assert.That(serverVar.Version, Is.EqualTo(serverVersionBefore), "Unauthorized SetDirty leaked dirty delta to server.");
+        }
+
+        [Test]
+        public void Test15_Client_CannotModifyAuthority_LogsErrorAndBlocks()
+        {
+            string token = $"client_auth_hack_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 10);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 10, 2000), Is.True);
+            Assert.That(clientVar.HasAuthority, Is.False);
+
+            ushort clientId = client.localID;
+
+            // Client attempts to grant itself authority
+            clientVar.AddAuthority(clientId);
+            Assert.That(clientVar.HasAuthority, Is.False, "Client was able to grant itself authority via AddAuthority.");
+            Assert.That(clientVar.AuthIds, Does.Not.Contain(clientId));
+
+            // Client attempts SetAuthIds
+            clientVar.SetAuthIds(clientId, 99);
+            Assert.That(clientVar.HasAuthority, Is.False, "Client was able to set authority via SetAuthIds.");
+            Assert.That(clientVar.AuthIds, Does.Not.Contain(clientId));
+
+            // Client attempts RemoveAuthority
+            serverVar.AddAuthority(clientId);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.HasAuthority, 2000), Is.True);
+
+            clientVar.RemoveAuthority(clientId);
+            Assert.That(clientVar.HasAuthority, Is.True, "Client was able to revoke authority via RemoveAuthority.");
+        }
+
+        [Test]
+        public void Test16_Server_ExclusionList_AddRemoveSetAndContains()
+        {
+            string token = $"exclusion_ops_{Guid.NewGuid():N}";
+            var syncVar = new SyncVar<int>(token, 0);
+
+            // Add with deduplication
+            syncVar.AddExclusion(1);
+            syncVar.AddExclusion(1);
+            syncVar.AddExclusion(2);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(syncVar.ExclusionIds.Length, Is.EqualTo(2));
+                Assert.That(syncVar.ContainsExclusion(1), Is.True);
+                Assert.That(syncVar.IsExcluded(2), Is.True);
+                Assert.That(syncVar.ContainsExclusion(3), Is.False);
+            });
+
+            // Remove
+            syncVar.RemoveExclusion(1);
+            Assert.Multiple(() =>
+            {
+                Assert.That(syncVar.ContainsExclusion(1), Is.False);
+                Assert.That(syncVar.ContainsExclusion(2), Is.True);
+                Assert.That(syncVar.ExclusionIds.Length, Is.EqualTo(1));
+            });
+
+            // Set with deduplication
+            syncVar.SetExclusionIds(10, 10, 20, 30, 20);
+            Assert.Multiple(() =>
+            {
+                Assert.That(syncVar.ExclusionIds.Length, Is.EqualTo(3));
+                CollectionAssert.AreEqual(new ushort[] { 10, 20, 30 }, syncVar.ExclusionIds);
+            });
+        }
+
+        [Test]
+        public void Test17_Client_CannotModifyExclusions_LogsErrorAndBlocks()
+        {
+            string token = $"client_excl_hack_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 100);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 100, 2000), Is.True);
+
+            // Client attempts to modify exclusion lists
+            clientVar.AddExclusion(5);
+            Assert.That(clientVar.ContainsExclusion(5), Is.False, "Client was able to add an exclusion.");
+
+            clientVar.SetExclusionIds(1, 2, 3);
+            Assert.That(clientVar.ExclusionIds, Is.Empty, "Client was able to set exclusions.");
+
+            serverVar.AddExclusion(5);
+            clientVar.RemoveExclusion(5);
+            Assert.That(serverVar.ContainsExclusion(5), Is.True, "Client was able to remove a server exclusion.");
+        }
+
+        #endregion
     }
 }

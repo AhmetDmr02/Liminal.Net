@@ -17,17 +17,28 @@ namespace Liminal.Net.SyncVar
         int ActivePageOffset { get; }
         int Length { get; }
         ushort[] AuthIds { get; }
+        ushort[] ExclusionIds { get; }
+
         bool IsAuthorized(ushort clientId);
+        bool IsExcluded(ushort clientId);
+        bool ContainsExclusion(ushort clientId);
 
         void SetAuthIds(params ushort[] clientIds);
         void AddAuthority(ushort clientId);
         void RemoveAuthority(ushort clientId);
         void ApplyAuthUpdateFromRemote(ushort[] newAuthIds);
 
+        void SetExclusionIds(params ushort[] clientIds);
+        void SetExclusions(params ushort[] clientIds);
+        void AddExclusion(ushort clientId);
+        void RemoveExclusion(ushort clientId);
+
+        void SetDirty();
+
         void AllocateSlots(int size);
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
-        void ApplyRemoteBytes(ReadOnlySpan<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options);
+        void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options);
     }
 
     public class SyncVar<T> : ISyncVarInternal
@@ -37,6 +48,7 @@ namespace Liminal.Net.SyncVar
         private const int STATE_SWAPPING = 2;
 
         private readonly object _authLock = new();
+        private readonly object _exclusionLock = new();
         private readonly SyncVarManager _manager;
 
         private readonly (int PageIndex, int PageOffset)[] _slots = new (int, int)[2];
@@ -50,6 +62,7 @@ namespace Liminal.Net.SyncVar
         private T _value;
         private uint _version;
         private ushort[] _authIds = Array.Empty<ushort>();
+        private ushort[] _exclusionIds = Array.Empty<ushort>();
 
         public event Action<bool> OnAuthorityChanged;
 
@@ -60,6 +73,7 @@ namespace Liminal.Net.SyncVar
         public int ActivePageOffset => _slots[Volatile.Read(ref _frontIndex)].PageOffset;
         public int Length => _slotLengths[Volatile.Read(ref _frontIndex)];
         public ushort[] AuthIds => Volatile.Read(ref _authIds);
+        public ushort[] ExclusionIds => Volatile.Read(ref _exclusionIds);
         public SyncVarManager Manager => _manager;
 
         public event Action<T, T> OnValueChanged;
@@ -97,7 +111,7 @@ namespace Liminal.Net.SyncVar
                     return;
                 }
 
-                WriteFromOwningThread(value);
+                WriteFromOwningThread(value, force: false);
             }
         }
 
@@ -110,8 +124,25 @@ namespace Liminal.Net.SyncVar
             _manager.RegisterSyncVar(this);
         }
 
+        public void SetDirty()
+        {
+            if (!HasAuthority)
+            {
+                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                ushort myId = netManager?.localID ?? 0;
+                LiminalLogger.LogError($"[SyncVar] Unauthorized SetDirty blocked! Client {myId} does not have authority on '{Token}'.");
+                return;
+            }
+
+            WriteFromOwningThread(_value, force: true);
+        }
+
+        #region Authority Management
+
         public void SetAuthIds(params ushort[] clientIds)
         {
+            if (!IsServerAuthority("SetAuthIds")) return;
+
             lock (_authLock)
             {
                 if (clientIds == null || clientIds.Length == 0)
@@ -138,6 +169,8 @@ namespace Liminal.Net.SyncVar
 
         public void AddAuthority(ushort clientId)
         {
+            if (!IsServerAuthority("AddAuthority")) return;
+
             lock (_authLock)
             {
                 var current = Volatile.Read(ref _authIds);
@@ -160,6 +193,8 @@ namespace Liminal.Net.SyncVar
 
         public void RemoveAuthority(ushort clientId)
         {
+            if (!IsServerAuthority("RemoveAuthority")) return;
+
             lock (_authLock)
             {
                 var current = Volatile.Read(ref _authIds);
@@ -240,6 +275,144 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        #endregion
+
+        #region Exclusion Management
+
+        public bool IsExcluded(ushort clientId)
+        {
+            var excluded = Volatile.Read(ref _exclusionIds);
+            if (excluded == null || excluded.Length == 0) return false;
+            for (int i = 0; i < excluded.Length; i++)
+            {
+                if (excluded[i] == clientId) return true;
+            }
+            return false;
+        }
+
+        public bool ContainsExclusion(ushort clientId) => IsExcluded(clientId);
+
+        public void SetExclusionIds(params ushort[] clientIds)
+        {
+            if (!IsServerAuthority("SetExclusionIds")) return;
+
+            lock (_exclusionLock)
+            {
+                if (clientIds == null || clientIds.Length == 0)
+                {
+                    CommitExclusionUpdate(Array.Empty<ushort>());
+                    return;
+                }
+
+                var cleanList = new List<ushort>(clientIds.Length);
+                for (int i = 0; i < clientIds.Length; i++)
+                {
+                    ushort id = clientIds[i];
+                    if (cleanList.Contains(id))
+                    {
+                        LiminalLogger.LogWarning($"[SyncVar] Duplicate exclusion ID {id} passed into '{Token}'. Overwriting duplicate entry.");
+                        continue;
+                    }
+                    cleanList.Add(id);
+                }
+
+                CommitExclusionUpdate(cleanList.ToArray());
+            }
+        }
+
+        public void SetExclusions(params ushort[] clientIds) => SetExclusionIds(clientIds);
+
+        public void AddExclusion(ushort clientId)
+        {
+            if (!IsServerAuthority("AddExclusion")) return;
+
+            lock (_exclusionLock)
+            {
+                var current = Volatile.Read(ref _exclusionIds);
+                for (int i = 0; i < current.Length; i++)
+                {
+                    if (current[i] == clientId)
+                    {
+                        LiminalLogger.LogWarning($"[SyncVar] Client {clientId} is already in exclusion list for '{Token}'. Overwriting duplicate assignment.");
+                        return;
+                    }
+                }
+
+                var next = new ushort[current.Length + 1];
+                Array.Copy(current, next, current.Length);
+                next[current.Length] = clientId;
+
+                CommitExclusionUpdate(next);
+            }
+        }
+
+        public void RemoveExclusion(ushort clientId)
+        {
+            if (!IsServerAuthority("RemoveExclusion")) return;
+
+            lock (_exclusionLock)
+            {
+                var current = Volatile.Read(ref _exclusionIds);
+                int targetIndex = -1;
+
+                for (int i = 0; i < current.Length; i++)
+                {
+                    if (current[i] == clientId)
+                    {
+                        targetIndex = i;
+                        break;
+                    }
+                }
+
+                if (targetIndex < 0)
+                {
+                    LiminalLogger.LogWarning($"[SyncVar] Cannot remove exclusion: Client {clientId} is not in exclusion list for '{Token}'.");
+                    return;
+                }
+
+                var next = new ushort[current.Length - 1];
+                if (targetIndex > 0)
+                {
+                    Array.Copy(current, 0, next, 0, targetIndex);
+                }
+                if (targetIndex < current.Length - 1)
+                {
+                    Array.Copy(current, targetIndex + 1, next, targetIndex, current.Length - targetIndex - 1);
+                }
+
+                CommitExclusionUpdate(next);
+            }
+        }
+
+        private void CommitExclusionUpdate(ushort[] newExclusionIds)
+        {
+            Volatile.Write(ref _exclusionIds, newExclusionIds);
+        }
+
+        #endregion
+
+        private bool IsServerAuthority(string actionName)
+        {
+            var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+            if (netManager == null || netManager.Role == NetworkRole.None)
+            {
+                // Standalone / offline / initialization mode allows configuration
+                return true;
+            }
+
+            if (netManager.Role == NetworkRole.Server ||
+                netManager.Role == NetworkRole.Host ||
+                netManager.Transport?.IsServer == true ||
+                netManager.localID == ILiminalTransport.SERVER_ID)
+            {
+                return true;
+            }
+
+            ushort myId = netManager.localID;
+            LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {myId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+            return false;
+        }
+
         public void AllocateSlots(int size)
         {
             int capacity = Math.Max(size + 128, 256);
@@ -252,9 +425,9 @@ namespace Liminal.Net.SyncVar
             _slotLengths[1] = size;
         }
 
-        private void WriteFromOwningThread(T newValue)
+        private void WriteFromOwningThread(T newValue, bool force = false)
         {
-            if (EqualityComparer<T>.Default.Equals(_value, newValue)) return;
+            if (!force && EqualityComparer<T>.Default.Equals(_value, newValue)) return;
 
             int backIndex = 1 - Volatile.Read(ref _frontIndex);
             var (page, offset) = _slots[backIndex];
@@ -288,9 +461,12 @@ namespace Liminal.Net.SyncVar
                 Volatile.Write(ref _gate, STATE_IDLE);
             }
 
-            _manager.DirtyBitset.SetDirty(Id);
+            _manager?.DirtyBitset.SetDirty(Id);
 
-            OnValueChanged?.Invoke(old, newValue);
+            if (force || !EqualityComparer<T>.Default.Equals(old, newValue))
+            {
+                OnValueChanged?.Invoke(old, newValue);
+            }
         }
 
         public bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version)
@@ -321,19 +497,22 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void ApplyRemoteBytes(ReadOnlySpan<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options)
+        public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options)
         {
             if (newVersion <= _version && _version != 0) return;
 
-            T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes.ToArray(), options);
+            T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
+
             T old = _value;
             _value = deserialized;
             Volatile.Write(ref _version, newVersion);
 
             int front = Volatile.Read(ref _frontIndex);
             var (page, offset) = _slots[front];
-            incomingBytes.CopyTo(_manager.Slab.GetSpan(page, offset, incomingBytes.Length));
-            _slotLengths[front] = incomingBytes.Length;
+
+            int length = (int)incomingBytes.Length;
+            incomingBytes.CopyTo(_manager.Slab.GetSpan(page, offset, length));
+            _slotLengths[front] = length;
             _slotVersions[front] = newVersion;
 
             OnValueChanged?.Invoke(old, deserialized);
