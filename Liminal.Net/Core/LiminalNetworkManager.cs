@@ -9,8 +9,8 @@ namespace Liminal.Net.Core
     {
         None,
         Server,
-        Client, 
-        Host   
+        Client,
+        Host
     }
 
     public class LiminalNetworkManager
@@ -40,6 +40,12 @@ namespace Liminal.Net.Core
         public DisconnectReasonCoordinator DisconnectCoordinator { get; private set; }
 
         public event Action<ushort, DisconnectReason, string> OnDisconnectResolved;
+
+        public static event Action OnManagerPreInitialize;
+        public static event Action OnManagerPostInitialize;
+
+        public static event Action OnManagerShutdown;
+
 
         public ushort localID => _transport.LocalClientId;
 
@@ -73,6 +79,8 @@ namespace Liminal.Net.Core
 
         private void InitializeSystems()
         {
+            OnManagerPreInitialize?.Invoke();
+
             ShutdownSystems();
 
             LiminalLogger.Log("[Manager] Initializing Network Systems...");
@@ -93,6 +101,8 @@ namespace Liminal.Net.Core
             _phaseAligner = new LiminalPhaseAligner(_config);
 
             TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
+
+            OnManagerPostInitialize?.Invoke();
         }
 
         private void HandleDisconnectResolved(ushort id, DisconnectReason reason, string message)
@@ -102,6 +112,8 @@ namespace Liminal.Net.Core
 
         private void ShutdownSystems()
         {
+            OnManagerShutdown?.Invoke();
+
             _ticker?.Stop();
 
             TelemetryManager?.Dispose();
@@ -184,7 +196,7 @@ namespace Liminal.Net.Core
         public void Disconnect()
         {
             if (Role == NetworkRole.None) return;
-            
+
             Role = NetworkRole.None;
 
             _transport.Disconnect();

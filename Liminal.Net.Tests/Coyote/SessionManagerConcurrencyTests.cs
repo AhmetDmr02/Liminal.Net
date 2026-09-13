@@ -701,5 +701,121 @@ namespace Liminal.Net.Tests
                 manager.GetActiveSessionCount() == 0,
                 "Session was not cleaned up after Dispose/Flush/Poll.");
         }
+        [Test]
+        public static async Task Coyote_Interpreter_ReentrantDispatchAndTeardownRace()
+        {
+            var config = new LiminalTransportConfig();
+            var interpreter = new LiminalPacketInterpreter(config);
+
+            ushort chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
+            if (chatPacketId == 0)
+            {
+                LiminalPacketLibrary.Initialize();
+                chatPacketId = LiminalPacketLibrary.GetId<ChatPacket>();
+            }
+
+            byte[] serializedChat = MessagePackSerializer.Serialize(new ChatPacket { Message = "DeadlockStress" });
+
+            object subscriberA = new object();
+            object subscriberB = new object();
+            object dynamicSubscriber = new object();
+
+            int totalProcessedA = 0;
+            int totalProcessedB = 0;
+            int totalDynamicProcessed = 0;
+
+            Action<ChatPacket, ushort> callbackA = null;
+            callbackA = (pkt, sender) =>
+            {
+                Interlocked.Increment(ref totalProcessedA);
+
+                if ((totalProcessedA & 1) == 0)
+                {
+                    interpreter.Subscribe<ChatPacket>((dynamicPkt, dynamicSender) =>
+                    {
+                        Interlocked.Increment(ref totalDynamicProcessed);
+                    }, dynamicSubscriber);
+                }
+                else
+                {
+                    interpreter.UnsubscribeAll(dynamicSubscriber);
+                }
+            };
+
+            Action<ChatPacket, ushort> callbackB = (pkt, sender) =>
+            {
+                Interlocked.Increment(ref totalProcessedB);
+            };
+
+            interpreter.Subscribe(callbackA, subscriberA);
+            interpreter.Subscribe(callbackB, subscriberB);
+
+            var dispatchTask = Task.Run(async () =>
+            {
+                for (int i = 0; i < 30; i++)
+                {
+                    interpreter.Dispatch(chatPacketId, 1, serializedChat);
+                    await Task.Yield();
+                }
+            });
+
+            var lifecycleTaskA = Task.Run(async () =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    interpreter.Subscribe(callbackA, subscriberA);
+                    await Task.Yield();
+                    interpreter.Unsubscribe<ChatPacket>(subscriberA);
+                    await Task.Yield();
+                }
+            });
+
+            var lifecycleTaskB = Task.Run(async () =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    interpreter.UnsubscribeAll(subscriberB);
+                    await Task.Yield();
+                    interpreter.Subscribe(callbackB, subscriberB);
+                    await Task.Yield();
+                }
+            });
+
+            var teardownTask = Task.Run(async () =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    await Task.Yield();
+                    interpreter.ClearAllHandlers();
+                    await Task.Yield();
+                    interpreter.Subscribe(callbackB, subscriberB);
+                }
+            });
+
+            await Task.WhenAll(dispatchTask, lifecycleTaskA, lifecycleTaskB, teardownTask);
+
+            interpreter.ClearAllHandlers();
+
+            int finalCountA = Volatile.Read(ref totalProcessedA);
+            int finalCountB = Volatile.Read(ref totalProcessedB);
+            int finalCountDynamic = Volatile.Read(ref totalDynamicProcessed);
+
+            for (int i = 0; i < 10; i++)
+            {
+                interpreter.Dispatch(chatPacketId, 1, serializedChat);
+            }
+
+            Specification.Assert(
+                Volatile.Read(ref totalProcessedA) == finalCountA,
+                "Subscriber A continued receiving packets after terminal ClearAllHandlers.");
+
+            Specification.Assert(
+                Volatile.Read(ref totalProcessedB) == finalCountB,
+                "Subscriber B continued receiving packets after terminal ClearAllHandlers.");
+
+            Specification.Assert(
+                Volatile.Read(ref totalDynamicProcessed) == finalCountDynamic,
+                "Dynamic subscriber continued receiving packets after terminal ClearAllHandlers.");
+        }
     }
 }

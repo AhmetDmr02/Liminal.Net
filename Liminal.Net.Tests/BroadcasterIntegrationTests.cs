@@ -491,7 +491,77 @@ namespace Liminal.Net.Tests
             Assert.That(receivedCount, Is.EqualTo(1), "Callback was invoked after being unsubscribed via Broadcaster.");
         }
 
+        [Test]
+        public void Test18_Broadcaster_DuplicateSubscription_SuppressedForSameSubscriber()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            int invocationCount = 0;
+            object subscriber = new object();
+            Action<ChatPacket, ushort> onChatReceived = (pkt, s) => Interlocked.Increment(ref invocationCount);
+
+            LiminalNetworkManager.Instance = client;
+
+            Broadcaster.Subscribe(onChatReceived, subscriber);
+            Broadcaster.Subscribe(onChatReceived, subscriber);
+            Broadcaster.Subscribe(onChatReceived, subscriber);
+
+            _serverManager.Interpreter.SendCommand(client.localID, new ChatPacket { Message = "DeduplicationCheck" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => invocationCount == 1, 2000), Is.True);
+
+            Thread.Sleep(150);
+
+            Assert.That(invocationCount, Is.EqualTo(1),
+                "Duplicate subscriptions for the same subscriber instance fired multiple times.");
+        }
+
+        [Test]
+        public void Test19_Broadcaster_SeparateSubscribers_NotSuppressedAcrossDistinctInstances()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient();
+            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+
+            int subscriber1Invocations = 0;
+            int subscriber2Invocations = 0;
+
+            var sub1 = new object();
+            var sub2 = new object();
+
+            Action<ChatPacket, ushort> callback1 = (pkt, s) => Interlocked.Increment(ref subscriber1Invocations);
+            Action<ChatPacket, ushort> callback2 = (pkt, s) => Interlocked.Increment(ref subscriber2Invocations);
+
+            LiminalNetworkManager.Instance = client;
+
+            Broadcaster.Subscribe(callback1, sub1);
+            Broadcaster.Subscribe(callback2, sub2);
+
+            Broadcaster.Subscribe(callback1, sub1);
+
+            _serverManager.Interpreter.SendCommand(client.localID, new ChatPacket { Message = "DistinctSubscriberCheck" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => subscriber1Invocations == 1 && subscriber2Invocations == 1, 2000), Is.True);
+
+            Thread.Sleep(150);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(subscriber1Invocations, Is.EqualTo(1), "Subscriber 1 received duplicate invocations.");
+                Assert.That(subscriber2Invocations, Is.EqualTo(1), "Subscriber 2 was incorrectly suppressed by Subscriber 1.");
+            });
+        }
+
         #endregion
+
         #region SendToClient Specific Targeted Tests
 
         [Test]

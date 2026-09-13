@@ -145,6 +145,17 @@ namespace Liminal.Net.Core
             public int Count => _list.Count;
 
             public void Add(Subscription sub) => _list.Add(sub);
+            public bool Contains(ushort packetId, Delegate callback)
+            {
+                for (int i = 0; i < _list.Count; i++)
+                {
+                    var item = _list[i];
+                    if (item.PacketId == packetId && item.Callback.Equals(callback))
+                        return true;
+                }
+
+                return false;
+            }
 
             public List<Subscription> Clear()
             {
@@ -216,6 +227,12 @@ namespace Liminal.Net.Core
 
                 lock (subList.Lock)
                 {
+                    if (subList.Contains(packetId, callback))
+                    {
+                        LiminalLogger.LogWarning($"[Interpreter] Duplicate subscription suppressed: {subscriber.GetType().Name} -> {typeof(T).Name}");
+                        return;
+                    }
+
                     var dispatcher = GetOrCreateDispatcher<T>(packetId);
                     dispatcher.Add(callback);
                     subList.Add(subscription);
