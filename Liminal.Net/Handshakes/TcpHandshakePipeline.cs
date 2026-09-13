@@ -97,10 +97,6 @@ namespace Liminal.Net.Handshakes
 
                 ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
                 await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token).ConfigureAwait(false);
-
-                ushort fourthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
-                var readyPacket = new ConnectionHandshakeReadyConfirmed();
-                await SendPacketAsync(stream, fourthPacketId, readyPacket, cts.Token).ConfigureAwait(false);
                 await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
@@ -124,8 +120,12 @@ namespace Liminal.Net.Handshakes
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Invalid ACK");
                 }
 
-                // Both endpoints are confirmed ready. Promote on server before raising events.
                 onClientValidated?.Invoke(assignedId);
+
+                ushort fourthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
+                var readyPacket = new ConnectionHandshakeReadyConfirmed();
+                await SendPacketAsync(stream, fourthPacketId, readyPacket, cts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 return HandshakeResult.Ok(assignedId);
             }
@@ -161,6 +161,7 @@ namespace Liminal.Net.Handshakes
                 };
 
                 await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 byte[] header = new byte[8];
                 await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
@@ -199,6 +200,15 @@ namespace Liminal.Net.Handshakes
 
                 ushort assignedId = serverResponse.AssignedClientID;
 
+                ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
+                var ack = new ConnectionHandshakeClientAck
+                {
+                    ClientID = assignedId,
+                    Ack = true
+                };
+                await SendPacketAsync(stream, thirdPacketId, ack, cts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
+
                 await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
                 length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
                 packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
@@ -215,15 +225,6 @@ namespace Liminal.Net.Handshakes
                     byte[] readyPayload = new byte[length];
                     await stream.LiminalReadExactlyAsync(readyPayload, 0, length, cts.Token).ConfigureAwait(false);
                 }
-
-                ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
-                var ack = new ConnectionHandshakeClientAck
-                {
-                    ClientID = assignedId,
-                    Ack = true
-                };
-                await SendPacketAsync(stream, thirdPacketId, ack, cts.Token).ConfigureAwait(false);
-                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 return HandshakeResult.Ok(assignedId);
             }
