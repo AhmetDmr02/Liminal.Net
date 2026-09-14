@@ -221,15 +221,22 @@ namespace Liminal.Net.Registry
         {
             if (_manager.Role != NetworkRole.Client) return;
 
+            uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+            if (packet.RosterVersion < currentVersion)
+            {
+                // Stale snapshot; current state is already newer
+                return;
+            }
+
             Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
             Interlocked.Exchange(ref _hostClientId, packet.HostClientId);
 
             var snapshotSet = new HashSet<ushort>(packet.ConnectedClientIds);
-            foreach (var id in _clients.Keys)
+            foreach (var kvp in _clients)
             {
-                if (!snapshotSet.Contains(id))
+                if (!snapshotSet.Contains(kvp.Key))
                 {
-                    if (_clients.TryRemove(id, out var removed))
+                    if (_clients.TryRemove(kvp.Key, out var removed))
                     {
                         _onClientLeft?.Invoke(removed);
                     }
@@ -266,7 +273,14 @@ namespace Liminal.Net.Registry
         {
             if (_manager.Role != NetworkRole.Client) return;
 
-            if (packet.RosterVersion > (uint)Volatile.Read(ref _rosterVersion) + 1)
+            uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+            if (packet.RosterVersion <= currentVersion)
+            {
+                // Stale or duplicate delta packet
+                return;
+            }
+
+            if (packet.RosterVersion > currentVersion + 1)
             {
                 RequestRosterReconciliation();
                 return;
@@ -288,7 +302,14 @@ namespace Liminal.Net.Registry
         {
             if (_manager.Role != NetworkRole.Client) return;
 
-            if (packet.RosterVersion > (uint)Volatile.Read(ref _rosterVersion) + 1)
+            uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+            if (packet.RosterVersion <= currentVersion)
+            {
+                // Stale or duplicate delta packet
+                return;
+            }
+
+            if (packet.RosterVersion > currentVersion + 1)
             {
                 RequestRosterReconciliation();
                 return;

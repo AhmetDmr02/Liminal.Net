@@ -105,6 +105,7 @@ namespace Liminal.Net.Core
         private LiminalPacketFramerPipeline _pipeline;
 
         private LiminalTicker _ticker;
+        public LiminalTicker Ticker => _ticker;
         private LiminalPhaseAligner _phaseAligner;
 
         public LiminalTelemetryManager TelemetryManager { get; private set; }
