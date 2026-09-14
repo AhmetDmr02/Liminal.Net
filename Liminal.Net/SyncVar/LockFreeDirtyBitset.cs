@@ -1,4 +1,4 @@
-﻿using System.Threading;
+using System.Threading;
 
 namespace Liminal.Net.SyncVar
 {
@@ -11,7 +11,19 @@ namespace Liminal.Net.SyncVar
             int bucket = id >> 6;
             long bit = 1L << (id & 63);
 
+#if NET5_0_OR_GREATER
             Interlocked.Or(ref _masks[bucket], bit);
+#else
+            long current = Volatile.Read(ref _masks[bucket]);
+            while ((current & bit) == 0)
+            {
+                long updated = current | bit;
+                long prior = Interlocked.CompareExchange(ref _masks[bucket], updated, current);
+                if (prior == current)
+                    break;
+                current = prior;
+            }
+#endif
         }
 
         public bool TryConsumeBucket(int bucketIndex, out long dirtyMask)

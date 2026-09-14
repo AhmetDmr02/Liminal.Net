@@ -5,7 +5,6 @@ using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace Liminal.Net.SyncVar
@@ -183,7 +182,7 @@ namespace Liminal.Net.SyncVar
                 ulong umask = (ulong)mask;
                 while (umask != 0)
                 {
-                    int bitPos = BitOperations.TrailingZeroCount(umask);
+                    int bitPos = BitOperationsCompat.TrailingZeroCount(umask);
                     ushort id = (ushort)((bucket << 6) + bitPos);
 
                     if (_idRegistry.TryGetValue(id, out var syncVar))

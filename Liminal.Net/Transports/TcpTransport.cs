@@ -543,7 +543,11 @@ namespace Liminal.Net.Transports
 
                 using (linkedCts.Token.Register(() => { try { client.Close(); } catch { } }))
                 {
+#if NET5_0_OR_GREATER
                     await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, linkedCts.Token).ConfigureAwait(false);
+#else
+                    await client.ConnectAsync(connectionInfo.ip, connectionInfo.port).ConfigureAwait(false);
+#endif
                 }
 
                 if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
