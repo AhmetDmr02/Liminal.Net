@@ -144,7 +144,14 @@ namespace Liminal.Net.Transports
 
         public event Action<ushort, DisconnectReason, string> OnTransportDisconnectReason;
 
-        private readonly ConcurrentDictionary<ushort, ClientSendState> _sendQueues = new();
+        internal readonly ConcurrentDictionary<ushort, ClientSendState> _sendQueues = new();
+        private readonly object _connectionLifecycleLock = new();
+
+        internal void SetConnectedForTesting(bool isConnected = true, bool isServer = true)
+        {
+            _isConnected = isConnected;
+            _isServer = isServer;
+        }
 
         #region Initialization
         public virtual void InitializeTransport(LiminalNetworkConfig config)
@@ -246,9 +253,17 @@ namespace Liminal.Net.Transports
             {
                 _onClientKicked?.Invoke(clientId);
                 try { clientSocket.Close(); } catch { }
-                _sockets.TryRemove(clientId, out _);
 
-                TeardownSendQueue(clientId);
+                ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(clientId, clientSocket));
+
+                if (_sendQueues.TryGetValue(clientId, out var sendState))
+                {
+                    TeardownSendQueue(clientId, sendState);
+                }
+                else
+                {
+                    TeardownSendQueue(clientId);
+                }
 
                 if (TryClaimDisconnect(clientSocket))
                 {
@@ -670,50 +685,67 @@ namespace Liminal.Net.Transports
             }
         }
 
-        private void PromoteClient(ushort clientId, TcpClient client)
+        internal void PromoteClient(ushort clientId, TcpClient client)
         {
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
 
             int maxPacketCount = _config.Hiccup.Enabled ? _config.MaxPacketCount * _config.Hiccup.MaxRecoveryScale : _config.MaxPacketCount;
             maxPacketCount = Math.Max(_config.MaxPacketCount, maxPacketCount);
 
-            var sendState = new ClientSendState(maxPacketCount);
+            ClientSendState sendState;
+            ClientSendState oldSendState = null;
+            TcpClient oldClient = null;
 
-            _sendQueues.AddOrUpdate(clientId, sendState, (k, old) =>
+            lock (_connectionLifecycleLock)
             {
-                old.LifetimeCts.Cancel();
-                old.Channel.Writer.TryComplete();
-
-                if (old.WriterTask != null)
-                    _ = old.WriterTask.ContinueWith(_ => old.Dispose(), TaskContinuationOptions.ExecuteSynchronously);
-                else
-                    old.Dispose();
-
-                return sendState;
-            });
-
-            _sockets.AddOrUpdate(clientId, client, (key, old) =>
-            {
-                LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
-
-                if (TryClaimDisconnect(old))
+                if (_isShuttingDown != 0 || !_isConnected)
                 {
-                    Interlocked.Decrement(ref _totalConnections);
+                    try { client.Close(); } catch { }
+                    return;
                 }
 
-                try { old.Close(); } catch { }
-                return client;
-            });
+                sendState = new ClientSendState(maxPacketCount);
 
-            _clientIdResolver.ConfirmRegistration(clientId);
+                _sendQueues.AddOrUpdate(clientId, sendState, (k, old) =>
+                {
+                    oldSendState = old;
+                    return sendState;
+                });
+
+                _sockets.AddOrUpdate(clientId, client, (key, old) =>
+                {
+                    oldClient = old;
+                    if (TryClaimDisconnect(old))
+                    {
+                        Interlocked.Decrement(ref _totalConnections);
+                    }
+                    return client;
+                });
+
+                _clientIdResolver.ConfirmRegistration(clientId);
+
+                sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
+                _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
+            }
+
+            if (oldSendState != null)
+            {
+                oldSendState.LifetimeCts.Cancel();
+                oldSendState.Channel.Writer.TryComplete();
+
+                if (oldSendState.WriterTask != null)
+                    _ = oldSendState.WriterTask.ContinueWith(_ => oldSendState.Dispose(), TaskContinuationOptions.ExecuteSynchronously);
+                else
+                    oldSendState.Dispose();
+            }
+
+            if (oldClient != null)
+            {
+                LiminalLogger.LogWarning($"[Transport] Replacing existing socket for client {clientId}");
+                try { oldClient.Close(); } catch { }
+            }
 
             _onClientConnected?.Invoke(clientId);
-
-            if (!IsCurrentConnection(clientId, client, sendState))
-                return;
-
-            sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
-            _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
@@ -1064,7 +1096,7 @@ namespace Liminal.Net.Transports
         }
         #endregion
 
-        private readonly struct OutboundPacket
+        internal readonly struct OutboundPacket
         {
             public readonly byte[] Buffer;
             public readonly int Length;
@@ -1076,7 +1108,7 @@ namespace Liminal.Net.Transports
             }
         }
 
-        private sealed class ClientSendState
+        internal sealed class ClientSendState
         {
             public readonly Channel<OutboundPacket> Channel;
             public readonly CancellationTokenSource LifetimeCts;
