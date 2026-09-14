@@ -702,7 +702,21 @@ namespace Liminal.Net.Transports
                         catch (Exception ex)
                         {
                             LiminalLogger.LogError($"[Transport] Handshake error: {ex.Message}");
-                            try { acceptedClient.Close(); } catch { }
+                            if (promoted && assignedClientId != 0)
+                            {
+                                if (_sockets.TryGetValue(assignedClientId, out var cur) && ReferenceEquals(cur, acceptedClient))
+                                {
+                                    Kick(assignedClientId);
+                                }
+                                else
+                                {
+                                    try { acceptedClient.Close(); } catch { }
+                                }
+                            }
+                            else
+                            {
+                                try { acceptedClient.Close(); } catch { }
+                            }
                         }
                         finally
                         {

@@ -188,6 +188,7 @@ namespace Liminal.Net.Core
             if (_disposed) return;
 
             _sessionManager?.HandleClientDisconnected(clientId);
+            _sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
 
             _onLocalClientDisconnected?.Invoke(clientId);
         }
