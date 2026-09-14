@@ -16,7 +16,7 @@ namespace Liminal.Net.Registry
 
         private int _rosterVersion;
 
-        public IReadOnlyCollection<ConnectedClient> AllClients => _clients.Values.ToList().AsReadOnly();
+        public ICollection<ConnectedClient> AllClients => _clients.Values;
         public int Count => _clients.Count;
 
         private ConnectedClient _localClient;
