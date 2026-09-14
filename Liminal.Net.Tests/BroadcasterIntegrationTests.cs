@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
@@ -53,7 +53,7 @@ namespace Liminal.Net.Tests
             LiminalNetworkManager.Instance = null;
         }
 
-        private LiminalNetworkManager CreateAndStartClient()
+        private LiminalNetworkManager CreateAndStartClient(bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -68,7 +68,20 @@ namespace Liminal.Net.Tests
 
             var client = new LiminalNetworkManager(new TcpTransport(), config);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -103,7 +116,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             LiminalNetworkManager.Instance = client;
 
@@ -132,7 +144,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             ushort assignedClientId = client.localID;
             Assert.That(assignedClientId, Is.Not.Zero);
@@ -165,7 +176,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             ushort clientLocalId = client.localID;
             bool receivedLoopback = false;
@@ -199,7 +209,6 @@ namespace Liminal.Net.Tests
 
             var c1 = CreateAndStartClient();
             var c2 = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => c1.Transport.IsConnected && c2.Transport.IsConnected, 3000), Is.True);
 
             int c1Count = 0, c2Count = 0;
             ushort c1SeenSender = 999, c2SeenSender = 999;
@@ -236,7 +245,6 @@ namespace Liminal.Net.Tests
 
             var c1 = CreateAndStartClient();
             var c2 = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => c1.Transport.IsConnected && c2.Transport.IsConnected, 3000), Is.True);
 
             bool serverReceived = false;
             _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, s) => serverReceived = true, this);
@@ -263,9 +271,11 @@ namespace Liminal.Net.Tests
         public void Test08_Host_SendToMe_DeliversToLocalClient_WithLocalClientIdSender()
         {
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
 
             ushort hostClientId = _serverManager.localID;
             bool localClientReceived = false;
@@ -292,16 +302,16 @@ namespace Liminal.Net.Tests
         public void Test09_Host_SendToNotHost_ReachesOnlyRemoteClients_ExcludesServerAndHostPlayer()
         {
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
 
             var remoteClient1 = CreateAndStartClient();
             var remoteClient2 = CreateAndStartClient();
 
             Assert.That(SpinWait.SpinUntil(() =>
-                remoteClient1.Transport.IsConnected &&
-                remoteClient2.Transport.IsConnected &&
                 _serverManager.Transport.IsClientConnected(remoteClient1.localID) &&
                 _serverManager.Transport.IsClientConnected(remoteClient2.localID), 3000), Is.True);
 
@@ -338,12 +348,13 @@ namespace Liminal.Net.Tests
         public void Test10_Host_SendToNotMe_DeliversToRemotesAndServerLoopback_ExcludesHostClient()
         {
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
 
             var remoteClient = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected, 2000), Is.True);
 
             int hostReceivedCount = 0;
             int remoteReceivedCount = 0;
@@ -371,13 +382,14 @@ namespace Liminal.Net.Tests
         public void Test11_Host_SendToNotServer_SendsAsLocalClientId_ReachesRemotesAndHostClient()
         {
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
             ushort hostClientId = _serverManager.localID;
 
             var remoteClient = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected, 2000), Is.True);
 
             bool hostClientReceived = false;
             ushort hostSeenSender = 999;
@@ -423,12 +435,13 @@ namespace Liminal.Net.Tests
         public void Test12_Host_SendToEveryone_DeliversToAllSessionsWithServerAuthority()
         {
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
 
             var remoteClient = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected, 2000), Is.True);
 
             int hostReceiveCount = 0;
             int remoteReceiveCount = 0;
@@ -468,7 +481,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int receivedCount = 0;
             object subscriberTag = new object();
@@ -498,7 +510,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int invocationCount = 0;
             object subscriber = new object();
@@ -528,7 +539,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int subscriber1Invocations = 0;
             int subscriber2Invocations = 0;
@@ -572,7 +582,6 @@ namespace Liminal.Net.Tests
 
             var c1 = CreateAndStartClient();
             var c2 = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => c1.Transport.IsConnected && c2.Transport.IsConnected, 3000), Is.True);
 
             ushort c1Id = c1.localID;
             ushort c2Id = c2.localID;
@@ -610,12 +619,13 @@ namespace Liminal.Net.Tests
         public void Test15_SendToClient_HostToRemoteClient_DeliveredWithServerAuthority()
         {
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
 
             var remoteClient = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected, 2000), Is.True);
 
             ushort remoteClientId = remoteClient.localID;
             Assert.That(remoteClientId, Is.Not.Zero);
@@ -670,7 +680,6 @@ namespace Liminal.Net.Tests
 
             var client1 = CreateAndStartClient();
             var client2 = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected && client2.Transport.IsConnected, 2000), Is.True);
 
             int client2ReceivedCount = 0;
             client2.Interpreter.Subscribe<ChatPacket>((pkt, sender) => Interlocked.Increment(ref client2ReceivedCount), this);

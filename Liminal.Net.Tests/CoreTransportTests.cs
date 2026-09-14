@@ -55,7 +55,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -69,7 +69,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -87,10 +100,13 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test02_ClientConnect_WithoutServer_FailsGracefully()
         {
-            var client = CreateAndStartClient();
+            var client = CreateAndStartClient(waitForConnect: false);
 
-            bool connected = SpinWait.SpinUntil(() => client.Transport.IsConnected, 1000);
-            Assert.That(connected, Is.False, "Client magically connected to a non-existent server.");
+            bool connected = false;
+            client.Events.OnLocalClientConnected += _ => connected = true;
+
+            bool spun = SpinWait.SpinUntil(() => connected, 1000);
+            Assert.That(spun, Is.False, "Client magically connected to a non-existent server.");
 
             bool roleReset = SpinWait.SpinUntil(() => client.Role == NetworkRole.None, 6000);
 
@@ -124,8 +140,6 @@ namespace Liminal.Net.Tests
             bool received = false;
             client.Interpreter.Subscribe<ChatPacket>((pkt, id) => { received = (pkt.Message == "Ping"); }, this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
             _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "Ping" });
             Assert.That(SpinWait.SpinUntil(() => received, 2000), Is.True, "Packet not delivered.");
         }
@@ -155,8 +169,6 @@ namespace Liminal.Net.Tests
                 }
             }, this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True, "Client failed to connect.");
-
             _serverManager.Interpreter.SendCommand(1, new FilePacket { FileName = "test.bin", Data = sentData });
             _serverManager.SessionManager.Flush();
 
@@ -176,7 +188,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             byte[] oversizedData = new byte[5000];
 
@@ -191,7 +202,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool clientSawDisconnect = false;
             client.Events.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
@@ -208,8 +218,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var c1 = CreateAndStartClient();
             var c2 = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => c1.Transport.IsConnected && c2.Transport.IsConnected, 2000), Is.True);
 
             _serverManager.Shutdown();
 
@@ -272,12 +280,15 @@ namespace Liminal.Net.Tests
 
             var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
             _clientManagers.Add(client);
+
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
             client.StartClient("127.0.0.1", _currentTestPort);
 
             int receivedCount = 0;
             client.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref receivedCount), this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 2000), Is.True);
 
             for (int i = 0; i < 100; i++)
             {
@@ -290,9 +301,11 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test11_HostMode_InitializesAndConnectsLocalClient()
         {
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True, "Host failed to start or Local Client failed to connect to itself.");
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True, "Host failed to start or Local Client failed to connect to itself.");
 
             Assert.That(_serverManager.Role, Is.EqualTo(NetworkRole.Host));
 
@@ -316,7 +329,6 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
             var remoteClient = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected, 2000), Is.True);
 
             Assert.That(SpinWait.SpinUntil(() => remoteClientId != 0, 2000), Is.True, "Host did not detect the remote client connecting.");
         }
@@ -404,8 +416,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True, "Client failed to connect.");
-
             ushort myId = client.localID;
             Assert.That(myId, Is.Not.EqualTo(0), "Client was not assigned a valid ID.");
 
@@ -453,8 +463,6 @@ namespace Liminal.Net.Tests
                 if (pkt.Message == "UnreliablePing") received = true;
             }, this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
             _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "UnreliablePing" }, DeliveryMethod.Unreliable);
             _serverManager.SessionManager.Flush();
 
@@ -475,8 +483,6 @@ namespace Liminal.Net.Tests
                 if (pkt.Message == "ReliableMsg") receivedRel = true;
                 if (pkt.Message == "UnreliableMsg") receivedUnrel = true;
             }, this);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "UnreliableMsg" }, DeliveryMethod.Unreliable);
             _serverManager.Interpreter.SendCommand(1, new ChatPacket { Message = "ReliableMsg" }, DeliveryMethod.Reliable);
@@ -499,8 +505,6 @@ namespace Liminal.Net.Tests
                 if (pkt.Message == "BroadcastUnreliable") received = true;
             }, this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
             LiminalNetworkManager.Instance = _serverManager;
 
             Broadcaster.SendToClient(1, new ChatPacket { Message = "BroadcastUnreliable" }, DeliveryMethod.Unreliable);
@@ -515,7 +519,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             byte[] oversized = new byte[5000];
             Assert.DoesNotThrow(() =>
@@ -543,7 +546,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool sawUnreliable = false;
             bool sawReliable = false;
@@ -571,7 +573,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool sawUnreliable = false;
             bool sawReliable = false;
@@ -623,7 +624,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool sawUnreliable = false;
             _serverManager.Interpreter.Subscribe<FilePacket>((pkt, id) =>
@@ -663,7 +663,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             var dispatchOrder = new List<string>();
 
@@ -715,9 +714,12 @@ namespace Liminal.Net.Tests
 
             var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
             _clientManagers.Add(client);
+
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
             client.StartClient("127.0.0.1", _currentTestPort);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 2000), Is.True);
 
             int serverReceivedUnreliable = 0;
             int serverReceivedReliable = 0;
@@ -754,7 +756,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int receivedCount = 0;
             _serverManager.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref receivedCount), this);
@@ -780,7 +781,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "Unrel" }, DeliveryMethod.Unreliable);
             client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "Rel" }, DeliveryMethod.Reliable);

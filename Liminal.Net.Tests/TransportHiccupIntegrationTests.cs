@@ -555,8 +555,12 @@ namespace Liminal.Net.Tests
             config.Default_Port = port;
             var manager = new LiminalNetworkManager(new TcpTransport(), config);
             _managers.Add(manager);
+
+            bool ready = false;
+            manager.Events.OnLocalClientConnected += _ => ready = true;
+
             manager.StartClient(config.Default_Host, port);
-            Assert.That(SpinWait.SpinUntil(() => manager.Transport.IsConnected, 3000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => ready, 3000), Is.True, "Client failed to connect via OnLocalClientConnected.");
             return manager;
         }
 

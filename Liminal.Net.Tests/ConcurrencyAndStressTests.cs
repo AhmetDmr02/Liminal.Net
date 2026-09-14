@@ -53,7 +53,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -67,7 +67,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 5000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -83,8 +96,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var clientManager = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => clientManager.Transport.IsConnected, 5000), Is.True);
 
             ushort assignedId = clientManager.localID;
 
@@ -195,8 +206,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var clientManager = CreateAndStartClient();
 
-            Assert.That(SpinWait.SpinUntil(() => clientManager.Transport.IsConnected, 2000), Is.True);
-
             Thread.Sleep(100);
 
             ushort targetId = clientManager.localID;
@@ -275,14 +284,8 @@ namespace Liminal.Net.Tests
             for (int i = 0; i < ITERATIONS; i++)
             {
                 var client = CreateAndStartClient();
-
-                bool connected = SpinWait.SpinUntil(() => client.Transport.IsConnected, 1000);
-
-                if (connected)
-                {
-                    client.Disconnect();
-                    Thread.Sleep(50);
-                }
+                client.Disconnect();
+                Thread.Sleep(50);
             }
 
             Thread.Sleep(500);
@@ -534,7 +537,6 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => customServer.Transport.IsConnected, 2000), Is.True);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int serverReceivedCount = 0;
             customServer.Interpreter.Subscribe<ChatPacket>((pkt, id) => Interlocked.Increment(ref serverReceivedCount), this);
@@ -579,7 +581,6 @@ namespace Liminal.Net.Tests
             customServer.Interpreter.Subscribe<ChatPacket>((pkt, id) => { LiminalLogger.Log($"Server received packet: {pkt.Message}"); }, this);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool serverKickedClient = false;
             customServer.Events.OnClientKicked += (id) => serverKickedClient = true;

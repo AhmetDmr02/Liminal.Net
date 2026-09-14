@@ -75,6 +75,10 @@ namespace Liminal.Net.Tests
 
             var client = new LiminalNetworkManager(new TcpTransport<SecureFramingContext>(), clientConfig);
             _clientManagers.Add(client);
+
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             client.StartClient("127.0.0.1", _currentTestPort);
 
             bool received = false;
@@ -83,7 +87,7 @@ namespace Liminal.Net.Tests
                 if (pkt.Message == "FramedPing") received = true;
             }, this);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 2000), Is.True);
 
             // Send 10 packets from Server to Client
             for (int i = 0; i < 10; i++)
@@ -124,8 +128,11 @@ namespace Liminal.Net.Tests
             bool serverKickedClient = false;
             _serverManager.Events.OnClientKicked += (id) => serverKickedClient = true;
 
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             client.StartClient("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 2000), Is.True);
 
             // Client sends packet with bad magic cookie
             client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "Exploit" });
@@ -162,9 +169,13 @@ namespace Liminal.Net.Tests
 
             var client = new LiminalNetworkManager(new TcpTransport<SecureFramingContext>(), clientConfig);
             _clientManagers.Add(client);
+
+            bool client25Connected = false;
+            client.Events.OnLocalClientConnected += _ => client25Connected = true;
+
             client.StartClient("127.0.0.1", _currentTestPort);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client25Connected, 2000), Is.True);
             ushort assignedId = client.localID;
 
             int totalPackets = 1000;

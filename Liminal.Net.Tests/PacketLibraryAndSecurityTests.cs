@@ -1,4 +1,4 @@
-﻿using Liminal.Net.BasePackets;
+using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
@@ -55,7 +55,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -69,7 +69,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 3000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -305,9 +318,6 @@ namespace Liminal.Net.Tests
             var c1 = CreateAndStartClient();
             var c2 = CreateAndStartClient();
             var c3 = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() =>
-                c1.Transport.IsConnected && c2.Transport.IsConnected && c3.Transport.IsConnected, 3000), Is.True);
 
             ushort id1 = c1.localID;
             ushort id2 = c2.localID;

@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
@@ -57,7 +57,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(ILiminalTransport transport, uint tickRate = 20)
+        private LiminalNetworkManager CreateAndStartClient(ILiminalTransport transport, uint tickRate = 20, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -78,7 +78,20 @@ namespace Liminal.Net.Tests
 
             var client = new LiminalNetworkManager(transport, config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 3000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -178,8 +191,6 @@ namespace Liminal.Net.Tests
             var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 15.0, JitterMs = 0.0 };
             var client = CreateAndStartClient(clientTransport, tickRate: 20);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True, "Client failed to connect.");
-
             bool receivedWireTelemetry = SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 4000);
 
             Assert.That(receivedWireTelemetry, Is.True, "Client failed to measure WireRTT.");
@@ -198,7 +209,6 @@ namespace Liminal.Net.Tests
             var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 10.0, JitterMs = 0.0 };
             var client = CreateAndStartClient(clientTransport, tickRate: 20);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 3000), Is.True);
 
             var aligner = new LiminalPhaseAligner(_serverConfig);
@@ -229,7 +239,6 @@ namespace Liminal.Net.Tests
             var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 5.0, JitterMs = 0.0 };
             var client = CreateAndStartClient(clientTransport, tickRate: 60);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 3000), Is.True);
             Assert.That(client.TelemetryManager.WireRTT, Is.EqualTo(10.0).Within(4.0));
 
@@ -246,8 +255,6 @@ namespace Liminal.Net.Tests
 
             var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 15.0, JitterMs = 3.0 };
             var client = CreateAndStartClient(clientTransport, tickRate: 20);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int packetsDelivered = 0;
             client.Interpreter.Subscribe<ChatPacket>((pkt, senderId) =>

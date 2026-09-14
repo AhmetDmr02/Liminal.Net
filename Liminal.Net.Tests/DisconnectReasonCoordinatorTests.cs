@@ -1,4 +1,4 @@
-﻿using Liminal.Net.BasePackets;
+using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
@@ -56,7 +56,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -70,7 +70,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(PollUntil(() => connected, _serverManager, client, 2000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -105,8 +118,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
             ushort clientId = client.localID;
 
             DisconnectReason serverResolvedReason = DisconnectReason.Unknown;
@@ -155,8 +166,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
             ushort clientId = client.localID;
 
             DisconnectReason clientReceivedReason = DisconnectReason.Unknown;
@@ -192,8 +201,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
             ushort clientId = client.localID;
 
             client.Interpreter.UnsubscribeAll(client.DisconnectCoordinator);
@@ -231,8 +238,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
             ushort clientId = client.localID;
 
             DisconnectReason serverDetectedReason = DisconnectReason.Unknown;
@@ -279,7 +284,12 @@ namespace Liminal.Net.Tests
             var client = new LiminalNetworkManager(new TcpTransport<SecureFramingContext>(), clientConfig);
             _clientManagers.Add(client);
 
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(PollUntil(() => clientConnected, _serverManager, client, 2000), Is.True, "Client failed to connect via OnLocalClientConnected.");
 
             DisconnectReason serverResolvedReason = DisconnectReason.Unknown;
             bool serverResolved = false;
@@ -298,8 +308,6 @@ namespace Liminal.Net.Tests
                 clientResolvedReason = reason;
                 clientResolved = true;
             };
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
 
             // Send malformed payload from client to server to trip framer
             client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = "ExploitPayload" });
@@ -324,8 +332,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
             ushort clientId = client.localID;
 
             client.Interpreter.UnsubscribeAll(client.DisconnectCoordinator);
@@ -355,8 +361,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(PollUntil(() => client.Transport.IsConnected, _serverManager, client, 2000), Is.True);
 
             int unhandledExceptions = 0;
 
@@ -399,7 +403,6 @@ namespace Liminal.Net.Tests
 
             // Establish primary connection to fill slot
             var client1 = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected, 2000), Is.True);
 
             // Prepare second client that should get rejected due to capacity
             var client2Config = new LiminalNetworkConfig

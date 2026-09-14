@@ -54,7 +54,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -68,7 +68,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 3000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -97,7 +110,6 @@ namespace Liminal.Net.Tests
 
             var client = CreateAndStartClient();
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             Assert.That(timeoutServer.Transport.ConnectedClientCount, Is.EqualTo(1));
 
             bool timedOut = SpinWait.SpinUntil(() => serverSawDisconnect, 3000);
@@ -129,12 +141,15 @@ namespace Liminal.Net.Tests
             var client = new LiminalNetworkManager(new TcpTransport(), clientTimeoutConfig);
             _clientManagers.Add(client);
 
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             bool clientSawDisconnect = false;
             client.Events.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
 
             client.StartClient("127.0.0.1", _currentTestPort);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 2000), Is.True);
 
             bool clientTimedOut = SpinWait.SpinUntil(() => clientSawDisconnect, 3000);
 
@@ -218,6 +233,9 @@ namespace Liminal.Net.Tests
             var client = new LiminalNetworkManager(new TcpTransport(), clientSendConfig);
             _clientManagers.Add(client);
 
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             Task.Run(async () =>
             {
                 var acceptedSocket = await rawListener.AcceptTcpClientAsync();
@@ -229,7 +247,7 @@ namespace Liminal.Net.Tests
             });
 
             client.StartClient("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 2000), Is.True);
 
             byte[] largePayload = new byte[32768];
             Array.Fill(largePayload, (byte)0xFF);
@@ -303,11 +321,14 @@ namespace Liminal.Net.Tests
                     var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
                     clients.Add(client);
 
+                    bool isConnected = false;
+                    client.Events.OnLocalClientConnected += _ => isConnected = true;
+
                     barrier.SignalAndWait();
 
                     client.StartClient("127.0.0.1", _currentTestPort);
 
-                    if (SpinWait.SpinUntil(() => client.Transport.IsConnected, 2500))
+                    if (SpinWait.SpinUntil(() => isConnected, 2500))
                     {
                         connectedClients.Add(client);
                     }
@@ -342,9 +363,13 @@ namespace Liminal.Net.Tests
 
             var lateClient = new LiminalNetworkManager(new TcpTransport(), lateClientConfig);
             clients.Add(lateClient);
+
+            bool lateConnected = false;
+            lateClient.Events.OnLocalClientConnected += _ => lateConnected = true;
+
             lateClient.StartClient("127.0.0.1", _currentTestPort);
 
-            Assert.That(SpinWait.SpinUntil(() => lateClient.Transport.IsConnected, 2000), Is.True,
+            Assert.That(SpinWait.SpinUntil(() => lateConnected, 2000), Is.True,
                 "New client failed to claim the released connection slot.");
             Assert.That(customServer.Transport.ConnectedClientCount, Is.EqualTo(maxConnections),
                 "Server count did not return to max capacity after late client connected.");
@@ -429,8 +454,12 @@ namespace Liminal.Net.Tests
                 HandshakeTimeout = 2
             });
             clients.Add(testClient);
+
+            bool testClientConnected = false;
+            testClient.Events.OnLocalClientConnected += _ => testClientConnected = true;
+
             testClient.StartClient("127.0.0.1", _currentTestPort);
-            bool admitted = SpinWait.SpinUntil(() => testClient.Transport.IsConnected, 2500);
+            bool admitted = SpinWait.SpinUntil(() => testClientConnected, 2500);
             Assert.That(admitted, Is.True, "CAPACITY LEAK: Server locked up because replaced sockets never decremented _totalConnections.");
             Assert.That(server.Transport.ConnectedClientCount, Is.EqualTo(maxConnections));
 
@@ -499,7 +528,6 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => server.Transport.IsConnected, 2000), Is.True);
 
             var client1 = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected, 2000), Is.True);
             Assert.That(server.Transport.ConnectedClientCount, Is.EqualTo(1));
 
             ushort client1Id = client1.localID;
@@ -511,10 +539,6 @@ namespace Liminal.Net.Tests
                 "Server failed to decrement ConnectedClientCount after Kick.");
 
             var client2 = CreateAndStartClient();
-            bool client2Connected = SpinWait.SpinUntil(() => client2.Transport.IsConnected, 2000);
-
-            Assert.That(client2Connected, Is.True,
-                "Kick dropped the socket but leaked the capacity slot, blocking future clients.");
             Assert.That(server.Transport.ConnectedClientCount, Is.EqualTo(1));
 
             client2.Shutdown();

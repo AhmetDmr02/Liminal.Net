@@ -1,4 +1,4 @@
-﻿using Liminal.Net.BasePackets;
+using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
@@ -54,7 +54,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -68,7 +68,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 3000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -84,8 +97,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
             int packetsReceived = 0;
@@ -94,7 +105,7 @@ namespace Liminal.Net.Tests
             const int packetCount = 20;
             for (int i = 0; i < packetCount; i++)
             {
-                _serverManager.Interpreter.SendCommand(clientId, new ChatPacket { Message = $"Telemetry_{i}" });
+                _serverManager.Interpreter.SendCommand(clientId, new ChatPacket { Message = $"Ping_{i}" });
             }
             _serverManager.SessionManager.Flush();
 
@@ -121,11 +132,11 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void Test56_Telemetry_RTT_MeasuresNonZeroLatencyBetweenPeers()
+        public void Test56_Telemetry_RoundTripLatency_MeasuresAccurateLoopbackWindow()
         {
             var telemetryConfig = new LiminalTelemetryConfig
             {
-                Flags = TelemetryFlags.All,
+                Flags = TelemetryFlags.End2EndRTT,
                 PollIntervalInSeconds = 0.05f
             };
 
@@ -134,8 +145,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
             bool rttUpdated = SpinWait.SpinUntil(() =>
@@ -171,7 +180,6 @@ namespace Liminal.Net.Tests
             }, this);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             Thread.Sleep(300);
 
@@ -192,7 +200,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             client.TelemetryManager.Sample();
             Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.End2EndRTT > 0.0, 2000), Is.True);
@@ -230,7 +237,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
             Assert.That(SpinWait.SpinUntil(() => _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out _), 2000), Is.True);
@@ -259,7 +265,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.End2EndRTT > 0.0, 3000), Is.True);
 
@@ -287,8 +292,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
             bool baselineEstablished = SpinWait.SpinUntil(() =>
@@ -345,7 +348,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
             bool wireRttResolved = SpinWait.SpinUntil(() =>
@@ -426,8 +428,11 @@ namespace Liminal.Net.Tests
             var client = new LiminalNetworkManager(clientSimTransport, clientConfig, telemetryConfig);
             _clientManagers.Add(client);
 
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             client.StartClient("127.0.0.1", _currentTestPort);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 4000), Is.True, "Client failed to connect.");
+            Assert.That(SpinWait.SpinUntil(() => clientConnected, 4000), Is.True, "Client failed to connect via OnLocalClientConnected.");
 
             // Allow wire pings to travel and stabilize
             bool stabilized = SpinWait.SpinUntil(() =>
@@ -457,7 +462,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 2000), Is.True);
 
@@ -491,7 +495,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient(telemetryConfig);
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             ushort clientId = client.localID;
 
             Assert.That(SpinWait.SpinUntil(() => _serverManager.TelemetryManager.TryGetClientWireRTT(clientId, out _), 2000), Is.True);
@@ -514,7 +517,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
 
             var client = CreateAndStartClient();
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             var clientTransport = (TcpTransport)client.Transport;
 

@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.SyncVar;
@@ -74,7 +74,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient()
+        private LiminalNetworkManager CreateAndStartClient(bool waitForConnect = true)
         {
             var config = new LiminalNetworkConfig
             {
@@ -90,7 +90,20 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config);
             _clientManagers.Add(client);
+
+            bool connected = false;
+            if (waitForConnect)
+            {
+                client.Events.OnLocalClientConnected += _ => connected = true;
+            }
+
             client.StartClient("127.0.0.1", _currentTestPort);
+
+            if (waitForConnect)
+            {
+                Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect via OnLocalClientConnected.");
+            }
+
             return client;
         }
 
@@ -106,7 +119,6 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 1337, 2000), Is.True,
                 "Client failed to receive the initial snapshot blit on connection.");
         }
@@ -121,7 +133,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 10, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 10, 2000), Is.True);
 
             int callbackOld = 0;
             int callbackNew = 0;
@@ -134,11 +146,16 @@ namespace Liminal.Net.Tests
                 callbackFired = true;
             };
 
-            serverVar.Value = 99;
+            serverVar.Value = 42;
 
-            Assert.That(SpinWait.SpinUntil(() => callbackFired && clientVar.Value == 99, 2000), Is.True);
-            Assert.That(callbackOld, Is.EqualTo(10));
-            Assert.That(callbackNew, Is.EqualTo(99));
+            Assert.That(SpinWait.SpinUntil(() => callbackFired && clientVar.Value == 42, 2000), Is.True,
+                "Client failed to observe mutated SyncVar value.");
+            Assert.Multiple(() =>
+            {
+                Assert.That(callbackOld, Is.EqualTo(10));
+                Assert.That(callbackNew, Is.EqualTo(42));
+                Assert.That(clientVar.Version, Is.EqualTo(serverVar.Version));
+            });
         }
 
         [Test]
@@ -151,7 +168,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 50, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50, 2000), Is.True);
             Assert.That(clientVar.HasAuthority, Is.False);
 
             bool callbackFired = false;
@@ -179,7 +196,6 @@ namespace Liminal.Net.Tests
             var c1Var = client1.SyncVarManager.Bind<int>(token);
             var c2Var = client2.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client1.Transport.IsConnected && client2.Transport.IsConnected, 2000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 100 && c2Var.Value == 100, 2000), Is.True);
 
             bool c1AuthEventFired = false;
@@ -205,7 +221,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 10, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 10, 2000), Is.True);
 
             serverVar.AddAuthority(client.localID);
             Assert.That(SpinWait.SpinUntil(() => clientVar.HasAuthority, 2000), Is.True);
@@ -255,7 +271,7 @@ namespace Liminal.Net.Tests
             var c2 = client.SyncVarManager.Bind<float>(t2);
             var c3 = client.SyncVarManager.Bind<string>(t3);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && c3.Value == "Init", 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => c3.Value == "Init", 2000), Is.True);
 
             s1.Value = 500;
             s2.Value = 99.9f;
@@ -276,8 +292,6 @@ namespace Liminal.Net.Tests
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<TestStatePayload>(token);
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             int observedTornSnapshots = 0;
             int receivedUpdates = 0;
@@ -329,8 +343,6 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
-
             for (int i = 1; i <= 100; i++)
             {
                 serverVar.Value = i;
@@ -344,15 +356,18 @@ namespace Liminal.Net.Tests
         public void Test10_HostMode_BidirectionalSync()
         {
             string token = $"host_sync_{Guid.NewGuid():N}";
+
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
             _serverManager.StartHost();
 
-            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected && _serverManager.localID != 0, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 2000), Is.True);
 
             var hostVar = new SyncVar<int>(token, 10);
             var remoteClient = CreateAndStartClient();
             var clientVar = remoteClient.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => remoteClient.Transport.IsConnected && clientVar.Value == 10, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 10, 2000), Is.True);
 
             hostVar.Value = 42;
             Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 42, 2000), Is.True);
@@ -369,8 +384,6 @@ namespace Liminal.Net.Tests
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
-
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             // ServerConfig sets page size to 4096. 30 large arrays push memory past page 0.
             const int totalVars = 30;
@@ -430,11 +443,15 @@ namespace Liminal.Net.Tests
             };
             var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
             _clientManagers.Add(client);
+
+            bool clientConnected = false;
+            client.Events.OnLocalClientConnected += _ => clientConnected = true;
+
             client.StartClient("127.0.0.1", newPort);
 
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 20, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientConnected && clientVar.Value == 20, 2000), Is.True);
         }
         #region SetDirty, Authority Guard & Exclusion List Tests
 
@@ -448,7 +465,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 50, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50, 2000), Is.True);
 
             uint initialVersion = serverVar.Version;
             bool clientFired = false;
@@ -475,7 +492,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 75, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 75, 2000), Is.True);
             Assert.That(clientVar.HasAuthority, Is.False);
 
             uint clientVersionBefore = clientVar.Version;
@@ -498,7 +515,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 10, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 10, 2000), Is.True);
             Assert.That(clientVar.HasAuthority, Is.False);
 
             ushort clientId = client.localID;
@@ -568,7 +585,7 @@ namespace Liminal.Net.Tests
             var client = CreateAndStartClient();
             var clientVar = client.SyncVarManager.Bind<int>(token);
 
-            Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected && clientVar.Value == 100, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 100, 2000), Is.True);
 
             // Client attempts to modify exclusion lists
             clientVar.AddExclusion(5);
