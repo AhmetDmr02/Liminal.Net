@@ -44,4 +44,10 @@ namespace Liminal.Net.BasePackets
     public struct ConnectionHandshakeReadyConfirmed
     {
     }
+
+    [LiminalPacket]
+    [MessagePackObject]
+    public struct ConnectionHandshakeClientFullyReady
+    {
+    }
 }

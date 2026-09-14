@@ -120,12 +120,30 @@ namespace Liminal.Net.Handshakes
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Invalid ACK");
                 }
 
-                onClientValidated?.Invoke(assignedId);
 
-                ushort fourthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
                 var readyPacket = new ConnectionHandshakeReadyConfirmed();
-                await SendPacketAsync(stream, fourthPacketId, readyPacket, cts.Token).ConfigureAwait(false);
+                ushort readyPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
+                await SendPacketAsync(stream, readyPacketId, readyPacket, cts.Token).ConfigureAwait(false);
                 await stream.FlushAsync(cts.Token).ConfigureAwait(false);
+
+                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
+                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+
+                ushort fifthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientFullyReady>();
+                if (packetId != fifthPacketId || length < 0 || length > _maxHandshakeSize)
+                {
+                    Drop(client, $"Protocol Violation: Expected ClientFullyReady (ID {fifthPacketId}, Length {length})", forceRst: true);
+                    return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "FullyReady violation");
+                }
+
+                if (length > 0)
+                {
+                    byte[] fullyReadyPayload = new byte[length];
+                    await stream.LiminalReadExactlyAsync(fullyReadyPayload, 0, length, cts.Token).ConfigureAwait(false);
+                }
+
+                onClientValidated?.Invoke(assignedId);
 
                 return HandshakeResult.Ok(assignedId);
             }
@@ -225,6 +243,10 @@ namespace Liminal.Net.Handshakes
                     byte[] readyPayload = new byte[length];
                     await stream.LiminalReadExactlyAsync(readyPayload, 0, length, cts.Token).ConfigureAwait(false);
                 }
+
+                ushort fifthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientFullyReady>();
+                await SendPacketAsync(stream, fifthPacketId, new ConnectionHandshakeClientFullyReady(), cts.Token).ConfigureAwait(false);
+                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 return HandshakeResult.Ok(assignedId);
             }

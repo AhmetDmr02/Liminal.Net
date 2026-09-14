@@ -549,8 +549,6 @@ namespace Liminal.Net.Transports
                 if (result.Success)
                 {
                     _localClientId = result.ClientId;
-                    _isConnected = true;
-
                     PromoteLocalClient(_localClientId, client);
                 }
                 else
@@ -708,10 +706,14 @@ namespace Liminal.Net.Transports
 
             _clientIdResolver.ConfirmRegistration(clientId);
 
+            _onClientConnected?.Invoke(clientId);
+
+            if (!IsCurrentConnection(clientId, client, sendState))
+                return;
+
             sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
             _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
 
-            _onClientConnected?.Invoke(clientId);
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
         }
 
@@ -723,11 +725,24 @@ namespace Liminal.Net.Transports
             _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
             _sockets[ILiminalTransport.SERVER_ID] = client;
 
+            _isConnected = true;
+            _onLocalClientConnected?.Invoke(assignedId);
+
+            if (!IsCurrentConnection(ILiminalTransport.SERVER_ID, client, sendState))
+                return;
+
             sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(ILiminalTransport.SERVER_ID, client, sendState));
             _ = Task.Run(() => ReceiveLoop(ILiminalTransport.SERVER_ID, client, sendState));
 
-            _onLocalClientConnected?.Invoke(assignedId);
             LiminalLogger.Log($"[Transport] Successfully connected to server. Local ID: {assignedId}");
+        }
+
+        private bool IsCurrentConnection(ushort clientId, TcpClient client, ClientSendState sendState)
+        {
+            return _sockets.TryGetValue(clientId, out var currentClient) &&
+                   ReferenceEquals(currentClient, client) &&
+                   _sendQueues.TryGetValue(clientId, out var currentSendState) &&
+                   ReferenceEquals(currentSendState, sendState);
         }
 
         private async Task ReceiveLoop(ushort incomingId, TcpClient client, ClientSendState ownedSendState)
