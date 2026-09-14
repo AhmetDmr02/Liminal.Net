@@ -135,6 +135,7 @@ namespace Liminal.Net.Transports
 
         public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
         public int ConnectedClientCount => _sockets.Count;
+        public int TotalConnections => Volatile.Read(ref _totalConnections);
 
         public TContext OutboundContext { get; set; }
 

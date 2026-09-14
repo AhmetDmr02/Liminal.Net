@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 
 namespace Liminal.Net.Core
@@ -58,7 +58,8 @@ namespace Liminal.Net.Core
             // Deadband: within 0.5ms of target cushion, do not adjust
             if (Math.Abs(errorMs) < 0.5) return 0;
 
-            long errorTicks = (long)((errorMs / 1000.0) * Stopwatch.Frequency);
+            // Damping factor of 0.5 prevents 2-tick pipeline limit-cycle oscillation across the deadband
+            long errorTicks = (long)(((errorMs * 0.5) / 1000.0) * Stopwatch.Frequency);
 
             // Clamp to + - _maxSlewPerTickTicks per tick
             return Math.Clamp(errorTicks, -_maxSlewPerTickTicks, _maxSlewPerTickTicks);

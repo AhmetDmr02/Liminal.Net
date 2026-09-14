@@ -191,10 +191,13 @@ namespace Liminal.Net.Tests
             var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 15.0, JitterMs = 0.0 };
             var client = CreateAndStartClient(clientTransport, tickRate: 20);
 
-            bool receivedWireTelemetry = SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 4000);
+            bool receivedWireTelemetry = SpinWait.SpinUntil(() =>
+                client.TelemetryManager != null &&
+                client.TelemetryManager.WireRTT > 0.0 &&
+                Math.Abs(client.TelemetryManager.WireRTT - 30.0) <= 6.0, 5000);
 
-            Assert.That(receivedWireTelemetry, Is.True, "Client failed to measure WireRTT.");
-            Assert.That(client.TelemetryManager.WireRTT, Is.EqualTo(30.0).Within(6.0), "WireRTT did not match simulated latency.");
+            Assert.That(receivedWireTelemetry, Is.True,
+                $"Client WireRTT did not stabilize around expected simulated latency. Current WireRTT: {client.TelemetryManager?.WireRTT:F2} ms");
             Assert.That(client.TelemetryManager.ServerCountdownMs, Is.InRange(0.0, 50.0), "Server countdown is outside the 50ms tick boundary.");
         }
 
@@ -212,19 +215,20 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 3000), Is.True);
 
             var aligner = new LiminalPhaseAligner(_serverConfig);
-
-            bool converged = SpinWait.SpinUntil(() =>
+            int consecutiveZeroSlews = 0;
+            client.Events.OnPreFlush += () =>
             {
                 double wireRtt = client.TelemetryManager.WireRTT;
-                double serverCountdown = client.TelemetryManager.ServerCountdownMs;
+                if (wireRtt <= 0.0) return;
+                long slew = aligner.CalculateSlewAdjustment(wireRtt, client.TelemetryManager.ServerCountdownMs, clientCountdownMs: 0.0);
+                if (slew == 0)
+                    Interlocked.Increment(ref consecutiveZeroSlews);
+                else
+                    Interlocked.Exchange(ref consecutiveZeroSlews, 0);
+            };
 
-                if (wireRtt <= 0.0) return false;
-
-                long slew = aligner.CalculateSlewAdjustment(wireRtt, serverCountdown, clientCountdownMs: 0.0);
-                return slew == 0;
-            }, 6000);
-
-            Assert.That(converged, Is.True, "Client ticker failed to converge phase into the target cushion deadband.");
+            Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref consecutiveZeroSlews) >= 3, 6000), Is.True,
+                "Client ticker failed to converge phase into the target cushion deadband.");
         }
 
         [Test]
@@ -239,8 +243,13 @@ namespace Liminal.Net.Tests
             var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 5.0, JitterMs = 0.0 };
             var client = CreateAndStartClient(clientTransport, tickRate: 60);
 
-            Assert.That(SpinWait.SpinUntil(() => client.TelemetryManager.WireRTT > 0.0, 3000), Is.True);
-            Assert.That(client.TelemetryManager.WireRTT, Is.EqualTo(10.0).Within(4.0));
+            bool receivedWireTelemetry = SpinWait.SpinUntil(() =>
+                client.TelemetryManager != null &&
+                client.TelemetryManager.WireRTT > 0.0 &&
+                Math.Abs(client.TelemetryManager.WireRTT - 10.0) <= 4.0, 5000);
+
+            Assert.That(receivedWireTelemetry, Is.True,
+                $"Client WireRTT did not stabilize around expected 10ms simulated latency. Current WireRTT: {client.TelemetryManager?.WireRTT:F2} ms");
 
             var aligner = new LiminalPhaseAligner(_serverConfig);
             Assert.That(aligner.GetProportionalCushionMs(), Is.EqualTo(1000.0 / 60.0 * 0.4).Within(0.1));

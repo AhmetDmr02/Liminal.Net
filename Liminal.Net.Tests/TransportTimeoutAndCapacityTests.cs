@@ -441,8 +441,10 @@ namespace Liminal.Net.Tests
             bool allSettled = Task.WaitAll(settled, TimeSpan.FromSeconds(5));
             Assert.That(allSettled, Is.True, "Storm clients never reached a terminal state in time.");
 
-            Assert.That(SpinWait.SpinUntil(() => server.Transport.ConnectedClientCount == 1, 3000), Is.True,
-                "Expected exactly 1 socket surviving in the dictionary for ID 42.");
+            Assert.That(SpinWait.SpinUntil(() =>
+                server.Transport.ConnectedClientCount == 1 &&
+                (server.Transport as TcpTransport)?.TotalConnections == 1, 3000), Is.True,
+                "Expected exactly 1 socket surviving in the dictionary and TotalConnections slot settled to 1 for ID 42.");
 
             collisionResolver.SetTargetId(999);
             var testClient = new LiminalNetworkManager(new TcpTransport(), new LiminalNetworkConfig
