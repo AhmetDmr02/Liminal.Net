@@ -638,13 +638,13 @@ namespace Liminal.Net.Transports
                     _ = Task.Run(async () =>
                     {
                         bool promoted = false;
+                        ushort assignedClientId = 0;
                         try
                         {
                             _onHandshakeInitialized?.Invoke();
 
                             var pipeline = new TcpHandshakePipeline(_clientIdResolver, _config);
 
-                            ushort assignedClientId = 0;
                             ClientSendState clientSendState = null;
 
                             HandshakeResult result = await pipeline.TryVerifyClientAsync(

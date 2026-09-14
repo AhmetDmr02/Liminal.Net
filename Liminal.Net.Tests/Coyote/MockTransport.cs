@@ -1,16 +1,99 @@
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
+using System.Collections.Generic;
 
 namespace Liminal.Net.Tests
 {
     public class MockTransport : ILiminalTransport
     {
+        public struct PacketRecord
+        {
+            public byte[] Data;
+            public ushort TargetId;
+            public TransportFlags Flags;
+        }
+
+        public class ThreadSafeSet<T> : IEnumerable<T>
+        {
+            private readonly HashSet<T> _set = new();
+            private readonly object _lock = new();
+
+            public bool Add(T item)
+            {
+                lock (_lock) return _set.Add(item);
+            }
+
+            public bool Remove(T item)
+            {
+                lock (_lock) return _set.Remove(item);
+            }
+
+            public bool Contains(T item)
+            {
+                lock (_lock) return _set.Contains(item);
+            }
+
+            public void Clear()
+            {
+                lock (_lock) _set.Clear();
+            }
+
+            public int Count
+            {
+                get { lock (_lock) return _set.Count; }
+            }
+
+            public IEnumerator<T> GetEnumerator()
+            {
+                lock (_lock) return new List<T>(_set).GetEnumerator();
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+
+        public class ThreadSafeList<T> : IEnumerable<T>
+        {
+            private readonly List<T> _list = new();
+            private readonly object _lock = new();
+
+            public void Add(T item)
+            {
+                lock (_lock) _list.Add(item);
+            }
+
+            public void Clear()
+            {
+                lock (_lock) _list.Clear();
+            }
+
+            public int Count
+            {
+                get { lock (_lock) return _list.Count; }
+            }
+
+            public T this[int index]
+            {
+                get { lock (_lock) return _list[index]; }
+            }
+
+            public IEnumerator<T> GetEnumerator()
+            {
+                lock (_lock) return new List<T>(_list).GetEnumerator();
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+
+        public readonly ThreadSafeList<PacketRecord> SentPackets = new();
+        public readonly ThreadSafeSet<ushort> ConnectedClients = new();
+        public readonly ThreadSafeSet<ushort> KickedClients = new();
+
         public ushort LocalClientId => 1;
-        public bool IsServer => true;
-        public bool IsClient => false;
+        public bool IsServer { get; set; } = true;
+        public bool IsClient => !IsServer;
         public bool IsConnected => true;
-        public int ConnectedClientCount => 1;
+        public int ConnectedClientCount => ConnectedClients.Count > 0 ? ConnectedClients.Count : 1;
 
         public LiminalNetworkConfig Config => _conf;
 
@@ -44,18 +127,49 @@ namespace Liminal.Net.Tests
 
         public void Send(Span<byte> data, ushort clientId, TransportFlags flags)
         {
+            SentPackets.Add(new PacketRecord
+            {
+                Data = data.ToArray(),
+                TargetId = clientId,
+                Flags = flags
+            });
             OnSendHook?.Invoke(data.ToArray(), clientId, flags);
         }
 
-        public void Kick(ushort clientId) => OnClientKicked?.Invoke(clientId);
+        public void Kick(ushort clientId)
+        {
+            KickedClients.Add(clientId);
+            ConnectedClients.Remove(clientId);
+            OnClientKicked?.Invoke(clientId);
+        }
+
         public Func<ushort, bool>? IsClientConnectedFunc;
-        public bool IsClientConnected(ushort clientId) => IsClientConnectedFunc?.Invoke(clientId) ?? true;
+        public bool IsClientConnected(ushort clientId)
+        {
+            if (IsClientConnectedFunc != null) return IsClientConnectedFunc(clientId);
+            if (ConnectedClients.Count > 0) return ConnectedClients.Contains(clientId);
+            return true;
+        }
 
         #region Test Injection Triggers
 
-        public void TriggerClientConnected(ushort id) => OnClientConnected?.Invoke(id);
-        public void TriggerClientDisconnected(ushort id) => OnClientDisconnected?.Invoke(id);
-        public void TriggerClientKicked(ushort id) => OnClientKicked?.Invoke(id);
+        public void TriggerClientConnected(ushort id)
+        {
+            ConnectedClients.Add(id);
+            OnClientConnected?.Invoke(id);
+        }
+
+        public void TriggerClientDisconnected(ushort id)
+        {
+            ConnectedClients.Remove(id);
+            OnClientDisconnected?.Invoke(id);
+        }
+
+        public void TriggerClientKicked(ushort id)
+        {
+            Kick(id);
+        }
+
         public void TriggerLocalClientConnected(ushort id) => OnLocalClientConnected?.Invoke(id);
         public void TriggerLocalClientDisconnected(ushort id) => OnLocalClientDisconnected?.Invoke(id);
 

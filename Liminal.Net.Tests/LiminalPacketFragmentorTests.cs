@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Transports;
@@ -610,9 +610,80 @@ namespace Liminal.Net.Tests
                 public TransportFlags Flags;
             }
 
-            public readonly List<PacketRecord> SentPackets = new();
-            public readonly HashSet<ushort> ConnectedClients = new();
-            public readonly HashSet<ushort> KickedClients = new();
+            public class ThreadSafeSet<T> : IEnumerable<T>
+            {
+                private readonly HashSet<T> _set = new();
+                private readonly object _lock = new();
+
+                public bool Add(T item)
+                {
+                    lock (_lock) return _set.Add(item);
+                }
+
+                public bool Remove(T item)
+                {
+                    lock (_lock) return _set.Remove(item);
+                }
+
+                public bool Contains(T item)
+                {
+                    lock (_lock) return _set.Contains(item);
+                }
+
+                public void Clear()
+                {
+                    lock (_lock) _set.Clear();
+                }
+
+                public int Count
+                {
+                    get { lock (_lock) return _set.Count; }
+                }
+
+                public IEnumerator<T> GetEnumerator()
+                {
+                    lock (_lock) return new List<T>(_set).GetEnumerator();
+                }
+
+                System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+            }
+
+            public class ThreadSafeList<T> : IEnumerable<T>
+            {
+                private readonly List<T> _list = new();
+                private readonly object _lock = new();
+
+                public void Add(T item)
+                {
+                    lock (_lock) _list.Add(item);
+                }
+
+                public void Clear()
+                {
+                    lock (_lock) _list.Clear();
+                }
+
+                public int Count
+                {
+                    get { lock (_lock) return _list.Count; }
+                }
+
+                public T this[int index]
+                {
+                    get { lock (_lock) return _list[index]; }
+                }
+
+                public IEnumerator<T> GetEnumerator()
+                {
+                    lock (_lock) return new List<T>(_list).GetEnumerator();
+                }
+
+                System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+            }
+
+            public readonly ThreadSafeList<PacketRecord> SentPackets = new();
+            public readonly ThreadSafeSet<ushort> ConnectedClients = new();
+            public readonly ThreadSafeSet<ushort> KickedClients = new();
 
             public ushort LocalClientId => 1;
             public bool IsServer { get; set; } = false;
