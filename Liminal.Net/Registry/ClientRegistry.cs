@@ -199,7 +199,32 @@ namespace Liminal.Net.Registry
         private void HandleLocalClientConnected(ushort localId)
         {
             if (_manager.Role == NetworkRole.Host)
+            {
+                Interlocked.Exchange(ref _hostClientId, localId);
+                if (_clients.TryGetValue(localId, out var existing))
+                {
+                    if (!existing.IsHost || !existing.IsLocal)
+                    {
+                        var updated = new ConnectedClient(localId, isLocal: true, isHost: true);
+                        _clients[localId] = updated;
+                        LocalClient = updated;
+                    }
+                    else
+                    {
+                        LocalClient = existing;
+                    }
+                }
+                else
+                {
+                    var hostClient = new ConnectedClient(localId, isLocal: true, isHost: true);
+                    _clients.TryAdd(localId, hostClient);
+                    LocalClient = hostClient;
+                    _onClientJoined?.Invoke(hostClient);
+                }
+
+                _onLocalClientReady?.Invoke(LocalClient);
                 return;
+            }
 
             var localClient = new ConnectedClient(localId, isLocal: true, isHost: false);
             LocalClient = localClient;

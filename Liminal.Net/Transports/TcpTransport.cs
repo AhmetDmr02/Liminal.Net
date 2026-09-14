@@ -513,14 +513,22 @@ namespace Liminal.Net.Transports
             {
                 LiminalLogger.LogWarning($"[Transport] Outbound writer aborted on client {clientId}: {ex.Message}");
 
-                if (IsServer) Kick(clientId);
+                if (IsServer)
+                {
+                    if (IsCurrentConnection(clientId, client, state))
+                        Kick(clientId);
+                }
                 else Shutdown();
             }
             catch (Exception ex)
             {
                 LiminalLogger.LogError($"[Transport] Unexpected outbound writer failure on {clientId}: {ex.Message}");
 
-                if (IsServer) Kick(clientId);
+                if (IsServer)
+                {
+                    if (IsCurrentConnection(clientId, client, state))
+                        Kick(clientId);
+                }
                 else Shutdown();
             }
             finally
@@ -558,10 +566,22 @@ namespace Liminal.Net.Transports
 
                 _onHandshakeInitialized?.Invoke();
 
-                HandshakeResult result = await ClientHandshaker(client, _config).ConfigureAwait(false);
+                HandshakeResult result;
+                if (ClientHandshaker != null && ClientHandshaker.Target == null && ClientHandshaker.Method.Name == nameof(DefaultHandshakes.ClientTcpHandshake))
+                {
+                    result = await DefaultHandshakes.ClientTcpHandshake(client, _config, assignedId =>
+                    {
+                        _localClientId = assignedId;
+                    }).ConfigureAwait(false);
+                }
+                else
+                {
+                    result = await ClientHandshaker(client, _config).ConfigureAwait(false);
+                }
 
                 if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
                 {
+                    _localClientId = 0;
                     try { client.Close(); } catch { }
                     return;
                 }
@@ -573,6 +593,7 @@ namespace Liminal.Net.Transports
                 }
                 else
                 {
+                    _localClientId = 0;
                     try { client.Close(); } catch { }
 
                     OnTransportDisconnectReason?.Invoke(ILiminalTransport.SERVER_ID, result.FailureReason, result.FailureMessage);
@@ -583,10 +604,12 @@ namespace Liminal.Net.Transports
             }
             catch (OperationCanceledException)
             {
+                _localClientId = 0;
                 try { client.Close(); } catch { }
             }
             catch (Exception ex)
             {
+                _localClientId = 0;
                 try { client.Close(); } catch { }
                 LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
                 Shutdown();
@@ -621,6 +644,9 @@ namespace Liminal.Net.Transports
 
                             var pipeline = new TcpHandshakePipeline(_clientIdResolver, _config);
 
+                            ushort assignedClientId = 0;
+                            ClientSendState clientSendState = null;
+
                             HandshakeResult result = await pipeline.TryVerifyClientAsync(
                                 acceptedClient,
                                 _config.Version,
@@ -639,17 +665,38 @@ namespace Liminal.Net.Transports
                                         }
                                     }
                                 },
-                                assignedId =>
+                                onClientValidated: null,
+                                onClientPreValidated: assignedId =>
                                 {
-                                    PromoteClient(assignedId, acceptedClient);
+                                    assignedClientId = assignedId;
+                                    PrePromoteClient(assignedId, acceptedClient, out clientSendState);
                                     promoted = true;
+                                    return clientSendState;
+                                },
+                                onClientPostValidated: (assignedId, state) =>
+                                {
+                                    PostPromoteClient(assignedId, acceptedClient, (ClientSendState)state);
                                 }
                             ).ConfigureAwait(false);
 
                             if (!result.Success)
                             {
                                 LiminalLogger.LogWarning($"[Transport] Handshake rejected client: {result.FailureReason} - {result.FailureMessage}");
-                                try { acceptedClient.Close(); } catch { }
+                                if (promoted && assignedClientId != 0)
+                                {
+                                    if (_sockets.TryGetValue(assignedClientId, out var cur) && ReferenceEquals(cur, acceptedClient))
+                                    {
+                                        Kick(assignedClientId);
+                                    }
+                                    else
+                                    {
+                                        try { acceptedClient.Close(); } catch { }
+                                    }
+                                }
+                                else
+                                {
+                                    try { acceptedClient.Close(); } catch { }
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -689,14 +736,13 @@ namespace Liminal.Net.Transports
             }
         }
 
-        internal void PromoteClient(ushort clientId, TcpClient client)
+        internal void PrePromoteClient(ushort clientId, TcpClient client, out ClientSendState sendState)
         {
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
 
             int maxPacketCount = _config.Hiccup.Enabled ? _config.MaxPacketCount * _config.Hiccup.MaxRecoveryScale : _config.MaxPacketCount;
             maxPacketCount = Math.Max(_config.MaxPacketCount, maxPacketCount);
 
-            ClientSendState sendState;
             ClientSendState oldSendState = null;
             TcpClient oldClient = null;
 
@@ -705,16 +751,19 @@ namespace Liminal.Net.Transports
                 if (_isShuttingDown != 0 || !_isConnected)
                 {
                     try { client.Close(); } catch { }
+                    sendState = null;
                     return;
                 }
 
-                sendState = new ClientSendState(maxPacketCount);
+                var newSendState = new ClientSendState(maxPacketCount);
 
-                _sendQueues.AddOrUpdate(clientId, sendState, (k, old) =>
+                _sendQueues.AddOrUpdate(clientId, newSendState, (k, old) =>
                 {
                     oldSendState = old;
-                    return sendState;
+                    return newSendState;
                 });
+
+                sendState = newSendState;
 
                 _sockets.AddOrUpdate(clientId, client, (key, old) =>
                 {
@@ -727,9 +776,6 @@ namespace Liminal.Net.Transports
                 });
 
                 _clientIdResolver.ConfirmRegistration(clientId);
-
-                sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
-                _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
             }
 
             if (oldSendState != null)
@@ -749,9 +795,44 @@ namespace Liminal.Net.Transports
                 try { oldClient.Close(); } catch { }
             }
 
-            _onClientConnected?.Invoke(clientId);
+            try
+            {
+                _onClientConnected?.Invoke(clientId);
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Transport] Error during OnClientConnected for {clientId}: {ex.Message}");
+                if (_sockets.TryGetValue(clientId, out var cur) && ReferenceEquals(cur, client))
+                {
+                    Kick(clientId);
+                }
+                else
+                {
+                    try { client.Close(); } catch { }
+                }
+                sendState = null;
+                return;
+            }
+        }
+
+        internal void PostPromoteClient(ushort clientId, TcpClient client, ClientSendState sendState)
+        {
+            if (sendState == null)
+                return;
+
+            if (!IsCurrentConnection(clientId, client, sendState))
+                return;
+
+            sendState.WriterTask = Task.Run(() => ProcessSendQueueAsync(clientId, client, sendState));
+            _ = Task.Run(async () => ReceiveLoop(clientId, client, sendState));
 
             LiminalLogger.Log($"[Transport] Client {clientId} successfully promoted to Game Loop.");
+        }
+
+        internal void PromoteClient(ushort clientId, TcpClient client)
+        {
+            PrePromoteClient(clientId, client, out var sendState);
+            PostPromoteClient(clientId, client, sendState);
         }
 
         private void PromoteLocalClient(ushort assignedId, TcpClient client)
@@ -763,7 +844,16 @@ namespace Liminal.Net.Transports
             _sockets[ILiminalTransport.SERVER_ID] = client;
 
             _isConnected = true;
-            _onLocalClientConnected?.Invoke(assignedId);
+            try
+            {
+                _onLocalClientConnected?.Invoke(assignedId);
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Transport] Error during OnLocalClientConnected: {ex.Message}");
+                Disconnect();
+                return;
+            }
 
             if (!IsCurrentConnection(ILiminalTransport.SERVER_ID, client, sendState))
                 return;
@@ -883,8 +973,15 @@ namespace Liminal.Net.Transports
                         if (TryClaimDisconnect(client))
                         {
                             Interlocked.Decrement(ref _totalConnections);
-                            _onClientDisconnected?.Invoke(incomingId);
-                            LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
+                            if (_sockets.TryGetValue(incomingId, out var activeClient) && !ReferenceEquals(activeClient, client))
+                            {
+                                LiminalLogger.Log($"[Transport] Old socket for client {incomingId} closed after replacement.");
+                            }
+                            else
+                            {
+                                _onClientDisconnected?.Invoke(incomingId);
+                                LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
+                            }
                         }
                     }
                     else if (_isClient)

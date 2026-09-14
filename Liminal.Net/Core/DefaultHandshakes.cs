@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Handshakes;
+using Liminal.Net.Handshakes;
 using System;
 using System.Net.Sockets;
 using System.Threading.Tasks;
@@ -13,13 +13,16 @@ namespace Liminal.Net.Core
             return await pipeline.TryVerifyClientAsync(client, config.Version, canAccept);
         }
 
-        public static async Task<HandshakeResult> ClientTcpHandshake(TcpClient client, LiminalNetworkConfig config)
+        public static Task<HandshakeResult> ClientTcpHandshake(TcpClient client, LiminalNetworkConfig config)
+            => ClientTcpHandshake(client, config, null);
+
+        public static async Task<HandshakeResult> ClientTcpHandshake(TcpClient client, LiminalNetworkConfig config, Action<ushort> onAssignedId)
         {
             try
             {
                 var pipeline = new TcpHandshakePipeline(config.ClientIdResolver, config, config.MaxHandshakeSize, (int)config.HandshakeTimeout);
 
-                return await pipeline.TryConnectToServerAsync(client, config.Version);
+                return await pipeline.TryConnectToServerAsync(client, config.Version, onAssignedId);
             }
             catch (Exception ex)
             {

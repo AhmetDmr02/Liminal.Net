@@ -12,7 +12,6 @@ namespace Liminal.Net.Tests.Coyote
     [TestFixture]
     public class LockFreeDirtyBitsetConcurrencyCoyoteTests
     {
-        [NUnitTest]
         [CoyoteTest]
         public static async Task Coyote_DirtyBitset_ConcurrentSetAndConsume_ZeroLostBits()
         {
@@ -117,7 +116,6 @@ namespace Liminal.Net.Tests.Coyote
                 $"Lost bits in bucket 1! Expected: 0x{expectedBucket1:X16}, Got: 0x{accumulatedBucket1:X16}");
         }
 
-        [NUnitTest]
         [CoyoteTest]
         public static async Task Coyote_DirtyBitset_MultipleThreadsSameBit_ZeroRaceOrDeadlock()
         {

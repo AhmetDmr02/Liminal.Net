@@ -39,7 +39,6 @@ namespace Liminal.Net.Tests.Coyote
             };
         }
 
-        [NUnitTest]
         [CoyoteTest]
         public static async Task Coyote_Server_ConcurrentConnectAndDisconnect_ZeroDesyncOrTornState()
         {
@@ -138,7 +137,6 @@ namespace Liminal.Net.Tests.Coyote
             }
         }
 
-        [NUnitTest]
         [CoyoteTest]
         public static async Task Coyote_Client_ConcurrentSnapshotAndDeltaReconciliation_ZeroCorruption()
         {
@@ -231,7 +229,6 @@ namespace Liminal.Net.Tests.Coyote
             }
         }
 
-        [NUnitTest]
         [CoyoteTest]
         public static async Task Coyote_Registry_ConcurrentEventSubscription_SafeAddRemoveUnderLoad()
         {

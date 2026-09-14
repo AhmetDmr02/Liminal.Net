@@ -1,4 +1,4 @@
-﻿using Liminal.Net.BasePackets;
+using Liminal.Net.BasePackets;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
@@ -26,7 +26,7 @@ namespace Liminal.Net.Handshakes
             _config = config;
         }
 
-        public virtual async Task<HandshakeResult> TryVerifyClientAsync(TcpClient client, ushort serverVersion, Func<bool> canAcceptConnection, Action<ushort> onClientValidated = null)
+        public virtual async Task<HandshakeResult> TryVerifyClientAsync(TcpClient client, ushort serverVersion, Func<bool> canAcceptConnection, Action<ushort> onClientValidated = null, Func<ushort, object> onClientPreValidated = null, Action<ushort, object> onClientPostValidated = null)
         {
             try
             {
@@ -121,26 +121,20 @@ namespace Liminal.Net.Handshakes
                 }
 
 
+                object preState = null;
+                if (onClientPreValidated != null)
+                {
+                    preState = onClientPreValidated(assignedId);
+                }
+
                 var readyPacket = new ConnectionHandshakeReadyConfirmed();
                 ushort readyPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
                 await SendPacketAsync(stream, readyPacketId, readyPacket, cts.Token).ConfigureAwait(false);
                 await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
-                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
-                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
-
-                ushort fifthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientFullyReady>();
-                if (packetId != fifthPacketId || length < 0 || length > _maxHandshakeSize)
+                if (onClientPostValidated != null)
                 {
-                    Drop(client, $"Protocol Violation: Expected ClientFullyReady (ID {fifthPacketId}, Length {length})", forceRst: true);
-                    return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "FullyReady violation");
-                }
-
-                if (length > 0)
-                {
-                    byte[] fullyReadyPayload = new byte[length];
-                    await stream.LiminalReadExactlyAsync(fullyReadyPayload, 0, length, cts.Token).ConfigureAwait(false);
+                    onClientPostValidated(assignedId, preState);
                 }
 
                 onClientValidated?.Invoke(assignedId);
@@ -164,7 +158,7 @@ namespace Liminal.Net.Handshakes
             }
         }
 
-        public virtual async Task<HandshakeResult> TryConnectToServerAsync(TcpClient client, ushort clientVersion)
+        public virtual async Task<HandshakeResult> TryConnectToServerAsync(TcpClient client, ushort clientVersion, Action<ushort> onAssignedId = null)
         {
             try
             {
@@ -217,6 +211,7 @@ namespace Liminal.Net.Handshakes
                 }
 
                 ushort assignedId = serverResponse.AssignedClientID;
+                onAssignedId?.Invoke(assignedId);
 
                 ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
                 var ack = new ConnectionHandshakeClientAck
@@ -243,10 +238,6 @@ namespace Liminal.Net.Handshakes
                     byte[] readyPayload = new byte[length];
                     await stream.LiminalReadExactlyAsync(readyPayload, 0, length, cts.Token).ConfigureAwait(false);
                 }
-
-                ushort fifthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientFullyReady>();
-                await SendPacketAsync(stream, fifthPacketId, new ConnectionHandshakeClientFullyReady(), cts.Token).ConfigureAwait(false);
-                await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
                 return HandshakeResult.Ok(assignedId);
             }

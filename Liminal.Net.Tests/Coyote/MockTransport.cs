@@ -48,7 +48,8 @@ namespace Liminal.Net.Tests
         }
 
         public void Kick(ushort clientId) => OnClientKicked?.Invoke(clientId);
-        public bool IsClientConnected(ushort clientId) => true;
+        public Func<ushort, bool>? IsClientConnectedFunc;
+        public bool IsClientConnected(ushort clientId) => IsClientConnectedFunc?.Invoke(clientId) ?? true;
 
         #region Test Injection Triggers
 

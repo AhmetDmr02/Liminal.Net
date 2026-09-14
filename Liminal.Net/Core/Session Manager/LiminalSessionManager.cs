@@ -78,6 +78,35 @@ namespace Liminal.Net.Core
 
         private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data, DeliveryMethod.Unreliable);
 
+        private bool TryGetOrAllocateSession(ushort id, out LiminalSession session)
+        {
+            if (_sessions.TryGetValue(id, out session))
+                return true;
+
+            if (_sessionManagerDisposed || _disconnectingSessions.ContainsKey(id))
+            {
+                session = null;
+                return false;
+            }
+
+            if (_transport != null && _transport.IsClientConnected(id))
+            {
+                if (id == ILiminalTransport.SERVER_ID && !_transport.IsServer)
+                {
+                    HandleLocalConnection(id);
+                }
+                else
+                {
+                    HandleClientConnected(id);
+                }
+
+                return _sessions.TryGetValue(id, out session);
+            }
+
+            session = null;
+            return false;
+        }
+
         private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData, DeliveryMethod deliveryMethod)
         {
             if (_sessionManagerDisposed)
@@ -87,7 +116,10 @@ namespace Liminal.Net.Core
                 return;
 
             if (!_sessions.TryGetValue(ownerId, out var session))
-                return;
+            {
+                if (!TryGetOrAllocateSession(ownerId, out session))
+                    return;
+            }
 
             TelemetryFlags activeFlags = _telemetryConfig?.Flags ?? TelemetryFlags.None;
             bool countPackets = (activeFlags & TelemetryFlags.PacketCounting) != 0;
@@ -395,8 +427,11 @@ namespace Liminal.Net.Core
 
             if (!_sessions.TryGetValue(targetId, out var session))
             {
-                LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
-                return;
+                if (!TryGetOrAllocateSession(targetId, out session))
+                {
+                    LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
+                    return;
+                }
             }
 
             int frameSize = 4 + 2 + payload.Length;
@@ -850,14 +885,23 @@ namespace Liminal.Net.Core
             if (_sessionManagerDisposed)
                 return;
 
-            _sessions.TryAdd(
-                ILiminalTransport.SERVER_ID,
-                new LiminalSession(
-                    ILiminalTransport.SERVER_ID,
-                    _config.MaxPacketSizePerBatch));
+            lock (_lifecycleLock)
+            {
+                if (_sessionManagerDisposed)
+                    return;
 
-            LiminalLogger.Log(
-                $"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
+                if (_sessions.ContainsKey(ILiminalTransport.SERVER_ID))
+                    return;
+
+                _disconnectingSessions.TryRemove(ILiminalTransport.SERVER_ID, out _);
+
+                _sessions[ILiminalTransport.SERVER_ID] = new LiminalSession(
+                    ILiminalTransport.SERVER_ID,
+                    _config.MaxPacketSizePerBatch);
+
+                LiminalLogger.Log(
+                    $"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
+            }
         }
 
         internal void HandleClientConnected(ushort id)
@@ -898,7 +942,7 @@ namespace Liminal.Net.Core
             }
         }
 
-        private void ProcessPendingDisconnects()
+        internal void ProcessPendingDisconnects()
         {
             while (_pendingDisconnects.TryDequeue(out var pending))
             {
@@ -977,6 +1021,7 @@ namespace Liminal.Net.Core
                 return;
 
             _sessionManagerDisposed = true;
+            RaiseShutdown();
         }
 
         #endregion
