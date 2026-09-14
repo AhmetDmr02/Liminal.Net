@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
@@ -122,7 +122,7 @@ namespace Liminal.Net.Tests
             _clientManagers.Add(client);
 
             bool serverKickedClient = false;
-            _serverManager.Transport.OnClientKicked += (id) => serverKickedClient = true;
+            _serverManager.Events.OnClientKicked += (id) => serverKickedClient = true;
 
             client.StartClient("127.0.0.1", _currentTestPort);
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);

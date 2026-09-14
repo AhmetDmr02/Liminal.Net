@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
@@ -103,8 +103,8 @@ namespace Liminal.Net.Tests
             bool serverSawConnect = false;
             bool serverSawDisconnect = false;
 
-            _serverManager.Transport.OnClientConnected += (id) => serverSawConnect = true;
-            _serverManager.Transport.OnClientDisconnected += (id) => serverSawDisconnect = true;
+            _serverManager.Events.OnClientConnected += (id) => serverSawConnect = true;
+            _serverManager.Events.OnClientDisconnected += (id) => serverSawDisconnect = true;
 
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
@@ -194,7 +194,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool clientSawDisconnect = false;
-            client.Transport.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
+            client.Events.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
 
             _serverManager.Transport.Kick(1);
 
@@ -239,7 +239,7 @@ namespace Liminal.Net.Tests
                 _clientManagers.Add(c);
                 clients.Add(c);
 
-                c.Transport.OnLocalClientConnected += (id) => assignedIds.Add(id);
+                c.Events.OnLocalClientConnected += (id) => assignedIds.Add(id);
 
                 c.StartClient("127.0.0.1", _currentTestPort);
             }
@@ -307,7 +307,7 @@ namespace Liminal.Net.Tests
         public void Test12_HostMode_RemoteClientCanConnectToHost()
         {
             ushort remoteClientId = 0;
-            _serverManager.Transport.OnClientConnected += (id) =>
+            _serverManager.Events.OnClientConnected += (id) =>
             {
                 if (id != _serverManager.localID) remoteClientId = id;
             };
@@ -330,13 +330,13 @@ namespace Liminal.Net.Tests
             ushort remoteClientId = 0;
             var remoteReady = new ManualResetEventSlim(false);
 
-            _serverManager.Transport.OnLocalClientConnected += id =>
+            _serverManager.Events.OnLocalClientConnected += id =>
             {
                 hostLocalId = id;
                 hostLocalReady.Set();
             };
 
-            _serverManager.Transport.OnClientConnected += id =>
+            _serverManager.Events.OnClientConnected += id =>
             {
                 if (hostLocalId != 0 && id != hostLocalId)
                 {

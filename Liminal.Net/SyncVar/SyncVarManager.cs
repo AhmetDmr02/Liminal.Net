@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using MessagePack;
 using System;
@@ -80,7 +80,7 @@ namespace Liminal.Net.SyncVar
             _attachedManager.Interpreter.Subscribe<SyncVarSlabClientRequestPacket>(HandleClientRequest, this);
             _attachedManager.Interpreter.Subscribe<SyncVarAuthUpdatePacket>(HandleAuthUpdate, this);
 
-            _attachedManager.Transport.OnClientConnected += HandleClientConnected;
+            _attachedManager.Events.OnClientConnected += HandleClientConnected;
             _attachedManager.OnPreFlush += FlushDirty;
         }
 
@@ -91,7 +91,7 @@ namespace Liminal.Net.SyncVar
             try
             {
                 _attachedManager.OnPreFlush -= FlushDirty;
-                _attachedManager.Transport.OnClientConnected -= HandleClientConnected;
+                _attachedManager.Events.OnClientConnected -= HandleClientConnected;
                 _attachedManager.Interpreter.UnsubscribeAll(this);
             }
             catch { }

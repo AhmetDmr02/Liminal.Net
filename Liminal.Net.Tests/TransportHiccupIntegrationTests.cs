@@ -139,7 +139,7 @@ namespace Liminal.Net.Tests
             var client = StartClient(_currentTestPort, clientConfig);
 
             bool kicked = false;
-            server.Transport.OnClientKicked += _ => kicked = true;
+            server.Events.OnClientKicked += _ => kicked = true;
 
             client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new FilePacket
             {
@@ -312,7 +312,7 @@ namespace Liminal.Net.Tests
             var server = StartServer(serverConfig);
             var client = StartClient(_currentTestPort, clientConfig);
             bool kicked = false;
-            server.Transport.OnClientKicked += _ => kicked = true;
+            server.Events.OnClientKicked += _ => kicked = true;
 
             client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new FilePacket
             {

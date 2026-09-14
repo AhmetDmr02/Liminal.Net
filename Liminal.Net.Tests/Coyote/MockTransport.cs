@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
 
@@ -55,6 +55,8 @@ namespace Liminal.Net.Tests
         public void TriggerClientConnected(ushort id) => OnClientConnected?.Invoke(id);
         public void TriggerClientDisconnected(ushort id) => OnClientDisconnected?.Invoke(id);
         public void TriggerClientKicked(ushort id) => OnClientKicked?.Invoke(id);
+        public void TriggerLocalClientConnected(ushort id) => OnLocalClientConnected?.Invoke(id);
+        public void TriggerLocalClientDisconnected(ushort id) => OnLocalClientDisconnected?.Invoke(id);
 
         public void TriggerMessageReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);
         public void TriggerReliableReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);

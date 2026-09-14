@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
@@ -93,7 +93,7 @@ namespace Liminal.Net.Tests
             timeoutServer.StartServer("127.0.0.1", _currentTestPort);
 
             bool serverSawDisconnect = false;
-            timeoutServer.Transport.OnClientDisconnected += (id) => serverSawDisconnect = true;
+            timeoutServer.Events.OnClientDisconnected += (id) => serverSawDisconnect = true;
 
             var client = CreateAndStartClient();
 
@@ -130,7 +130,7 @@ namespace Liminal.Net.Tests
             _clientManagers.Add(client);
 
             bool clientSawDisconnect = false;
-            client.Transport.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
+            client.Events.OnLocalClientDisconnected += (id) => clientSawDisconnect = true;
 
             client.StartClient("127.0.0.1", _currentTestPort);
 
@@ -403,8 +403,8 @@ namespace Liminal.Net.Tests
                     var c = new LiminalNetworkManager(new TcpTransport(), cfg);
                     clients.Add(c);
 
-                    c.Transport.OnLocalClientConnected += _ => tcs.TrySetResult(true);
-                    c.Transport.OnShutdown += () => tcs.TrySetResult(false);
+                    c.Events.OnLocalClientConnected += _ => tcs.TrySetResult(true);
+                    c.Events.OnTransportShutdown += () => tcs.TrySetResult(false);
 
                     barrier.SignalAndWait();
                     c.StartClient("127.0.0.1", _currentTestPort);

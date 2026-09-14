@@ -69,11 +69,6 @@ namespace Liminal.Net.Core
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
 
-            _transport.OnClientConnected += HandleClientConnected;
-            _transport.OnClientDisconnected += HandleClientDisconnected;
-            _transport.OnLocalClientConnected += HandleLocalConnection;
-            _transport.OnClientKicked += HandleClientDisconnected;
-
             _interpreter.OnSendRequest += BufferPacket;
         }
 
@@ -844,8 +839,8 @@ namespace Liminal.Net.Core
         #endregion
 
         #region Lifecycle
-
-        private void HandleLocalConnection(ushort clientId)
+ 
+        internal void HandleLocalConnection(ushort clientId)
         {
             if (_sessionManagerDisposed)
                 return;
@@ -860,7 +855,7 @@ namespace Liminal.Net.Core
                 $"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
         }
 
-        private void HandleClientConnected(ushort id)
+        internal void HandleClientConnected(ushort id)
         {
             if (_sessionManagerDisposed)
                 return;
@@ -881,7 +876,7 @@ namespace Liminal.Net.Core
             }
         }
 
-        private void HandleClientDisconnected(ushort id)
+        internal void HandleClientDisconnected(ushort id)
         {
             if (_sessionManagerDisposed)
                 return;
@@ -947,10 +942,6 @@ namespace Liminal.Net.Core
 
             _transport.OnMessageReceivedReliable -= HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable -= HandleUnreliableMessage;
-            _transport.OnClientConnected -= HandleClientConnected;
-            _transport.OnClientDisconnected -= HandleClientDisconnected;
-            _transport.OnLocalClientConnected -= HandleLocalConnection;
-            _transport.OnClientKicked -= HandleClientDisconnected;
 
             _interpreter.OnSendRequest -= BufferPacket;
 

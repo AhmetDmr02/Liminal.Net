@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
@@ -315,7 +315,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => testServer.Transport.IsConnected, 2000), Is.True);
 
             var connectedIds = new ConcurrentBag<ushort>();
-            testServer.Transport.OnClientConnected += (id) => connectedIds.Add(id);
+            testServer.Events.OnClientConnected += (id) => connectedIds.Add(id);
 
             var clients = new List<LiminalNetworkManager>();
             var startGate = new ManualResetEventSlim(false);
@@ -582,7 +582,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client.Transport.IsConnected, 2000), Is.True);
 
             bool serverKickedClient = false;
-            customServer.Transport.OnClientKicked += (id) => serverKickedClient = true;
+            customServer.Events.OnClientKicked += (id) => serverKickedClient = true;
 
             // Send more packets in a single batch than the server's InboundQueue MaxPacketCount can tolerate
             for (int i = 0; i < overflowPackets; i++)

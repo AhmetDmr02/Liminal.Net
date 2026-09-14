@@ -1,7 +1,8 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
 using System.Diagnostics;
+using System.Threading;
 
 namespace Liminal.Net.Core
 {
@@ -39,18 +40,102 @@ namespace Liminal.Net.Core
 
         public DisconnectReasonCoordinator DisconnectCoordinator { get; private set; }
 
-        public event Action<ushort, DisconnectReason, string> OnDisconnectResolved;
+        private readonly LiminalEventHub _eventHub;
+        public ILiminalEventHub Events => _eventHub;
 
-        public event Action OnManagerPreInitialize;
-        public event Action OnManagerPostInitialize;
+        #region High-Level Connection Events
+        public event Action<ushort> OnClientConnected
+        {
+            add => _eventHub.OnClientConnected += value;
+            remove => _eventHub.OnClientConnected -= value;
+        }
 
-        public event Action OnManagerShutdown;
+        public event Action<ushort> OnClientDisconnected
+        {
+            add => _eventHub.OnClientDisconnected += value;
+            remove => _eventHub.OnClientDisconnected -= value;
+        }
 
-        public event Action OnPreFlush;
-        public event Action OnPostFlush;
+        public event Action<ushort> OnLocalClientConnected
+        {
+            add => _eventHub.OnLocalClientConnected += value;
+            remove => _eventHub.OnLocalClientConnected -= value;
+        }
 
-        public event Action OnPrePoll;
-        public event Action OnPostPoll;
+        public event Action<ushort> OnLocalClientDisconnected
+        {
+            add => _eventHub.OnLocalClientDisconnected += value;
+            remove => _eventHub.OnLocalClientDisconnected -= value;
+        }
+
+        public event Action<ushort> OnClientKicked
+        {
+            add => _eventHub.OnClientKicked += value;
+            remove => _eventHub.OnClientKicked -= value;
+        }
+
+        public event Action OnServerStarted
+        {
+            add => _eventHub.OnServerStarted += value;
+            remove => _eventHub.OnServerStarted -= value;
+        }
+
+        public event Action OnTransportShutdown
+        {
+            add => _eventHub.OnTransportShutdown += value;
+            remove => _eventHub.OnTransportShutdown -= value;
+        }
+        #endregion
+
+        #region Lifecycle & Diagnostics Events
+        public event Action<ushort, DisconnectReason, string> OnDisconnectResolved
+        {
+            add => _eventHub.OnDisconnectResolved += value;
+            remove => _eventHub.OnDisconnectResolved -= value;
+        }
+
+        public event Action OnManagerPreInitialize
+        {
+            add => _eventHub.OnManagerPreInitialize += value;
+            remove => _eventHub.OnManagerPreInitialize -= value;
+        }
+
+        public event Action OnManagerPostInitialize
+        {
+            add => _eventHub.OnManagerPostInitialize += value;
+            remove => _eventHub.OnManagerPostInitialize -= value;
+        }
+
+        public event Action OnManagerShutdown
+        {
+            add => _eventHub.OnManagerShutdown += value;
+            remove => _eventHub.OnManagerShutdown -= value;
+        }
+
+        public event Action OnPreFlush
+        {
+            add => _eventHub.OnPreFlush += value;
+            remove => _eventHub.OnPreFlush -= value;
+        }
+
+        public event Action OnPostFlush
+        {
+            add => _eventHub.OnPostFlush += value;
+            remove => _eventHub.OnPostFlush -= value;
+        }
+
+        public event Action OnPrePoll
+        {
+            add => _eventHub.OnPrePoll += value;
+            remove => _eventHub.OnPrePoll -= value;
+        }
+
+        public event Action OnPostPoll
+        {
+            add => _eventHub.OnPostPoll += value;
+            remove => _eventHub.OnPostPoll -= value;
+        }
+        #endregion
 
         public ushort localID => _transport.LocalClientId;
 
@@ -68,9 +153,10 @@ namespace Liminal.Net.Core
 
             Interpreter = new LiminalPacketInterpreter(this, _config);
 
+            _eventHub = new LiminalEventHub(_transport);
+
             _transport.InitializeTransport(config);
             _transport.OnShutdown += HandleTransportShutdown;
-
 
             InitializeSystems();
         }
@@ -84,7 +170,7 @@ namespace Liminal.Net.Core
 
         private void InitializeSystems()
         {
-            OnManagerPreInitialize?.Invoke();
+            _eventHub.RaiseManagerPreInitialize();
 
             ShutdownSystems();
 
@@ -93,6 +179,8 @@ namespace Liminal.Net.Core
             _pipeline = new LiminalPacketFramerPipeline(_config);
             SessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
             DisconnectCoordinator = new DisconnectReasonCoordinator(_transport, Interpreter);
+
+            _eventHub.BindCoreSystems(SessionManager, DisconnectCoordinator);
 
             DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
@@ -108,17 +196,18 @@ namespace Liminal.Net.Core
 
             SyncVarManager = Liminal.Net.SyncVar.SyncVarManager.Initialize(this, _config);
 
-            OnManagerPostInitialize?.Invoke();
+            _eventHub.RaiseManagerPostInitialize();
         }
 
         private void HandleDisconnectResolved(ushort id, DisconnectReason reason, string message)
         {
-            OnDisconnectResolved?.Invoke(id, reason, message);
+            _eventHub.RaiseDisconnectResolved(id, reason, message);
         }
 
         private void ShutdownSystems()
         {
-            OnManagerShutdown?.Invoke();
+            _eventHub.RaiseManagerShutdown();
+            _eventHub.UnbindCoreSystems();
 
             _ticker?.Stop();
 
@@ -210,22 +299,40 @@ namespace Liminal.Net.Core
 
             ShutdownSystems();
 
+            _eventHub.Clear();
+
             LiminalLogger.Log("[Manager] Network State Disconnected.");
         }
+        private int _isShuttingDown;
+
         public void Shutdown()
         {
-            if (Role == NetworkRole.None) return;
+            if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+                return;
 
-            Role = NetworkRole.None;
+            try
+            {
+                bool wasActive = Role != NetworkRole.None;
+                Role = NetworkRole.None;
 
-            _ticker?.Stop();
+                _ticker?.Stop();
 
-            //Maybe we can reset the transport here but for now just shut it down
-            _transport.Shutdown();
+                //Maybe we can reset the transport here but for now just shut it down
+                _transport.Shutdown();
 
-            ShutdownSystems();
+                ShutdownSystems();
 
-            LiminalLogger.Log("[Manager] Network State Reset.");
+                _eventHub.Clear();
+
+                if (wasActive)
+                {
+                    LiminalLogger.Log("[Manager] Network State Reset.");
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _isShuttingDown, 0);
+            }
         }
         #endregion
 
@@ -235,27 +342,26 @@ namespace Liminal.Net.Core
         {
             var sm = SessionManager;
 
-            OnPrePoll?.Invoke();
+            _eventHub.RaisePrePoll();
             sm?.Poll();
-            OnPostPoll?.Invoke();
+            _eventHub.RaisePostPoll();
 
-            OnPreFlush?.Invoke();
+            _eventHub.RaisePreFlush();
             sm?.Flush();
-            OnPostFlush?.Invoke();
+            _eventHub.RaisePostFlush();
         }
 
         private void ServerTick()
         {
             var sm = SessionManager;
 
-
-            OnPrePoll?.Invoke();
+            _eventHub.RaisePrePoll();
             sm?.Poll();
-            OnPostPoll?.Invoke();
+            _eventHub.RaisePostPoll();
 
-            OnPreFlush?.Invoke();
+            _eventHub.RaisePreFlush();
             sm?.Flush();
-            OnPostFlush?.Invoke();
+            _eventHub.RaisePostFlush();
         }
 
         private void ClientBackgroundTick()
@@ -263,9 +369,9 @@ namespace Liminal.Net.Core
             //For now
             var sm = SessionManager;
 
-            OnPrePoll?.Invoke();
+            _eventHub.RaisePrePoll();
             sm?.Poll();
-            OnPostPoll?.Invoke();
+            _eventHub.RaisePostPoll();
 
             if (Role == NetworkRole.Client && _phaseAligner != null && TelemetryManager != null)
             {
@@ -282,9 +388,9 @@ namespace Liminal.Net.Core
                 }
             }
 
-            OnPreFlush?.Invoke();
+            _eventHub.RaisePreFlush();
             sm?.Flush();
-            OnPostFlush?.Invoke();
+            _eventHub.RaisePostFlush();
         }
 
         /// <summary>
@@ -294,10 +400,9 @@ namespace Liminal.Net.Core
         {
             if (Role == NetworkRole.Client)
             {
-
-                OnPrePoll?.Invoke();
+                _eventHub.RaisePrePoll();
                 SessionManager?.Poll();
-                OnPostFlush?.Invoke();
+                _eventHub.RaisePostPoll();
             }
         }
 
