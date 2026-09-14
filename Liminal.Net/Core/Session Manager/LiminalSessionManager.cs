@@ -840,6 +840,11 @@ namespace Liminal.Net.Core
 
         #region Lifecycle
  
+        public bool HasSession(ushort sessionId)
+        {
+            return !_sessionManagerDisposed && _sessions.ContainsKey(sessionId);
+        }
+
         internal void HandleLocalConnection(ushort clientId)
         {
             if (_sessionManagerDisposed)

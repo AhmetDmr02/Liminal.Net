@@ -14,6 +14,18 @@ namespace Liminal.Net.Core
         Host
     }
 
+    public enum NetworkLifecycleState
+    {
+        Stopped,
+        Connecting,
+        Connected,
+        StartingServer,
+        ServerActive,
+        StartingHost,
+        HostActive,
+        Stopping
+    }
+
     public class LiminalNetworkManager
     {
         #region Singleton
@@ -21,6 +33,66 @@ namespace Liminal.Net.Core
         #endregion
 
         public NetworkRole Role { get; private set; } = NetworkRole.None;
+        public NetworkLifecycleState LifecycleState { get; private set; } = NetworkLifecycleState.Stopped;
+
+        public bool IsConnected => LifecycleState switch
+        {
+            NetworkLifecycleState.Connected => ValidateClientOperational(),
+            NetworkLifecycleState.HostActive => ValidateHostOperational(),
+            NetworkLifecycleState.ServerActive => ValidateServerOperational(),
+            _ => false
+        };
+
+        public bool IsConnecting => LifecycleState switch
+        {
+            NetworkLifecycleState.Connecting => true,
+            NetworkLifecycleState.StartingHost => true,
+            NetworkLifecycleState.StartingServer => true,
+            _ => false
+        };
+
+        public bool CanSend => IsConnected && _transport != null && _transport.IsConnected;
+
+        public bool IsServer => Role == NetworkRole.Server || Role == NetworkRole.Host;
+        public bool IsClient => Role == NetworkRole.Client || Role == NetworkRole.Host;
+        public bool IsHost => Role == NetworkRole.Host;
+
+        public Liminal.Net.Registry.ClientRegistry ClientRegistry { get; private set; }
+
+        private Action _onConnectedAndReady;
+        public event Action OnConnectedAndReady
+        {
+            add => Liminal.Net.Misc.LiminalAtomicHelpers.SafeAdd(ref _onConnectedAndReady, value);
+            remove => Liminal.Net.Misc.LiminalAtomicHelpers.SafeRemove(ref _onConnectedAndReady, value);
+        }
+
+        private bool ValidateClientOperational()
+        {
+            return _transport != null
+                && _transport.IsConnected
+                && localID != 0
+                && SessionManager != null
+                && SessionManager.HasSession(ILiminalTransport.SERVER_ID)
+                && _isShuttingDown == 0;
+        }
+
+        private bool ValidateHostOperational()
+        {
+            return _transport != null
+                && _transport.IsServer
+                && _transport.IsConnected
+                && localID != 0
+                && SessionManager != null
+                && _isShuttingDown == 0;
+        }
+
+        private bool ValidateServerOperational()
+        {
+            return _transport != null
+                && _transport.IsServer
+                && SessionManager != null
+                && _isShuttingDown == 0;
+        }
 
         private readonly ILiminalTransport _transport;
         public ILiminalTransport Transport => _transport;
@@ -157,6 +229,10 @@ namespace Liminal.Net.Core
 
             _transport.InitializeTransport(config);
             _transport.OnShutdown += HandleTransportShutdown;
+            _transport.OnLocalClientConnected += HandleTransportLocalClientConnected;
+            _transport.OnLocalClientDisconnected += HandleTransportLocalClientDisconnected;
+
+            ClientRegistry = new Liminal.Net.Registry.ClientRegistry(this);
 
             InitializeSystems();
         }
@@ -164,8 +240,33 @@ namespace Liminal.Net.Core
         private void HandleTransportShutdown()
         {
             LiminalLogger.Log("[Manager] Transport reported shutdown. Resetting state...");
-
+            ResetLifecycleState();
             Shutdown();
+        }
+
+        private void HandleTransportLocalClientConnected(ushort clientId)
+        {
+            if (Role == NetworkRole.Client)
+            {
+                LifecycleState = NetworkLifecycleState.Connected;
+                _onConnectedAndReady?.Invoke();
+            }
+            else if (Role == NetworkRole.Host)
+            {
+                LifecycleState = NetworkLifecycleState.HostActive;
+                _onConnectedAndReady?.Invoke();
+            }
+        }
+
+        private void HandleTransportLocalClientDisconnected(ushort clientId)
+        {
+            ResetLifecycleState();
+        }
+
+        private void ResetLifecycleState()
+        {
+            Role = NetworkRole.None;
+            LifecycleState = NetworkLifecycleState.Stopped;
         }
 
         private void InitializeSystems()
@@ -195,6 +296,7 @@ namespace Liminal.Net.Core
             TelemetryManager = new LiminalTelemetryManager(this, _ticker, _telemetryConfig);
 
             SyncVarManager = Liminal.Net.SyncVar.SyncVarManager.Initialize(this, _config);
+            ClientRegistry?.Attach();
 
             _eventHub.RaiseManagerPostInitialize();
         }
@@ -231,6 +333,7 @@ namespace Liminal.Net.Core
 
             //_ticker = null;
             //SessionManager = null;
+            ClientRegistry?.Reset();
             SyncVarManager = null;
 
             _config.ClientIdResolver.ResetResolver();
@@ -241,29 +344,40 @@ namespace Liminal.Net.Core
         /// <summary>
         /// Starts as a Host: Acts as a Server, but also connects a local client to itself.
         /// </summary>
-        public void StartHost()
+        public bool StartHost()
         {
-            if (Role != NetworkRole.None) return;
+            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            {
+                LiminalLogger.LogWarning($"[Manager] Cannot StartHost: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                return false;
+            }
+
+            LifecycleState = NetworkLifecycleState.StartingHost;
+            Role = NetworkRole.Host;
 
             InitializeSystems();
 
             LiminalLogger.Log("[Manager] Starting Host Mode...");
-            Role = NetworkRole.Host;
 
             _transport.StartServer(_config.Default_Host, _config.Default_Port);
-
             _transport.StartClient(_config.Default_Host, _config.Default_Port);
 
             _ticker.OnTick += HostTick;
             _ticker.Start();
 
-
             LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+            return true;
         }
 
-        public void StartServer(string ip, int port)
+        public bool StartServer(string ip, int port)
         {
-            if (Role != NetworkRole.None) return;
+            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            {
+                LiminalLogger.LogWarning($"[Manager] Cannot StartServer: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                return false;
+            }
+
+            LifecycleState = NetworkLifecycleState.StartingServer;
             Role = NetworkRole.Server;
 
             InitializeSystems();
@@ -271,13 +385,24 @@ namespace Liminal.Net.Core
             LiminalLogger.Log($"[Manager] Starting Dedicated Server on {ip}:{port}");
             _transport.StartServer(ip, port);
 
+            LifecycleState = NetworkLifecycleState.ServerActive;
+
             _ticker.OnTick += ServerTick;
             _ticker.Start();
+
+            _onConnectedAndReady?.Invoke();
+            return true;
         }
 
-        public void StartClient(string ip, int port)
+        public bool StartClient(string ip, int port)
         {
-            if (Role != NetworkRole.None) return;
+            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            {
+                LiminalLogger.LogWarning($"[Manager] Cannot StartClient: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                return false;
+            }
+
+            LifecycleState = NetworkLifecycleState.Connecting;
             Role = NetworkRole.Client;
 
             InitializeSystems();
@@ -287,12 +412,14 @@ namespace Liminal.Net.Core
 
             _ticker.OnTick += ClientBackgroundTick;
             _ticker.Start();
+            return true;
         }
 
         public void Disconnect()
         {
-            if (Role == NetworkRole.None) return;
+            if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
 
+            LifecycleState = NetworkLifecycleState.Stopping;
             Role = NetworkRole.None;
 
             _transport.Disconnect();
@@ -300,6 +427,8 @@ namespace Liminal.Net.Core
             ShutdownSystems();
 
             _eventHub.Clear();
+
+            LifecycleState = NetworkLifecycleState.Stopped;
 
             LiminalLogger.Log("[Manager] Network State Disconnected.");
         }
@@ -312,7 +441,8 @@ namespace Liminal.Net.Core
 
             try
             {
-                bool wasActive = Role != NetworkRole.None;
+                bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
+                LifecycleState = NetworkLifecycleState.Stopping;
                 Role = NetworkRole.None;
 
                 _ticker?.Stop();
@@ -323,6 +453,8 @@ namespace Liminal.Net.Core
                 ShutdownSystems();
 
                 _eventHub.Clear();
+
+                LifecycleState = NetworkLifecycleState.Stopped;
 
                 if (wasActive)
                 {
