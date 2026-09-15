@@ -95,6 +95,7 @@ namespace Liminal.Net.Core
             _networkManager.Transport.OnClientDisconnected += HandleClientDisconnected;
             _networkManager.Transport.OnClientKicked += HandleClientDisconnected;
             _networkManager.Transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
+            _networkManager.Transport.OnLocalClientConnected += HandleLocalClientConnected;
 
             _ticker.OnTick += HandleTick;
 
@@ -134,6 +135,11 @@ namespace Liminal.Net.Core
         }
 
         private void HandleLocalClientDisconnected(ushort localId)
+        {
+            ResetAllState();
+        }
+
+        private void HandleLocalClientConnected(ushort localId)
         {
             ResetAllState();
         }
@@ -189,7 +195,7 @@ namespace Liminal.Net.Core
         }
         private void SendWirePing()
         {
-            if (_transportTelemetry == null) return;
+            if (_transportTelemetry == null || !_networkManager.CanSend) return;
 
             if (_networkManager.Role == NetworkRole.Client || _networkManager.Role == NetworkRole.Host)
             {
@@ -213,6 +219,8 @@ namespace Liminal.Net.Core
         }
         private void SendE2EPing()
         {
+            if (!_networkManager.CanSend) return;
+
             long now = Stopwatch.GetTimestamp();
 
             if (_networkManager.Role == NetworkRole.Client || _networkManager.Role == NetworkRole.Host)
@@ -345,6 +353,7 @@ namespace Liminal.Net.Core
                 _networkManager.Transport.OnClientDisconnected -= HandleClientDisconnected;
                 _networkManager.Transport.OnClientKicked -= HandleClientDisconnected;
                 _networkManager.Transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
+                _networkManager.Transport.OnLocalClientConnected -= HandleLocalClientConnected;
             }
 
             _tickPayloadSizeDiagnostics?.Dispose();
