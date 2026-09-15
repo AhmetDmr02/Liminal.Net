@@ -31,8 +31,13 @@ namespace Liminal.Net.Core
             private readonly object _lock = new();
 
             private Action<T, ushort>[] _callbacks = Array.Empty<Action<T, ushort>>();
+            private BitStreamHandler<T>[] _bitStreamHandlers = Array.Empty<BitStreamHandler<T>>();
+            private BitStreamTagHandler[] _tagHandlers = Array.Empty<BitStreamTagHandler>();
 
-            public bool HasCallbacks => Volatile.Read(ref _callbacks).Length != 0;
+            public bool HasCallbacks =>
+                Volatile.Read(ref _callbacks).Length != 0 ||
+                Volatile.Read(ref _bitStreamHandlers).Length != 0 ||
+                Volatile.Read(ref _tagHandlers).Length != 0;
 
             public void Add<TPacket>(Action<TPacket, ushort> callback)
             {
@@ -51,107 +56,17 @@ namespace Liminal.Net.Core
                 }
             }
 
-            public void RemoveUntyped(Delegate callback)
-            {
-                if (callback is not Action<T, ushort> typedCallback)
-                    return;
-
-                lock (_lock)
-                {
-                    var current = _callbacks;
-                    int index = -1;
-
-                    for (int i = 0; i < current.Length; i++)
-                    {
-                        if (current[i] == typedCallback)
-                        {
-                            index = i;
-                            break;
-                        }
-                    }
-
-                    if (index < 0)
-                        return;
-
-                    if (current.Length == 1)
-                    {
-                        Volatile.Write(ref _callbacks, Array.Empty<Action<T, ushort>>());
-                        return;
-                    }
-
-                    var next = new Action<T, ushort>[current.Length - 1];
-
-                    if (index > 0)
-                        Array.Copy(current, 0, next, 0, index);
-
-                    if (index < current.Length - 1)
-                        Array.Copy(current, index + 1, next, index, current.Length - index - 1);
-
-                    Volatile.Write(ref _callbacks, next);
-                }
-            }
-
-            public void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options)
-            {
-                var callbacks = Volatile.Read(ref _callbacks);
-
-                if (callbacks.Length == 0)
-                    return;
-
-                T packet = DeserializeSafe(rawData, options, out bool success);
-
-                if (!success)
-                    return;
-
-                for (int i = 0; i < callbacks.Length; i++)
-                {
-                    try
-                    {
-                        callbacks[i](packet, sender);
-                    }
-                    catch (Exception ex)
-                    {
-                        LiminalLogger.LogError($"[Interpreter] Exception in {typeof(T).Name} handler: {ex}");
-                    }
-                }
-            }
-
-            private static T DeserializeSafe(ReadOnlyMemory<byte> data, MessagePackSerializerOptions options, out bool success)
-            {
-                try
-                {
-                    success = true;
-                    return MessagePackSerializer.Deserialize<T>(data, options);
-                }
-                catch (Exception ex)
-                {
-                    LiminalLogger.LogWarning($"[Security] Malformed packet {typeof(T).Name}: {ex.Message}");
-                    success = false;
-                    return default;
-                }
-            }
-        }
-
-        private sealed class BitStreamDispatcher<TMeta> : IPacketDispatcher
-        {
-            private readonly object _lock = new();
-
-            private BitStreamHandler<TMeta>[] _handlers = Array.Empty<BitStreamHandler<TMeta>>();
-            private BitStreamTagHandler[] _tagHandlers = Array.Empty<BitStreamTagHandler>();
-
-            public bool HasCallbacks => Volatile.Read(ref _handlers).Length != 0 || Volatile.Read(ref _tagHandlers).Length != 0;
-
-            public void Add(BitStreamHandler<TMeta> handler)
+            public void Add(BitStreamHandler<T> handler)
             {
                 lock (_lock)
                 {
-                    var current = _handlers;
-                    var next = new BitStreamHandler<TMeta>[current.Length + 1];
+                    var current = _bitStreamHandlers;
+                    var next = new BitStreamHandler<T>[current.Length + 1];
 
                     Array.Copy(current, next, current.Length);
                     next[current.Length] = handler;
 
-                    Volatile.Write(ref _handlers, next);
+                    Volatile.Write(ref _bitStreamHandlers, next);
                 }
             }
 
@@ -171,16 +86,16 @@ namespace Liminal.Net.Core
 
             public void RemoveUntyped(Delegate callback)
             {
-                if (callback is BitStreamHandler<TMeta> typedHandler)
+                if (callback is Action<T, ushort> typedCallback)
                 {
                     lock (_lock)
                     {
-                        var current = _handlers;
+                        var current = _callbacks;
                         int index = -1;
 
                         for (int i = 0; i < current.Length; i++)
                         {
-                            if (current[i] == typedHandler)
+                            if (current[i] == typedCallback)
                             {
                                 index = i;
                                 break;
@@ -192,11 +107,11 @@ namespace Liminal.Net.Core
 
                         if (current.Length == 1)
                         {
-                            Volatile.Write(ref _handlers, Array.Empty<BitStreamHandler<TMeta>>());
+                            Volatile.Write(ref _callbacks, Array.Empty<Action<T, ushort>>());
                             return;
                         }
 
-                        var next = new BitStreamHandler<TMeta>[current.Length - 1];
+                        var next = new Action<T, ushort>[current.Length - 1];
 
                         if (index > 0)
                             Array.Copy(current, 0, next, 0, index);
@@ -204,7 +119,43 @@ namespace Liminal.Net.Core
                         if (index < current.Length - 1)
                             Array.Copy(current, index + 1, next, index, current.Length - index - 1);
 
-                        Volatile.Write(ref _handlers, next);
+                        Volatile.Write(ref _callbacks, next);
+                    }
+                }
+                else if (callback is BitStreamHandler<T> bitStreamHandler)
+                {
+                    lock (_lock)
+                    {
+                        var current = _bitStreamHandlers;
+                        int index = -1;
+
+                        for (int i = 0; i < current.Length; i++)
+                        {
+                            if (current[i] == bitStreamHandler)
+                            {
+                                index = i;
+                                break;
+                            }
+                        }
+
+                        if (index < 0)
+                            return;
+
+                        if (current.Length == 1)
+                        {
+                            Volatile.Write(ref _bitStreamHandlers, Array.Empty<BitStreamHandler<T>>());
+                            return;
+                        }
+
+                        var next = new BitStreamHandler<T>[current.Length - 1];
+
+                        if (index > 0)
+                            Array.Copy(current, 0, next, 0, index);
+
+                        if (index < current.Length - 1)
+                            Array.Copy(current, index + 1, next, index, current.Length - index - 1);
+
+                        Volatile.Write(ref _bitStreamHandlers, next);
                     }
                 }
                 else if (callback is BitStreamTagHandler tagHandler)
@@ -247,65 +198,92 @@ namespace Liminal.Net.Core
 
             public void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options)
             {
-                var handlers = Volatile.Read(ref _handlers);
+                var callbacks = Volatile.Read(ref _callbacks);
+                var bitStreamHandlers = Volatile.Read(ref _bitStreamHandlers);
                 var tagHandlers = Volatile.Read(ref _tagHandlers);
 
-                if (handlers.Length == 0 && tagHandlers.Length == 0)
+                if (callbacks.Length == 0 && bitStreamHandlers.Length == 0 && tagHandlers.Length == 0)
                     return;
 
-                TMeta meta;
-                ReadOnlySpan<byte> bitstreamSpan;
+                T packet;
+                bool hasBitStream = false;
+                ReadOnlySpan<byte> bitstreamSpan = default;
 
                 try
                 {
                     var mpReader = new MessagePackReader(rawData);
-                    meta = MessagePackSerializer.Deserialize<TMeta>(ref mpReader, options);
+                    packet = MessagePackSerializer.Deserialize<T>(ref mpReader, options);
                     int consumed = (int)mpReader.Consumed;
 
-                    if (rawData.Length < consumed + 4)
+                    if (rawData.Length == consumed)
                     {
-                        LiminalLogger.LogWarning($"[Security] Truncated bitstream packet {typeof(TMeta).Name}: missing bitstream length header.");
+                        // Standard packet without bitstream payload
+                        hasBitStream = false;
+                    }
+                    else if (rawData.Length >= consumed + 4)
+                    {
+                        int bitstreamLength = BinaryPrimitives.ReadInt32LittleEndian(rawData.Span.Slice(consumed, 4));
+                        if (bitstreamLength < 0 || rawData.Length < consumed + 4 + bitstreamLength)
+                        {
+                            LiminalLogger.LogWarning($"[Security] Corrupted/cut bitstream packet {typeof(T).Name}: expected {bitstreamLength} bytes, but only {rawData.Length - (consumed + 4)} available.");
+                            return;
+                        }
+
+                        bitstreamSpan = rawData.Span.Slice(consumed + 4, bitstreamLength);
+                        hasBitStream = true;
+                    }
+                    else
+                    {
+                        LiminalLogger.LogWarning($"[Security] Malformed packet {typeof(T).Name}: incomplete bitstream header.");
                         return;
                     }
-
-                    int bitstreamLength = BinaryPrimitives.ReadInt32LittleEndian(rawData.Span.Slice(consumed, 4));
-                    if (bitstreamLength < 0 || rawData.Length < consumed + 4 + bitstreamLength)
-                    {
-                        LiminalLogger.LogWarning($"[Security] Corrupted/cut bitstream packet {typeof(TMeta).Name}: expected {bitstreamLength} bytes, but only {rawData.Length - (consumed + 4)} available.");
-                        return;
-                    }
-
-                    bitstreamSpan = rawData.Span.Slice(consumed + 4, bitstreamLength);
                 }
                 catch (Exception ex)
                 {
-                    LiminalLogger.LogWarning($"[Security] Malformed bitstream packet {typeof(TMeta).Name}: {ex.Message}");
+                    LiminalLogger.LogWarning($"[Security] Malformed packet {typeof(T).Name}: {ex.Message}");
                     return;
                 }
 
-                for (int i = 0; i < handlers.Length; i++)
+                // 1. Invoke standard typed subscribers
+                for (int i = 0; i < callbacks.Length; i++)
                 {
                     try
                     {
-                        var reader = new BitReader(bitstreamSpan);
-                        handlers[i](in meta, ref reader, sender);
+                        callbacks[i](packet, sender);
                     }
                     catch (Exception ex)
                     {
-                        LiminalLogger.LogError($"[Interpreter] Exception in {typeof(TMeta).Name} bitstream handler: {ex}");
+                        LiminalLogger.LogError($"[Interpreter] Exception in {typeof(T).Name} handler: {ex}");
                     }
                 }
 
-                for (int i = 0; i < tagHandlers.Length; i++)
+                // 2. If a bitstream is attached, invoke bitstream subscribers
+                if (hasBitStream)
                 {
-                    try
+                    for (int i = 0; i < bitStreamHandlers.Length; i++)
                     {
-                        var reader = new BitReader(bitstreamSpan);
-                        tagHandlers[i](ref reader, sender);
+                        try
+                        {
+                            var reader = new BitReader(bitstreamSpan);
+                            bitStreamHandlers[i](in packet, ref reader, sender);
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError($"[Interpreter] Exception in {typeof(T).Name} bitstream handler: {ex}");
+                        }
                     }
-                    catch (Exception ex)
+
+                    for (int i = 0; i < tagHandlers.Length; i++)
                     {
-                        LiminalLogger.LogError($"[Interpreter] Exception in {typeof(TMeta).Name} bitstream tag handler: {ex}");
+                        try
+                        {
+                            var reader = new BitReader(bitstreamSpan);
+                            tagHandlers[i](ref reader, sender);
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError($"[Interpreter] Exception in {typeof(T).Name} bitstream tag handler: {ex}");
+                        }
                     }
                 }
             }
@@ -470,7 +448,7 @@ namespace Liminal.Net.Core
                         return;
                     }
 
-                    var dispatcher = GetOrCreateBitStreamDispatcher<TMeta>(packetId);
+                    var dispatcher = GetOrCreateDispatcher<TMeta>(packetId);
                     dispatcher.Add(callback);
                     subList.Add(subscription);
                 }
@@ -510,7 +488,7 @@ namespace Liminal.Net.Core
                         return;
                     }
 
-                    var dispatcher = GetOrCreateBitStreamDispatcher<TPacket>(packetId);
+                    var dispatcher = GetOrCreateDispatcher<TPacket>(packetId);
                     dispatcher.Add(callback);
                     subList.Add(subscription);
                 }
@@ -606,13 +584,6 @@ namespace Liminal.Net.Core
             return typedDispatcher;
         }
 
-        private BitStreamDispatcher<TMeta> GetOrCreateBitStreamDispatcher<TMeta>(ushort packetId)
-        {
-            var dispatcher = _handlers.GetOrAdd(packetId, _ => new BitStreamDispatcher<TMeta>());
-            if (dispatcher is not BitStreamDispatcher<TMeta> bitDispatcher)
-                throw new InvalidOperationException($"Packet ID {packetId} ({typeof(TMeta).Name}) is already registered with a different dispatcher ({dispatcher.GetType().Name}).");
-            return bitDispatcher;
-        }
 
         private void RemoveFromHandlers_NoLock(ushort packetId, Delegate callback)
         {

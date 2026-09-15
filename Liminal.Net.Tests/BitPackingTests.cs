@@ -617,12 +617,10 @@ namespace Liminal.Net.Tests
             writer.WriteInt(1, 16);
             writer.Flush();
 
-            // 1. Client explicitly sends as client to server
             client.Interpreter.SendBitStreamAsClient(ILiminalTransport.SERVER_ID, in meta, buf.AsSpan(0, writer.BytesWritten));
             Assert.That(serverReceived.Wait(TimeSpan.FromSeconds(3)), Is.True, "Server did not receive packet from client.");
             Assert.That(serverSeenSender, Is.EqualTo(client.localID), "Server should see client.localID as sender.");
 
-            // 2. Server explicitly sends as server to client
             server.Interpreter.SendBitStreamAsServer(client.localID, in meta, buf.AsSpan(0, writer.BytesWritten));
             Assert.That(clientReceived.Wait(TimeSpan.FromSeconds(3)), Is.True, "Client did not receive packet from server.");
             Assert.That(clientSeenSender, Is.EqualTo(ILiminalTransport.SERVER_ID), "Client should see SERVER_ID (0) as sender.");
@@ -706,8 +704,6 @@ namespace Liminal.Net.Tests
                 callbackInvoked = true;
             }, this);
 
-            // Construct a malformed payload where the stamped bitstream length is 64 bytes,
-            // but only 4 bytes are actually present in the network packet.
             var metaPkt = new TestSnapshotMeta { Tick = 1, Count = 1 };
             byte[] rawMeta = MessagePack.MessagePackSerializer.Serialize(metaPkt);
             byte[] malformedPacket = new byte[rawMeta.Length + 4 + 4];
@@ -717,7 +713,6 @@ namespace Liminal.Net.Tests
 
             ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<TestSnapshotMeta>());
 
-            // Dispatch directly to server interpreter (simulating arrival from network)
             server.Interpreter.Dispatch(packetId, client.localID, malformedPacket);
 
             Assert.That(callbackInvoked, Is.False, "Truncated/cut bitstream packet must be rejected and not delivered to subscriber.");
@@ -758,6 +753,143 @@ namespace Liminal.Net.Tests
             Assert.That(callbackInvoked, Is.True, "Valid packet with stamped length should be delivered.");
             Assert.That(readVal, Is.EqualTo(0x7FFFFFFF));
             Assert.That(remainingBitsAfterRead, Is.EqualTo(0), "Trailing garbage outside the stamped length must NOT be visible to BitReader.");
+        }
+
+        [Test]
+        public void Test_UnifiedDispatcher_BitStreamPacket_DispatchesToBothNormalAndBitStreamSubscribers()
+        {
+            var (server, client) = CreateConnectedPair();
+
+            bool normalInvoked = false;
+            TestSnapshotMeta normalReceivedMeta = default;
+
+            bool bitStreamInvoked = false;
+            TestSnapshotMeta bitStreamReceivedMeta = default;
+            int bitStreamPayloadVal = 0;
+
+            using var normalSignal = new ManualResetEventSlim(false);
+            using var bitStreamSignal = new ManualResetEventSlim(false);
+
+            // Subscribe BOTH normal and bitstream subscribers to the same packet type
+            server.Interpreter.Subscribe<TestSnapshotMeta>((TestSnapshotMeta meta, ushort sender) =>
+            {
+                normalInvoked = true;
+                normalReceivedMeta = meta;
+                normalSignal.Set();
+            }, this);
+
+            server.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                bitStreamInvoked = true;
+                bitStreamReceivedMeta = meta;
+                bitStreamPayloadVal = reader.ReadInt();
+                bitStreamSignal.Set();
+            }, this);
+
+            // Send as BitStream
+            var sendMeta = new TestSnapshotMeta { Tick = 77, Count = 3 };
+            byte[] buf = new byte[8];
+            var writer = new BitWriter(buf.AsSpan());
+            writer.WriteInt(123456);
+            writer.Flush();
+
+            client.Interpreter.SendBitStream<TestSnapshotMeta>(ILiminalTransport.SERVER_ID, in sendMeta, buf.AsSpan(0, writer.BytesWritten));
+
+            Assert.That(normalSignal.Wait(TimeSpan.FromSeconds(3)), Is.True, "Normal subscriber should receive metadata struct from BitStream packet.");
+            Assert.That(bitStreamSignal.Wait(TimeSpan.FromSeconds(3)), Is.True, "BitStream subscriber should receive packet and bitstream.");
+
+            Assert.That(normalInvoked, Is.True);
+            Assert.That(normalReceivedMeta.Tick, Is.EqualTo(77));
+            Assert.That(normalReceivedMeta.Count, Is.EqualTo(3));
+
+            Assert.That(bitStreamInvoked, Is.True);
+            Assert.That(bitStreamReceivedMeta.Tick, Is.EqualTo(77));
+            Assert.That(bitStreamPayloadVal, Is.EqualTo(123456));
+        }
+
+        [Test]
+        public void Test_UnifiedDispatcher_NormalPacket_DispatchesOnlyToNormalSubscribers()
+        {
+            var (server, client) = CreateConnectedPair();
+
+            bool normalInvoked = false;
+            TestSnapshotMeta normalReceivedMeta = default;
+
+            bool bitStreamInvoked = false;
+
+            using var normalSignal = new ManualResetEventSlim(false);
+
+            // Subscribe BOTH normal and bitstream subscribers to the same packet type
+            server.Interpreter.Subscribe<TestSnapshotMeta>((TestSnapshotMeta meta, ushort sender) =>
+            {
+                normalInvoked = true;
+                normalReceivedMeta = meta;
+                normalSignal.Set();
+            }, this);
+
+            server.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                bitStreamInvoked = true;
+            }, this);
+
+            // Send as a NORMAL packet (SendCommand without bitstream)
+            var sendMeta = new TestSnapshotMeta { Tick = 99, Count = 1 };
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, sendMeta);
+
+            Assert.That(normalSignal.Wait(TimeSpan.FromSeconds(3)), Is.True, "Normal subscriber should receive normal packet.");
+            Assert.That(normalInvoked, Is.True);
+            Assert.That(normalReceivedMeta.Tick, Is.EqualTo(99));
+
+            // Wait briefly to ensure BitStream subscriber is NOT invoked
+            Thread.Sleep(100);
+            Assert.That(bitStreamInvoked, Is.False, "BitStream subscriber must NOT be invoked when packet was sent without a bitstream.");
+        }
+
+        [Test]
+        public void Test_UnifiedDispatcher_Unsubscribe_IndependentLifecycle()
+        {
+            var (server, client) = CreateConnectedPair();
+
+            int normalCount = 0;
+            int bitStreamCount = 0;
+
+            object normalSub = new object();
+            object bitStreamSub = new object();
+
+            server.Interpreter.Subscribe<TestSnapshotMeta>((meta, sender) =>
+            {
+                normalCount++;
+            }, normalSub);
+
+            server.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                bitStreamCount++;
+            }, bitStreamSub);
+
+            var meta = new TestSnapshotMeta { Tick = 1, Count = 1 };
+            byte[] buf = new byte[8];
+            var writer = new BitWriter(buf.AsSpan());
+            writer.WriteInt(10);
+            writer.Flush();
+
+            client.Interpreter.SendBitStream<TestSnapshotMeta>(ILiminalTransport.SERVER_ID, in meta, buf.AsSpan(0, writer.BytesWritten));
+            Thread.Sleep(100);
+            Assert.That(normalCount, Is.EqualTo(1));
+            Assert.That(bitStreamCount, Is.EqualTo(1));
+
+            server.Interpreter.Unsubscribe<TestSnapshotMeta>(normalSub);
+
+            client.Interpreter.SendBitStream<TestSnapshotMeta>(ILiminalTransport.SERVER_ID, in meta, buf.AsSpan(0, writer.BytesWritten));
+            Thread.Sleep(100);
+            Assert.That(normalCount, Is.EqualTo(1), "Normal count should not increase after unsubscription.");
+            Assert.That(bitStreamCount, Is.EqualTo(2), "BitStream subscriber should still receive packet.");
+
+            server.Interpreter.UnsubscribeBitStream<TestSnapshotMeta>(bitStreamSub);
+
+            client.Interpreter.SendBitStream<TestSnapshotMeta>(ILiminalTransport.SERVER_ID, in meta, buf.AsSpan(0, writer.BytesWritten));
+            Thread.Sleep(100);
+            Assert.That(normalCount, Is.EqualTo(1));
+            Assert.That(bitStreamCount, Is.EqualTo(2), "BitStream count should not increase after unsubscription.");
         }
 
         #endregion
