@@ -64,6 +64,35 @@ namespace Liminal.Net.Core
             LiminalNetworkManager.Instance?.Interpreter.Unsubscribe<T>(subscriber);
         }
 
+        public static void SubscribeBitStream<TMeta>(BitStreamHandler<TMeta> callback, object subscriber) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+            if (manager == null)
+            {
+                LiminalLogger.LogError("[Broadcaster] Manager instance is null. Cannot subscribe.");
+                return;
+            }
+
+            manager.Interpreter.SubscribeBitStream(callback, subscriber);
+        }
+
+        public static void SubscribeBitStream<TPacket>(BitStreamTagHandler callback, object subscriber) where TPacket : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+            if (manager == null)
+            {
+                LiminalLogger.LogError("[Broadcaster] Manager instance is null. Cannot subscribe.");
+                return;
+            }
+
+            manager.Interpreter.SubscribeBitStream<TPacket>(callback, subscriber);
+        }
+
+        public static void UnsubscribeBitStream<TMeta>(object subscriber) where TMeta : struct
+        {
+            LiminalNetworkManager.Instance?.Interpreter.UnsubscribeBitStream<TMeta>(subscriber);
+        }
+
         public static void UnsubscribeAll(object subscriber)
         {
             LiminalNetworkManager.Instance?.Interpreter.UnsubscribeAll(subscriber);
@@ -125,17 +154,319 @@ namespace Liminal.Net.Core
             manager.Interpreter.SendCommandAsServer(targetClientId, packet, deliveryMethod);
         }
 
+        public static void SendBitStream<TMeta>(SendTo target, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager == null)
+            {
+                LiminalLogger.LogError("[Broadcaster] Cannot send bitstream: LiminalNetworkManager.Instance is null.");
+                return;
+            }
+
+            if (!manager.CanSend)
+            {
+                LiminalLogger.LogWarning("[Broadcaster] Cannot send bitstream: Network is not active or ready to send.");
+                return;
+            }
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                switch (target)
+                {
+                    case SendTo.Me:
+                        manager.Interpreter.SendBitStream(manager.localID, in meta, bitstream, deliveryMethod);
+                        return;
+
+                    case SendTo.Server:
+                        manager.Interpreter.SendBitStream(ILiminalTransport.SERVER_ID, in meta, bitstream, deliveryMethod);
+                        return;
+
+                    default:
+                        LiminalLogger.LogError($"[Broadcaster] Standalone clients can only use SendTo.Server or SendTo.Me. Attempted: {target}");
+                        return;
+                }
+            }
+
+            ResolveAndSendBitStreamMulticast(manager, target, in meta, bitstream, deliveryMethod);
+        }
+
+        public static void SendBitStreamToClient<TMeta>(ushort targetClientId, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (!ValidateManager(manager, out var role)) return;
+
+            if (role == NetworkRole.Client)
+            {
+                LiminalLogger.LogError("[Broadcaster] Standalone clients cannot use SendBitStreamToClient. Route packets through SendTo.Server instead.");
+                return;
+            }
+
+            if (!ValidateTargetSession(manager, targetClientId)) return;
+
+            manager.Interpreter.SendBitStreamAsServer(targetClientId, in meta, bitstream, deliveryMethod);
+        }
+
+        public static void SendBitStream<TMeta>(SendTo target, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager == null)
+            {
+                LiminalLogger.LogError("[Broadcaster] Cannot send bitstream: LiminalNetworkManager.Instance is null.");
+                return;
+            }
+
+            if (!manager.CanSend)
+            {
+                LiminalLogger.LogWarning("[Broadcaster] Cannot send bitstream: Network is not active or ready to send.");
+                return;
+            }
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                switch (target)
+                {
+                    case SendTo.Me:
+                        manager.Interpreter.SendBitStream(manager.localID, in meta, packAction, deliveryMethod);
+                        return;
+
+                    case SendTo.Server:
+                        manager.Interpreter.SendBitStream(ILiminalTransport.SERVER_ID, in meta, packAction, deliveryMethod);
+                        return;
+
+                    default:
+                        LiminalLogger.LogError($"[Broadcaster] Standalone clients can only use SendTo.Server or SendTo.Me. Attempted: {target}");
+                        return;
+                }
+            }
+
+            ResolveAndSendBitStreamActionMulticast(manager, target, in meta, packAction, deliveryMethod);
+        }
+
+        public static void SendBitStream<TMeta, TState>(SendTo target, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager == null)
+            {
+                LiminalLogger.LogError("[Broadcaster] Cannot send bitstream: LiminalNetworkManager.Instance is null.");
+                return;
+            }
+
+            if (!manager.CanSend)
+            {
+                LiminalLogger.LogWarning("[Broadcaster] Cannot send bitstream: Network is not active or ready to send.");
+                return;
+            }
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                switch (target)
+                {
+                    case SendTo.Me:
+                        manager.Interpreter.SendBitStream(manager.localID, in meta, in state, packAction, deliveryMethod);
+                        return;
+
+                    case SendTo.Server:
+                        manager.Interpreter.SendBitStream(ILiminalTransport.SERVER_ID, in meta, in state, packAction, deliveryMethod);
+                        return;
+
+                    default:
+                        LiminalLogger.LogError($"[Broadcaster] Standalone clients can only use SendTo.Server or SendTo.Me. Attempted: {target}");
+                        return;
+                }
+            }
+
+            ResolveAndSendBitStreamActionStateMulticast(manager, target, in meta, in state, packAction, deliveryMethod);
+        }
+
+        public static void SendBitStreamToClient<TMeta>(ushort targetClientId, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (!ValidateManager(manager, out var role)) return;
+
+            if (role == NetworkRole.Client)
+            {
+                LiminalLogger.LogError("[Broadcaster] Standalone clients cannot use SendBitStreamToClient. Route packets through SendTo.Server instead.");
+                return;
+            }
+
+            if (!ValidateTargetSession(manager, targetClientId)) return;
+
+            manager.Interpreter.SendBitStreamFrom(ILiminalTransport.SERVER_ID, targetClientId, in meta, packAction, deliveryMethod);
+        }
+
+        public static void SendBitStreamToClient<TMeta, TState>(ushort targetClientId, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (!ValidateManager(manager, out var role)) return;
+
+            if (role == NetworkRole.Client)
+            {
+                LiminalLogger.LogError("[Broadcaster] Standalone clients cannot use SendBitStreamToClient. Route packets through SendTo.Server instead.");
+                return;
+            }
+
+            if (!ValidateTargetSession(manager, targetClientId)) return;
+
+            manager.Interpreter.SendBitStreamFrom(ILiminalTransport.SERVER_ID, targetClientId, in meta, in state, packAction, deliveryMethod);
+        }
+
+        public static BitStreamScope BeginBitStream<TMeta>(SendTo target, in TMeta meta, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager == null)
+                throw new InvalidOperationException("[Broadcaster] Cannot begin bitstream: LiminalNetworkManager.Instance is null.");
+
+            if (!manager.CanSend)
+                throw new InvalidOperationException("[Broadcaster] Cannot begin bitstream: Network is not active or ready to send.");
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                switch (target)
+                {
+                    case SendTo.Me:
+                        return manager.Interpreter.BeginBitStreamScope(manager.localID, in meta, deliveryMethod);
+
+                    case SendTo.Server:
+                        return manager.Interpreter.BeginBitStreamScope(ILiminalTransport.SERVER_ID, in meta, deliveryMethod);
+
+                    default:
+                        throw new InvalidOperationException($"[Broadcaster] Standalone clients can only use SendTo.Server or SendTo.Me. Attempted: {target}");
+                }
+            }
+
+            return manager.Interpreter.BeginBitStreamScope(target, in meta, deliveryMethod);
+        }
+
+        public static BitStreamScope BeginBitStreamToClient<TMeta>(ushort targetClientId, in TMeta meta, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+
+            if (manager == null)
+                throw new InvalidOperationException("[Broadcaster] Cannot begin bitstream: LiminalNetworkManager.Instance is null.");
+
+            if (manager.Role == NetworkRole.Client)
+                throw new InvalidOperationException("[Broadcaster] Standalone clients cannot use BeginBitStreamToClient. Route packets through SendTo.Server instead.");
+
+            if (!ValidateTargetSession(manager, targetClientId))
+                throw new InvalidOperationException($"[Broadcaster] Client ID {targetClientId} is not a valid active session.");
+
+            return manager.Interpreter.BeginBitStreamScope(targetClientId, in meta, deliveryMethod);
+        }
+
         private static void ResolveAndSendMulticast<T>(LiminalNetworkManager manager, SendTo target, T packet, DeliveryMethod deliveryMethod) where T : struct
         {
+            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> filteredTargets = stackalloc ushort[maxClients];
+            int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
+
+            if (targetCount == 0) return;
+
+            var targetsSlice = filteredTargets.Slice(0, targetCount);
+
+            if (sendAsClient)
+            {
+                manager.Interpreter.SendCommandAsClient(targetsSlice, packet, deliveryMethod);
+            }
+            else
+            {
+                manager.Interpreter.SendCommandAsServer(targetsSlice, packet, deliveryMethod);
+            }
+        }
+
+        private static void ResolveAndSendBitStreamMulticast<TMeta>(LiminalNetworkManager manager, SendTo target, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod) where TMeta : struct
+        {
+            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> filteredTargets = stackalloc ushort[maxClients];
+            int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
+
+            if (targetCount == 0) return;
+
+            var targetsSlice = filteredTargets.Slice(0, targetCount);
+
+            if (sendAsClient)
+            {
+                manager.Interpreter.SendBitStreamAsClient(targetsSlice, in meta, bitstream, deliveryMethod);
+            }
+            else
+            {
+                manager.Interpreter.SendBitStreamAsServer(targetsSlice, in meta, bitstream, deliveryMethod);
+            }
+        }
+
+        private static void ResolveAndSendBitStreamActionMulticast<TMeta>(LiminalNetworkManager manager, SendTo target, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod) where TMeta : struct
+        {
+            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> filteredTargets = stackalloc ushort[maxClients];
+            int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
+
+            if (targetCount == 0) return;
+
+            var targetsSlice = filteredTargets.Slice(0, targetCount);
+            ushort sender = sendAsClient ? manager.localID : ILiminalTransport.SERVER_ID;
+            manager.Interpreter.SendBitStreamFrom(sender, targetsSlice, in meta, packAction, deliveryMethod);
+        }
+
+        private static void ResolveAndSendBitStreamActionStateMulticast<TMeta, TState>(LiminalNetworkManager manager, SendTo target, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod) where TMeta : struct
+        {
+            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> filteredTargets = stackalloc ushort[maxClients];
+            int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
+
+            if (targetCount == 0) return;
+
+            var targetsSlice = filteredTargets.Slice(0, targetCount);
+            ushort sender = sendAsClient ? manager.localID : ILiminalTransport.SERVER_ID;
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0) return;
+            ushort packetId = checked((ushort)idInt);
+            var writer = manager.Interpreter.RentWriter();
+
+            try
+            {
+                MessagePack.MessagePackSerializer.Serialize(writer, meta);
+                var bitWriter = new BitWriter(writer);
+                packAction(ref bitWriter, in state);
+                bitWriter.Flush();
+
+                for (int i = 0; i < targetsSlice.Length; i++)
+                    manager.Interpreter.InvokeSendRequestSingle(sender, targetsSlice[i], packetId, writer.WrittenSpan, deliveryMethod);
+            }
+            finally
+            {
+                manager.Interpreter.ReturnWriter(writer);
+            }
+        }
+
+        internal static void ResolveAndSendBitStream(LiminalNetworkManager manager, SendTo target, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod)
+        {
+            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> filteredTargets = stackalloc ushort[maxClients];
+            int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
+
+            if (targetCount == 0) return;
+
+            ushort sender = sendAsClient ? manager.localID : ILiminalTransport.SERVER_ID;
+            manager.Interpreter.InvokeSendRequestMulticast(sender, filteredTargets.Slice(0, targetCount), packetId, payload, deliveryMethod);
+        }
+
+        private static int ResolveTargets(LiminalNetworkManager manager, SendTo target, Span<ushort> destination, out bool sendAsClient)
+        {
+            sendAsClient = false;
             int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
             Span<ushort> allSessions = stackalloc ushort[maxClients];
             int totalSessions = manager.SessionManager.GetSessionIds(allSessions);
 
-            if (totalSessions == 0) return;
+            if (totalSessions == 0) return 0;
 
-            Span<ushort> filteredTargets = stackalloc ushort[totalSessions];
             int targetCount = 0;
-
             ushort localId = manager.localID;
             bool isHost = manager.Role == NetworkRole.Host;
 
@@ -173,23 +504,12 @@ namespace Liminal.Net.Core
 
                 if (include)
                 {
-                    filteredTargets[targetCount++] = id;
+                    destination[targetCount++] = id;
                 }
             }
 
-            if (targetCount == 0) return;
-
-            var targetsSlice = filteredTargets.Slice(0, targetCount);
-            bool sendAsClient = isHost && (target == SendTo.Me || target == SendTo.NotServer || target == SendTo.Server);
-
-            if (sendAsClient)
-            {
-                manager.Interpreter.SendCommandAsClient(targetsSlice, packet, deliveryMethod);
-            }
-            else
-            {
-                manager.Interpreter.SendCommandAsServer(targetsSlice, packet, deliveryMethod);
-            }
+            sendAsClient = isHost && (target == SendTo.Me || target == SendTo.NotServer || target == SendTo.Server);
+            return targetCount;
         }
         #endregion
 

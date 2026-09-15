@@ -20,7 +20,6 @@ namespace Liminal.Net.Core
 
         private interface IPacketDispatcher
         {
-            void Add<TPacket>(Action<TPacket, ushort> callback);
             void RemoveUntyped(Delegate callback);
             void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options);
             bool HasCallbacks { get; }
@@ -132,6 +131,171 @@ namespace Liminal.Net.Core
             }
         }
 
+        private sealed class BitStreamDispatcher<TMeta> : IPacketDispatcher
+        {
+            private readonly object _lock = new();
+
+            private BitStreamHandler<TMeta>[] _handlers = Array.Empty<BitStreamHandler<TMeta>>();
+            private BitStreamTagHandler[] _tagHandlers = Array.Empty<BitStreamTagHandler>();
+
+            public bool HasCallbacks => Volatile.Read(ref _handlers).Length != 0 || Volatile.Read(ref _tagHandlers).Length != 0;
+
+            public void Add(BitStreamHandler<TMeta> handler)
+            {
+                lock (_lock)
+                {
+                    var current = _handlers;
+                    var next = new BitStreamHandler<TMeta>[current.Length + 1];
+
+                    Array.Copy(current, next, current.Length);
+                    next[current.Length] = handler;
+
+                    Volatile.Write(ref _handlers, next);
+                }
+            }
+
+            public void Add(BitStreamTagHandler handler)
+            {
+                lock (_lock)
+                {
+                    var current = _tagHandlers;
+                    var next = new BitStreamTagHandler[current.Length + 1];
+
+                    Array.Copy(current, next, current.Length);
+                    next[current.Length] = handler;
+
+                    Volatile.Write(ref _tagHandlers, next);
+                }
+            }
+
+            public void RemoveUntyped(Delegate callback)
+            {
+                if (callback is BitStreamHandler<TMeta> typedHandler)
+                {
+                    lock (_lock)
+                    {
+                        var current = _handlers;
+                        int index = -1;
+
+                        for (int i = 0; i < current.Length; i++)
+                        {
+                            if (current[i] == typedHandler)
+                            {
+                                index = i;
+                                break;
+                            }
+                        }
+
+                        if (index < 0)
+                            return;
+
+                        if (current.Length == 1)
+                        {
+                            Volatile.Write(ref _handlers, Array.Empty<BitStreamHandler<TMeta>>());
+                            return;
+                        }
+
+                        var next = new BitStreamHandler<TMeta>[current.Length - 1];
+
+                        if (index > 0)
+                            Array.Copy(current, 0, next, 0, index);
+
+                        if (index < current.Length - 1)
+                            Array.Copy(current, index + 1, next, index, current.Length - index - 1);
+
+                        Volatile.Write(ref _handlers, next);
+                    }
+                }
+                else if (callback is BitStreamTagHandler tagHandler)
+                {
+                    lock (_lock)
+                    {
+                        var current = _tagHandlers;
+                        int index = -1;
+
+                        for (int i = 0; i < current.Length; i++)
+                        {
+                            if (current[i] == tagHandler)
+                            {
+                                index = i;
+                                break;
+                            }
+                        }
+
+                        if (index < 0)
+                            return;
+
+                        if (current.Length == 1)
+                        {
+                            Volatile.Write(ref _tagHandlers, Array.Empty<BitStreamTagHandler>());
+                            return;
+                        }
+
+                        var next = new BitStreamTagHandler[current.Length - 1];
+
+                        if (index > 0)
+                            Array.Copy(current, 0, next, 0, index);
+
+                        if (index < current.Length - 1)
+                            Array.Copy(current, index + 1, next, index, current.Length - index - 1);
+
+                        Volatile.Write(ref _tagHandlers, next);
+                    }
+                }
+            }
+
+            public void Dispatch(ReadOnlyMemory<byte> rawData, ushort sender, MessagePackSerializerOptions options)
+            {
+                var handlers = Volatile.Read(ref _handlers);
+                var tagHandlers = Volatile.Read(ref _tagHandlers);
+
+                if (handlers.Length == 0 && tagHandlers.Length == 0)
+                    return;
+
+                TMeta meta;
+                ReadOnlySpan<byte> bitstreamSpan;
+
+                try
+                {
+                    var mpReader = new MessagePackReader(rawData);
+                    meta = MessagePackSerializer.Deserialize<TMeta>(ref mpReader, options);
+                    int consumed = (int)mpReader.Consumed;
+                    bitstreamSpan = rawData.Span.Slice(consumed);
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogWarning($"[Security] Malformed bitstream packet {typeof(TMeta).Name}: {ex.Message}");
+                    return;
+                }
+
+                for (int i = 0; i < handlers.Length; i++)
+                {
+                    try
+                    {
+                        var reader = new BitReader(bitstreamSpan);
+                        handlers[i](in meta, ref reader, sender);
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[Interpreter] Exception in {typeof(TMeta).Name} bitstream handler: {ex}");
+                    }
+                }
+
+                for (int i = 0; i < tagHandlers.Length; i++)
+                {
+                    try
+                    {
+                        var reader = new BitReader(bitstreamSpan);
+                        tagHandlers[i](ref reader, sender);
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[Interpreter] Exception in {typeof(TMeta).Name} bitstream tag handler: {ex}");
+                    }
+                }
+            }
+        }
+
         private struct Subscription
         {
             public ushort PacketId;
@@ -191,7 +355,7 @@ namespace Liminal.Net.Core
             _config = config ?? throw new ArgumentNullException(nameof(config));
         }
 
-        private LiminalNativeBufferWriter RentWriter()
+        internal LiminalNativeBufferWriter RentWriter()
         {
             if (_writerPool.TryTake(out var writer))
             {
@@ -200,6 +364,22 @@ namespace Liminal.Net.Core
             }
 
             return new LiminalNativeBufferWriter(_config.Hiccup.GetRecoverySize(_config.MaxPacketSizePerBatch));
+        }
+
+        internal void ReturnWriter(LiminalNativeBufferWriter writer)
+        {
+            _writerPool.Add(writer);
+        }
+
+        internal void InvokeSendRequestSingle(ushort senderId, ushort targetSessionId, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod)
+        {
+            InvokeSendRequest(senderId, targetSessionId, packetId, payload, deliveryMethod);
+        }
+
+        internal void InvokeSendRequestMulticast(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod)
+        {
+            for (int i = 0; i < targetSessionIds.Length; i++)
+                InvokeSendRequest(senderId, targetSessionIds[i], packetId, payload, deliveryMethod);
         }
 
         #region Subscriptions
@@ -243,6 +423,88 @@ namespace Liminal.Net.Core
                 LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
             }
         }
+
+        public void SubscribeBitStream<TMeta>(BitStreamHandler<TMeta> callback, object subscriber) where TMeta : struct
+        {
+            if (callback == null)
+                throw new ArgumentNullException(nameof(callback));
+
+            if (subscriber == null)
+                throw new ArgumentNullException(nameof(subscriber));
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot subscribe to bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var subscription = new Subscription { PacketId = packetId, Callback = callback };
+
+            lock (_subscriptionGate)
+            {
+                var subList = _subscribers.GetOrAdd(subscriber, _ => new SubscriptionList());
+
+                lock (subList.Lock)
+                {
+                    if (subList.Contains(packetId, callback))
+                    {
+                        LiminalLogger.LogWarning($"[Interpreter] Duplicate bitstream subscription suppressed: {subscriber.GetType().Name} -> {typeof(TMeta).Name}");
+                        return;
+                    }
+
+                    var dispatcher = GetOrCreateBitStreamDispatcher<TMeta>(packetId);
+                    dispatcher.Add(callback);
+                    subList.Add(subscription);
+                }
+
+                LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to bitstream {typeof(TMeta).Name} (ID: {packetId})");
+            }
+        }
+
+        public void SubscribeBitStream<TPacket>(BitStreamTagHandler callback, object subscriber) where TPacket : struct
+        {
+            if (callback == null)
+                throw new ArgumentNullException(nameof(callback));
+
+            if (subscriber == null)
+                throw new ArgumentNullException(nameof(subscriber));
+
+            int idInt = LiminalPacketLibrary.GetId<TPacket>();
+
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot subscribe to bitstream tag {typeof(TPacket).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var subscription = new Subscription { PacketId = packetId, Callback = callback };
+
+            lock (_subscriptionGate)
+            {
+                var subList = _subscribers.GetOrAdd(subscriber, _ => new SubscriptionList());
+
+                lock (subList.Lock)
+                {
+                    if (subList.Contains(packetId, callback))
+                    {
+                        LiminalLogger.LogWarning($"[Interpreter] Duplicate bitstream tag subscription suppressed: {subscriber.GetType().Name} -> {typeof(TPacket).Name}");
+                        return;
+                    }
+
+                    var dispatcher = GetOrCreateBitStreamDispatcher<TPacket>(packetId);
+                    dispatcher.Add(callback);
+                    subList.Add(subscription);
+                }
+
+                LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to bitstream tag {typeof(TPacket).Name} (ID: {packetId})");
+            }
+        }
+
+        public void UnsubscribeBitStream<TMeta>(object subscriber) where TMeta : struct => Unsubscribe<TMeta>(subscriber);
 
         public void Unsubscribe<T>(object subscriber)
         {
@@ -323,7 +585,18 @@ namespace Liminal.Net.Core
 
         private TypedPacketDispatcher<T> GetOrCreateDispatcher<T>(ushort packetId)
         {
-            return (TypedPacketDispatcher<T>)_handlers.GetOrAdd(packetId, _ => new TypedPacketDispatcher<T>());
+            var dispatcher = _handlers.GetOrAdd(packetId, _ => new TypedPacketDispatcher<T>());
+            if (dispatcher is not TypedPacketDispatcher<T> typedDispatcher)
+                throw new InvalidOperationException($"Packet ID {packetId} ({typeof(T).Name}) is already registered with a different dispatcher ({dispatcher.GetType().Name}).");
+            return typedDispatcher;
+        }
+
+        private BitStreamDispatcher<TMeta> GetOrCreateBitStreamDispatcher<TMeta>(ushort packetId)
+        {
+            var dispatcher = _handlers.GetOrAdd(packetId, _ => new BitStreamDispatcher<TMeta>());
+            if (dispatcher is not BitStreamDispatcher<TMeta> bitDispatcher)
+                throw new InvalidOperationException($"Packet ID {packetId} ({typeof(TMeta).Name}) is already registered with a different dispatcher ({dispatcher.GetType().Name}).");
+            return bitDispatcher;
         }
 
         private void RemoveFromHandlers_NoLock(ushort packetId, Delegate callback)
@@ -555,6 +828,368 @@ namespace Liminal.Net.Core
             finally
             {
                 _writerPool.Add(writer);
+            }
+        }
+
+        #endregion
+
+        #region BitStream Sends
+
+        public void SendBitStream<TMeta>(ushort targetSessionId, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            ushort defaultSender;
+            var manager = _manager;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                defaultSender = targetSessionId == ILiminalTransport.SERVER_ID ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendBitStreamFrom(defaultSender, targetSessionId, in meta, bitstream, deliveryMethod);
+        }
+
+        public void SendBitStreamAsClient<TMeta>(ushort targetSessionId, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(_manager.localID, targetSessionId, in meta, bitstream, deliveryMethod);
+        }
+
+        public void SendBitStreamAsServer<TMeta>(ushort targetSessionId, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(ILiminalTransport.SERVER_ID, targetSessionId, in meta, bitstream, deliveryMethod);
+        }
+
+        public void SendBitStreamFrom<TMeta>(ushort senderId, ushort targetSessionId, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                if (!bitstream.IsEmpty)
+                {
+                    var span = writer.GetSpan(bitstream.Length);
+                    bitstream.CopyTo(span);
+                    writer.Advance(bitstream.Length);
+                }
+
+                InvokeSendRequest(senderId, targetSessionId, packetId, writer.WrittenSpan, deliveryMethod);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                ReturnWriter(writer);
+            }
+        }
+
+        public void SendBitStream<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (targetSessionIds.IsEmpty)
+                return;
+
+            ushort defaultSender;
+            var manager = _manager;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                bool targetsOnlyServer = targetSessionIds.Length == 1 && targetSessionIds[0] == ILiminalTransport.SERVER_ID;
+                defaultSender = targetsOnlyServer ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendBitStreamFrom(defaultSender, targetSessionIds, in meta, bitstream, deliveryMethod);
+        }
+
+        public void SendBitStreamAsServer<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(ILiminalTransport.SERVER_ID, targetSessionIds, in meta, bitstream, deliveryMethod);
+        }
+
+        public void SendBitStreamAsClient<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(_manager.localID, targetSessionIds, in meta, bitstream, deliveryMethod);
+        }
+
+        public void SendBitStreamFrom<TMeta>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (targetSessionIds.IsEmpty)
+                return;
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                if (!bitstream.IsEmpty)
+                {
+                    var span = writer.GetSpan(bitstream.Length);
+                    bitstream.CopyTo(span);
+                    writer.Advance(bitstream.Length);
+                }
+
+                ReadOnlySpan<byte> payload = writer.WrittenSpan;
+
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                    InvokeSendRequest(senderId, targetSessionIds[i], packetId, payload, deliveryMethod);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                ReturnWriter(writer);
+            }
+        }
+
+        public void SendBitStream<TMeta>(ushort targetSessionId, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            ushort defaultSender;
+            var manager = _manager;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                defaultSender = targetSessionId == ILiminalTransport.SERVER_ID ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendBitStreamFrom(defaultSender, targetSessionId, in meta, packAction, deliveryMethod);
+        }
+
+        public void SendBitStreamFrom<TMeta>(ushort senderId, ushort targetSessionId, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (packAction == null)
+                throw new ArgumentNullException(nameof(packAction));
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                var bitWriter = new BitWriter(writer);
+                packAction(ref bitWriter);
+                bitWriter.Flush();
+
+                InvokeSendRequest(senderId, targetSessionId, packetId, writer.WrittenSpan, deliveryMethod);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                ReturnWriter(writer);
+            }
+        }
+
+        public void SendBitStream<TMeta, TState>(ushort targetSessionId, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            ushort defaultSender;
+            var manager = _manager;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                defaultSender = targetSessionId == ILiminalTransport.SERVER_ID ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendBitStreamFrom(defaultSender, targetSessionId, in meta, in state, packAction, deliveryMethod);
+        }
+
+        public void SendBitStreamFrom<TMeta, TState>(ushort senderId, ushort targetSessionId, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (packAction == null)
+                throw new ArgumentNullException(nameof(packAction));
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                var bitWriter = new BitWriter(writer);
+                packAction(ref bitWriter, in state);
+                bitWriter.Flush();
+
+                InvokeSendRequest(senderId, targetSessionId, packetId, writer.WrittenSpan, deliveryMethod);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                ReturnWriter(writer);
+            }
+        }
+
+        public void SendBitStream<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (targetSessionIds.IsEmpty)
+                return;
+
+            ushort defaultSender;
+            var manager = _manager;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                bool targetsOnlyServer = targetSessionIds.Length == 1 && targetSessionIds[0] == ILiminalTransport.SERVER_ID;
+                defaultSender = targetsOnlyServer ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendBitStreamFrom(defaultSender, targetSessionIds, in meta, packAction, deliveryMethod);
+        }
+
+        public void SendBitStreamFrom<TMeta>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (targetSessionIds.IsEmpty)
+                return;
+
+            if (packAction == null)
+                throw new ArgumentNullException(nameof(packAction));
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                var bitWriter = new BitWriter(writer);
+                packAction(ref bitWriter);
+                bitWriter.Flush();
+
+                ReadOnlySpan<byte> payload = writer.WrittenSpan;
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                    InvokeSendRequest(senderId, targetSessionIds[i], packetId, payload, deliveryMethod);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                ReturnWriter(writer);
+            }
+        }
+
+        public BitStreamScope BeginBitStreamScope<TMeta>(ushort singleTargetId, in TMeta meta, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+                throw new InvalidOperationException($"Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                return new BitStreamScope(_manager, writer, singleTargetId, packetId, deliveryMethod);
+            }
+            catch
+            {
+                ReturnWriter(writer);
+                throw;
+            }
+        }
+
+        public BitStreamScope BeginBitStreamScope<TMeta>(SendTo sendToTarget, in TMeta meta, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+                throw new InvalidOperationException($"Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                return new BitStreamScope(_manager, writer, sendToTarget, packetId, deliveryMethod);
+            }
+            catch
+            {
+                ReturnWriter(writer);
+                throw;
             }
         }
 

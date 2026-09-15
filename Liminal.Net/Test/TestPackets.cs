@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using MessagePack;
 
 namespace Liminal.Net.Test
@@ -19,5 +19,19 @@ namespace Liminal.Net.Test
 
         [Key(1)]
         public byte[] Data;
+    }
+
+    [LiminalPacket]
+    [MessagePackObject]
+    public struct TestSnapshotMeta
+    {
+        [Key(0)] public uint Tick;
+        [Key(1)] public ushort Count;
+    }
+
+    [LiminalPacket]
+    [MessagePackObject]
+    public struct TestTagBitPacket
+    {
     }
 }
