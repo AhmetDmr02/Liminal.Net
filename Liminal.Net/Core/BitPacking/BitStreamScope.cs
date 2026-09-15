@@ -15,6 +15,7 @@ namespace Liminal.Net.Core
         private readonly ushort _singleTargetId;
         private readonly SendTo _sendToTarget;
         private readonly ushort _packetId;
+        private readonly int _lengthOffset;
         private readonly DeliveryMethod _deliveryMethod;
         private readonly bool _isSingleTarget;
         private bool _disposed;
@@ -29,6 +30,7 @@ namespace Liminal.Net.Core
             LiminalNativeBufferWriter writer,
             ushort singleTargetId,
             ushort packetId,
+            int lengthOffset,
             DeliveryMethod deliveryMethod)
         {
             _manager = manager;
@@ -36,6 +38,7 @@ namespace Liminal.Net.Core
             _singleTargetId = singleTargetId;
             _sendToTarget = default;
             _packetId = packetId;
+            _lengthOffset = lengthOffset;
             _deliveryMethod = deliveryMethod;
             _isSingleTarget = true;
             _disposed = false;
@@ -47,6 +50,7 @@ namespace Liminal.Net.Core
             LiminalNativeBufferWriter writer,
             SendTo sendToTarget,
             ushort packetId,
+            int lengthOffset,
             DeliveryMethod deliveryMethod)
         {
             _manager = manager;
@@ -54,6 +58,7 @@ namespace Liminal.Net.Core
             _singleTargetId = 0;
             _sendToTarget = sendToTarget;
             _packetId = packetId;
+            _lengthOffset = lengthOffset;
             _deliveryMethod = deliveryMethod;
             _isSingleTarget = false;
             _disposed = false;
@@ -73,6 +78,8 @@ namespace Liminal.Net.Core
             try
             {
                 Writer.Flush();
+                int bitstreamLen = _writer.WrittenSpan.Length - (_lengthOffset + 4);
+                _writer.WriteInt32At(_lengthOffset, bitstreamLen);
                 ReadOnlySpan<byte> payload = _writer.WrittenSpan;
 
                 if (_isSingleTarget)

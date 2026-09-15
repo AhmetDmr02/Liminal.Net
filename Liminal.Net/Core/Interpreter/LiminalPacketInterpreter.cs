@@ -1,6 +1,7 @@
 using Liminal.Net.Interfaces;
 using MessagePack;
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
@@ -260,7 +261,21 @@ namespace Liminal.Net.Core
                     var mpReader = new MessagePackReader(rawData);
                     meta = MessagePackSerializer.Deserialize<TMeta>(ref mpReader, options);
                     int consumed = (int)mpReader.Consumed;
-                    bitstreamSpan = rawData.Span.Slice(consumed);
+
+                    if (rawData.Length < consumed + 4)
+                    {
+                        LiminalLogger.LogWarning($"[Security] Truncated bitstream packet {typeof(TMeta).Name}: missing bitstream length header.");
+                        return;
+                    }
+
+                    int bitstreamLength = BinaryPrimitives.ReadInt32LittleEndian(rawData.Span.Slice(consumed, 4));
+                    if (bitstreamLength < 0 || rawData.Length < consumed + 4 + bitstreamLength)
+                    {
+                        LiminalLogger.LogWarning($"[Security] Corrupted/cut bitstream packet {typeof(TMeta).Name}: expected {bitstreamLength} bytes, but only {rawData.Length - (consumed + 4)} available.");
+                        return;
+                    }
+
+                    bitstreamSpan = rawData.Span.Slice(consumed + 4, bitstreamLength);
                 }
                 catch (Exception ex)
                 {
@@ -882,6 +897,10 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
+                var lenSpan = writer.GetSpan(4);
+                BinaryPrimitives.WriteInt32LittleEndian(lenSpan, bitstream.Length);
+                writer.Advance(4);
+
                 if (!bitstream.IsEmpty)
                 {
                     var span = writer.GetSpan(bitstream.Length);
@@ -955,6 +974,10 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
+                var lenSpan = writer.GetSpan(4);
+                BinaryPrimitives.WriteInt32LittleEndian(lenSpan, bitstream.Length);
+                writer.Advance(4);
+
                 if (!bitstream.IsEmpty)
                 {
                     var span = writer.GetSpan(bitstream.Length);
@@ -1016,9 +1039,15 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+
                 var bitWriter = new BitWriter(writer);
                 packAction(ref bitWriter);
                 bitWriter.Flush();
+
+                int bitstreamLen = writer.WrittenSpan.Length - (lengthOffset + 4);
+                writer.WriteInt32At(lengthOffset, bitstreamLen);
 
                 InvokeSendRequest(senderId, targetSessionId, packetId, writer.WrittenSpan, deliveryMethod);
             }
@@ -1071,9 +1100,15 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+
                 var bitWriter = new BitWriter(writer);
                 packAction(ref bitWriter, in state);
                 bitWriter.Flush();
+
+                int bitstreamLen = writer.WrittenSpan.Length - (lengthOffset + 4);
+                writer.WriteInt32At(lengthOffset, bitstreamLen);
 
                 InvokeSendRequest(senderId, targetSessionId, packetId, writer.WrittenSpan, deliveryMethod);
             }
@@ -1133,9 +1168,60 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+
                 var bitWriter = new BitWriter(writer);
                 packAction(ref bitWriter);
                 bitWriter.Flush();
+
+                int bitstreamLen = writer.WrittenSpan.Length - (lengthOffset + 4);
+                writer.WriteInt32At(lengthOffset, bitstreamLen);
+
+                ReadOnlySpan<byte> payload = writer.WrittenSpan;
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                    InvokeSendRequest(senderId, targetSessionIds[i], packetId, payload, deliveryMethod);
+            }
+            catch (MessagePackSerializationException ex)
+            {
+                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                ReturnWriter(writer);
+            }
+        }
+
+        public void SendBitStreamFrom<TMeta, TState>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (targetSessionIds.IsEmpty)
+                return;
+
+            if (packAction == null)
+                throw new ArgumentNullException(nameof(packAction));
+
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+            {
+                LiminalLogger.LogError($"[Interpreter] Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+                return;
+            }
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+
+                var bitWriter = new BitWriter(writer);
+                packAction(ref bitWriter, in state);
+                bitWriter.Flush();
+
+                int bitstreamLen = writer.WrittenSpan.Length - (lengthOffset + 4);
+                writer.WriteInt32At(lengthOffset, bitstreamLen);
 
                 ReadOnlySpan<byte> payload = writer.WrittenSpan;
                 for (int i = 0; i < targetSessionIds.Length; i++)
@@ -1163,7 +1249,9 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
-                return new BitStreamScope(_manager, writer, singleTargetId, packetId, deliveryMethod);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+                return new BitStreamScope(_manager, writer, singleTargetId, packetId, lengthOffset, deliveryMethod);
             }
             catch
             {
@@ -1184,7 +1272,9 @@ namespace Liminal.Net.Core
             try
             {
                 MessagePackSerializer.Serialize(writer, meta);
-                return new BitStreamScope(_manager, writer, sendToTarget, packetId, deliveryMethod);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+                return new BitStreamScope(_manager, writer, sendToTarget, packetId, lengthOffset, deliveryMethod);
             }
             catch
             {

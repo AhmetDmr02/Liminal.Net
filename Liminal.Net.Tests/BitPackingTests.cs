@@ -205,7 +205,12 @@ namespace Liminal.Net.Tests
 
         private (LiminalNetworkManager server, LiminalNetworkManager client) CreateConnectedPair()
         {
-            int port = Interlocked.Increment(ref _portCounter);
+            return CreateConnectedPair(out _);
+        }
+
+        private (LiminalNetworkManager server, LiminalNetworkManager client) CreateConnectedPair(out int port)
+        {
+            port = Interlocked.Increment(ref _portCounter);
 
             var serverConfig = new LiminalNetworkConfig
             {
@@ -242,6 +247,31 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => connected, 4000), Is.True, "Client failed to connect to server.");
 
             return (_serverManager, clientManager);
+        }
+
+        private LiminalNetworkManager CreateAndConnectAdditionalClient(int port)
+        {
+            var clientConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 32768,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var clientManager = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(clientManager);
+
+            bool connected = false;
+            clientManager.Events.OnLocalClientConnected += _ => connected = true;
+
+            clientManager.StartClient("127.0.0.1", port);
+            Assert.That(SpinWait.SpinUntil(() => connected, 4000), Is.True, "Additional client failed to connect to server.");
+
+            return clientManager;
         }
 
         [Test]
@@ -483,6 +513,251 @@ namespace Liminal.Net.Tests
             Thread.Sleep(200);
 
             Assert.That(callCount, Is.EqualTo(1), "Unsubscribed handler should not be called again.");
+        }
+
+        [Test]
+        public void Test_BitStream_Loopback_ClientSendToMe()
+        {
+            var (server, client) = CreateConnectedPair();
+            LiminalNetworkManager.Instance = client;
+
+            bool received = false;
+            ushort receivedSender = 0;
+            int receivedVal = 0;
+
+            Broadcaster.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                received = true;
+                receivedSender = sender;
+                receivedVal = reader.ReadInt(16);
+            }, this);
+
+            var meta = new TestSnapshotMeta { Tick = 42, Count = 1 };
+            Broadcaster.SendBitStream(SendTo.Me, in meta, (ref BitWriter writer) =>
+            {
+                writer.WriteInt(999, 16);
+            });
+
+            Assert.That(SpinWait.SpinUntil(() => received, 3000), Is.True, "Client failed to receive loopback bitstream.");
+            Assert.That(receivedSender, Is.EqualTo(client.localID), "Sender should be client's localID for loopback.");
+            Assert.That(receivedVal, Is.EqualTo(999));
+        }
+
+        [Test]
+        public void Test_BitStream_Loopback_HostSendToMe()
+        {
+            int port = Interlocked.Increment(ref _portCounter);
+            var hostConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 32768,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), hostConfig);
+            bool hostLocalConnected = false;
+            _serverManager.Events.OnLocalClientConnected += _ => hostLocalConnected = true;
+            _serverManager.StartHost();
+
+            Assert.That(SpinWait.SpinUntil(() => hostLocalConnected && _serverManager.localID != 0, 3000), Is.True);
+
+            ushort hostClientId = _serverManager.localID;
+            bool received = false;
+            ushort receivedSender = 999;
+            int receivedVal = 0;
+
+            LiminalNetworkManager.Instance = _serverManager;
+            Broadcaster.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                received = true;
+                receivedSender = sender;
+                receivedVal = reader.ReadInt(16);
+            }, this);
+
+            var meta = new TestSnapshotMeta { Tick = 77, Count = 1 };
+            Broadcaster.SendBitStream(SendTo.Me, in meta, (ref BitWriter writer) =>
+            {
+                writer.WriteInt(888, 16);
+            });
+
+            Assert.That(SpinWait.SpinUntil(() => received, 3000), Is.True, "Host failed to receive loopback bitstream.");
+            Assert.That(receivedSender, Is.EqualTo(hostClientId), "Sender should be hostClientId for Host loopback.");
+            Assert.That(receivedVal, Is.EqualTo(888));
+        }
+
+        [Test]
+        public void Test_BitStream_SendAsClient_And_SendAsServer()
+        {
+            var (server, client) = CreateConnectedPair();
+
+            ushort serverSeenSender = 999;
+            ushort clientSeenSender = 999;
+            using var serverReceived = new ManualResetEventSlim(false);
+            using var clientReceived = new ManualResetEventSlim(false);
+
+            server.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                serverSeenSender = sender;
+                serverReceived.Set();
+            }, this);
+
+            client.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                clientSeenSender = sender;
+                clientReceived.Set();
+            }, this);
+
+            var meta = new TestSnapshotMeta { Tick = 1, Count = 1 };
+            byte[] buf = new byte[8];
+            var writer = new BitWriter(buf.AsSpan());
+            writer.WriteInt(1, 16);
+            writer.Flush();
+
+            // 1. Client explicitly sends as client to server
+            client.Interpreter.SendBitStreamAsClient(ILiminalTransport.SERVER_ID, in meta, buf.AsSpan(0, writer.BytesWritten));
+            Assert.That(serverReceived.Wait(TimeSpan.FromSeconds(3)), Is.True, "Server did not receive packet from client.");
+            Assert.That(serverSeenSender, Is.EqualTo(client.localID), "Server should see client.localID as sender.");
+
+            // 2. Server explicitly sends as server to client
+            server.Interpreter.SendBitStreamAsServer(client.localID, in meta, buf.AsSpan(0, writer.BytesWritten));
+            Assert.That(clientReceived.Wait(TimeSpan.FromSeconds(3)), Is.True, "Client did not receive packet from server.");
+            Assert.That(clientSeenSender, Is.EqualTo(ILiminalTransport.SERVER_ID), "Client should see SERVER_ID (0) as sender.");
+        }
+
+        [Test]
+        public void Test_BitStream_Broadcaster_SendBitStreamToClient()
+        {
+            var (server, client) = CreateConnectedPair();
+            LiminalNetworkManager.Instance = server;
+
+            ushort clientSeenSender = 999;
+            int clientSeenVal = 0;
+            using var clientReceived = new ManualResetEventSlim(false);
+
+            client.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                clientSeenSender = sender;
+                clientSeenVal = reader.ReadInt(16);
+                clientReceived.Set();
+            }, this);
+
+            var meta = new TestSnapshotMeta { Tick = 10, Count = 1 };
+            Broadcaster.SendBitStreamToClient(client.localID, in meta, (ref BitWriter writer) =>
+            {
+                writer.WriteInt(1234, 16);
+            });
+
+            Assert.That(clientReceived.Wait(TimeSpan.FromSeconds(3)), Is.True);
+            Assert.That(clientSeenSender, Is.EqualTo(ILiminalTransport.SERVER_ID));
+            Assert.That(clientSeenVal, Is.EqualTo(1234));
+        }
+
+        [Test]
+        public void Test_BitStream_Multicast_SendToNotServer()
+        {
+            var (server, client1) = CreateConnectedPair(out int port);
+            var client2 = CreateAndConnectAdditionalClient(port);
+
+            LiminalNetworkManager.Instance = server;
+
+            int c1Count = 0, c2Count = 0;
+            ushort c1Sender = 999, c2Sender = 999;
+            int c1Val = 0, c2Val = 0;
+
+            client1.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c1Count);
+                c1Sender = sender;
+                c1Val = reader.ReadInt(16);
+            }, this);
+
+            client2.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c2Count);
+                c2Sender = sender;
+                c2Val = reader.ReadInt(16);
+            }, this);
+
+            var meta = new TestSnapshotMeta { Tick = 88, Count = 1 };
+            Broadcaster.SendBitStream(SendTo.NotServer, in meta, (ref BitWriter writer) =>
+            {
+                writer.WriteInt(4321, 16);
+            });
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1 && c2Count == 1, 3000), Is.True, "Both clients should receive multicast bitstream.");
+            Assert.That(c1Sender, Is.EqualTo(ILiminalTransport.SERVER_ID));
+            Assert.That(c2Sender, Is.EqualTo(ILiminalTransport.SERVER_ID));
+            Assert.That(c1Val, Is.EqualTo(4321));
+            Assert.That(c2Val, Is.EqualTo(4321));
+        }
+
+        [Test]
+        public void Test_BitStream_TruncatedPayload_SafelyRejected()
+        {
+            var (server, client) = CreateConnectedPair();
+
+            bool callbackInvoked = false;
+            server.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                callbackInvoked = true;
+            }, this);
+
+            // Construct a malformed payload where the stamped bitstream length is 64 bytes,
+            // but only 4 bytes are actually present in the network packet.
+            var metaPkt = new TestSnapshotMeta { Tick = 1, Count = 1 };
+            byte[] rawMeta = MessagePack.MessagePackSerializer.Serialize(metaPkt);
+            byte[] malformedPacket = new byte[rawMeta.Length + 4 + 4];
+            rawMeta.CopyTo(malformedPacket.AsSpan());
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(malformedPacket.AsSpan(rawMeta.Length, 4), 64); // Claimed 64 bytes
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(malformedPacket.AsSpan(rawMeta.Length + 4, 4), 0x12345678); // Only 4 bytes provided
+
+            ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<TestSnapshotMeta>());
+
+            // Dispatch directly to server interpreter (simulating arrival from network)
+            server.Interpreter.Dispatch(packetId, client.localID, malformedPacket);
+
+            Assert.That(callbackInvoked, Is.False, "Truncated/cut bitstream packet must be rejected and not delivered to subscriber.");
+        }
+
+        [Test]
+        public void Test_BitStream_TrailingGarbage_SafelyIgnored()
+        {
+            var (server, client) = CreateConnectedPair();
+
+            bool callbackInvoked = false;
+            int readVal = 0;
+            int remainingBitsAfterRead = -1;
+
+            server.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                callbackInvoked = true;
+                readVal = reader.ReadInt();
+                remainingBitsAfterRead = reader.BitsRemaining;
+            }, this);
+
+            // Construct a payload where the stamped bitstream length is 4 bytes (holding 0x7FFFFFFF),
+            // but 32 bytes of trailing garbage follow.
+            var metaPkt = new TestSnapshotMeta { Tick = 5, Count = 1 };
+            byte[] rawMeta = MessagePack.MessagePackSerializer.Serialize(metaPkt);
+            byte[] packetWithGarbage = new byte[rawMeta.Length + 4 + 4 + 32];
+            rawMeta.CopyTo(packetWithGarbage.AsSpan());
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(packetWithGarbage.AsSpan(rawMeta.Length, 4), 4); // Stamped 4 bytes
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(packetWithGarbage.AsSpan(rawMeta.Length + 4, 4), 0x7FFFFFFF); // 4 bytes of actual payload
+            // Fill trailing garbage
+            for (int i = rawMeta.Length + 8; i < packetWithGarbage.Length; i++)
+                packetWithGarbage[i] = 0xEE;
+
+            ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<TestSnapshotMeta>());
+
+            server.Interpreter.Dispatch(packetId, client.localID, packetWithGarbage);
+
+            Assert.That(callbackInvoked, Is.True, "Valid packet with stamped length should be delivered.");
+            Assert.That(readVal, Is.EqualTo(0x7FFFFFFF));
+            Assert.That(remainingBitsAfterRead, Is.EqualTo(0), "Trailing garbage outside the stamped length must NOT be visible to BitReader.");
         }
 
         #endregion

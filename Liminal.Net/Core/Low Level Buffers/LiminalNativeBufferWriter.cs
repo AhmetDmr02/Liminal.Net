@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Buffers;
+using System.Buffers.Binary;
 
 namespace Liminal.Net.Core
 {
@@ -11,6 +12,16 @@ namespace Liminal.Net.Core
         public LiminalNativeBufferWriter(int size)
         {
             _buffer = new LiminalNativeBuffer(size);
+        }
+
+        public void WriteInt32At(int offset, int value)
+        {
+            if (offset < 0 || offset + 4 > _position)
+            {
+                throw new ArgumentOutOfRangeException(nameof(offset));
+            }
+
+            BinaryPrimitives.WriteInt32LittleEndian(_buffer.GetSpan().Slice(offset, 4), value);
         }
 
         public void Advance(int count)

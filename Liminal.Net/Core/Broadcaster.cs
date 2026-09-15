@@ -423,26 +423,7 @@ namespace Liminal.Net.Core
 
             var targetsSlice = filteredTargets.Slice(0, targetCount);
             ushort sender = sendAsClient ? manager.localID : ILiminalTransport.SERVER_ID;
-
-            int idInt = LiminalPacketLibrary.GetId<TMeta>();
-            if (idInt == 0) return;
-            ushort packetId = checked((ushort)idInt);
-            var writer = manager.Interpreter.RentWriter();
-
-            try
-            {
-                MessagePack.MessagePackSerializer.Serialize(writer, meta);
-                var bitWriter = new BitWriter(writer);
-                packAction(ref bitWriter, in state);
-                bitWriter.Flush();
-
-                for (int i = 0; i < targetsSlice.Length; i++)
-                    manager.Interpreter.InvokeSendRequestSingle(sender, targetsSlice[i], packetId, writer.WrittenSpan, deliveryMethod);
-            }
-            finally
-            {
-                manager.Interpreter.ReturnWriter(writer);
-            }
+            manager.Interpreter.SendBitStreamFrom(sender, targetsSlice, in meta, in state, packAction, deliveryMethod);
         }
 
         internal static void ResolveAndSendBitStream(LiminalNetworkManager manager, SendTo target, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod)
