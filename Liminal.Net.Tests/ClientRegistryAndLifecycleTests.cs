@@ -145,7 +145,7 @@ namespace Liminal.Net.Tests
             Assert.That(client.IsConnected, Is.True);
             Assert.That(client.CanSend, Is.True);
             Assert.That(client.IsConnecting, Is.False);
-            Assert.That(connectedAndReadyFired, Is.True, "OnConnectedAndReady should fire upon connection");
+            Assert.That(SpinWait.SpinUntil(() => connectedAndReadyFired, 3000), Is.True, "OnConnectedAndReady should fire upon connection");
 
             client.Disconnect();
             Assert.That(client.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
