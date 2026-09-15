@@ -39,5 +39,12 @@ namespace Liminal.Net.SyncVar
                 Volatile.Write(ref _masks[i], 0);
             }
         }
+
+        public bool IsDirty(ushort id)
+        {
+            int bucket = id >> 6;
+            long bit = 1L << (id & 63);
+            return (Volatile.Read(ref _masks[bucket]) & bit) != 0;
+        }
     }
 }

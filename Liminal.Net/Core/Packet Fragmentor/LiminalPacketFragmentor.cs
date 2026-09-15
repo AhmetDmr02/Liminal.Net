@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Interfaces;
+using Liminal.Net.Interfaces;
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
@@ -62,6 +62,7 @@ namespace Liminal.Net.Core
 
             _transport.OnClientDisconnected += HandleClientCleanup;
             _transport.OnClientKicked += HandleClientCleanup;
+            _transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
             _transport.OnMessageReceivedFragmented += IngestFragment;
         }
 
@@ -495,6 +496,11 @@ namespace Liminal.Net.Core
             }
         }
 
+        private void HandleLocalClientDisconnected(ushort localId)
+        {
+            HandleClientCleanup(ILiminalTransport.SERVER_ID);
+        }
+
         public void Dispose()
         {
             // Atomically transition from 0 to 1; if already 1, exit immediately.
@@ -505,6 +511,7 @@ namespace Liminal.Net.Core
 
             _transport.OnClientDisconnected -= HandleClientCleanup;
             _transport.OnClientKicked -= HandleClientCleanup;
+            _transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
             _transport.OnMessageReceivedFragmented -= IngestFragment;
 
             foreach (var id in _peerChannels.Keys)

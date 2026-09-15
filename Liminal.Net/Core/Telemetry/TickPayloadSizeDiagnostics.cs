@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -45,17 +45,17 @@ namespace Liminal.Net.Core.Telemetry
 
         private void HandleTick()
         {
-            while (_payloadSizeMap.Count > 0)
+            var currentSnapshot = new TickPayloadSizeSnapshot();
+
+            foreach (var kvp in _payloadSizeMap)
             {
-                var key = _payloadSizeMap.Keys.First();
-                _payloadSizeMap.TryRemove(key, out int size);
-
-                if(_snapshots[currentIndex] == null) 
-                    _snapshots[currentIndex] = new TickPayloadSizeSnapshot();
-
-                _snapshots[currentIndex].AddSnapshot((key, size));
+                if (_payloadSizeMap.TryRemove(kvp.Key, out int size))
+                {
+                    currentSnapshot.AddSnapshot((kvp.Key, size));
+                }
             }
 
+            _snapshots[currentIndex] = currentSnapshot;
             currentIndex = (currentIndex + 1) % _snapshots.Length;
         }
 

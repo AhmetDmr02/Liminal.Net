@@ -92,7 +92,7 @@ namespace Liminal.Net.Tests
         public ushort LocalClientId => 1;
         public bool IsServer { get; set; } = true;
         public bool IsClient => !IsServer;
-        public bool IsConnected => true;
+        public bool IsConnected { get; set; } = true;
         public int ConnectedClientCount => ConnectedClients.Count > 0 ? ConnectedClients.Count : 1;
 
         public LiminalNetworkConfig Config => _conf;

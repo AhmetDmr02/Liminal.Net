@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
 
@@ -81,9 +81,9 @@ namespace Liminal.Net.Core
                 return;
             }
 
-            if (manager.Role == NetworkRole.None || !manager.Transport.IsConnected)
+            if (!manager.CanSend)
             {
-                LiminalLogger.LogWarning("[Broadcaster] Cannot send packet: Network is not active or connected.");
+                LiminalLogger.LogWarning("[Broadcaster] Cannot send packet: Network is not active or ready to send.");
                 return;
             }
 
@@ -205,9 +205,9 @@ namespace Liminal.Net.Core
 
             role = manager.Role;
 
-            if (role == NetworkRole.None || !manager.Transport.IsConnected)
+            if (!manager.CanSend)
             {
-                LiminalLogger.LogWarning("[Broadcaster] Cannot send packet: Network is not active or connected.");
+                LiminalLogger.LogWarning("[Broadcaster] Cannot send packet: Network is not active or ready to send.");
                 return false;
             }
 

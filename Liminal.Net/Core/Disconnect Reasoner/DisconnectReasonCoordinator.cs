@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
@@ -117,7 +117,7 @@ namespace Liminal.Net.Core
 
         public void ClientDisconnectWithReason(DisconnectReason reason, string message = null, int? graceSeconds = null)
         {
-            if (_disposed || (_transport.IsServer && _transport.LocalClientId == ILiminalTransport.SERVER_ID))
+            if (_disposed || !_transport.IsConnected || (_transport.IsServer && _transport.LocalClientId == ILiminalTransport.SERVER_ID))
             {
                 _transport.Disconnect();
                 return;

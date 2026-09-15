@@ -155,7 +155,7 @@ namespace Liminal.Net.SyncVar
 
         internal void BroadcastAuthChange(ushort varId, ushort[] newAuthIds)
         {
-            if (_attachedManager == null || _attachedManager.Role == NetworkRole.Client)
+            if (_attachedManager == null || _attachedManager.Role == NetworkRole.Client || !_attachedManager.CanSend)
                 return;
 
             SendViaManager(SendTo.Everyone, new SyncVarAuthUpdatePacket
@@ -169,7 +169,7 @@ namespace Liminal.Net.SyncVar
         private readonly ArrayBufferWriter<byte> _tailoredFlushWriter = new(2048);
         public void FlushDirty()
         {
-            if (_attachedManager == null || _attachedManager.Role == NetworkRole.None)
+            if (_attachedManager == null || !_attachedManager.CanSend)
                 return;
 
             _reusableDirtyList.Clear();
