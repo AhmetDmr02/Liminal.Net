@@ -136,13 +136,25 @@ namespace Liminal.Net.Core
         }
 
         #region Core Binding
+        private Action<ushort> _onPreLocalClientConnected;
+        private Action<ushort> _onPostLocalClientConnected;
+        private Action<ushort> _onPreLocalClientDisconnected;
+
         /// <summary>
         /// Binds active core systems so they are deterministically updated before high-level events fire.
         /// </summary>
-        public void BindCoreSystems(LiminalSessionManager sessionManager, DisconnectReasonCoordinator disconnectCoordinator = null)
+        public void BindCoreSystems(
+            LiminalSessionManager sessionManager,
+            DisconnectReasonCoordinator disconnectCoordinator = null,
+            Action<ushort> onPreLocalClientConnected = null,
+            Action<ushort> onPostLocalClientConnected = null,
+            Action<ushort> onPreLocalClientDisconnected = null)
         {
             _sessionManager = sessionManager;
             _disconnectCoordinator = disconnectCoordinator;
+            _onPreLocalClientConnected = onPreLocalClientConnected;
+            _onPostLocalClientConnected = onPostLocalClientConnected;
+            _onPreLocalClientDisconnected = onPreLocalClientDisconnected;
         }
 
         /// <summary>
@@ -152,6 +164,9 @@ namespace Liminal.Net.Core
         {
             _sessionManager = null;
             _disconnectCoordinator = null;
+            _onPreLocalClientConnected = null;
+            _onPostLocalClientConnected = null;
+            _onPreLocalClientDisconnected = null;
         }
         #endregion
 
@@ -171,7 +186,11 @@ namespace Liminal.Net.Core
 
             _sessionManager?.HandleLocalConnection(clientId);
 
+            _onPreLocalClientConnected?.Invoke(clientId);
+
             _onLocalClientConnected?.Invoke(clientId);
+
+            _onPostLocalClientConnected?.Invoke(clientId);
         }
 
         private void HandleTransportClientDisconnected(ushort clientId)
@@ -186,6 +205,8 @@ namespace Liminal.Net.Core
         private void HandleTransportLocalClientDisconnected(ushort clientId)
         {
             if (_disposed) return;
+
+            _onPreLocalClientDisconnected?.Invoke(clientId);
 
             _sessionManager?.HandleClientDisconnected(clientId);
             _sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);

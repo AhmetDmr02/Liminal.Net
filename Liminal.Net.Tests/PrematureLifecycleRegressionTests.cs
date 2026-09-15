@@ -143,5 +143,61 @@ namespace Liminal.Net.Tests
             // Fragmentor should have cleaned up peer channel 0 cleanly without throws
             Assert.Pass();
         }
+
+        [Test]
+        public void Test06_OnLocalClientConnected_GuaranteesCanSendIsTrue()
+        {
+            var transport = new MockTransport();
+            var clientManager = new LiminalNetworkManager(transport, _config);
+
+            bool canSendDuringEvent = false;
+            bool isConnectedDuringEvent = false;
+            bool hasSessionDuringEvent = false;
+
+            clientManager.Events.OnLocalClientConnected += id =>
+            {
+                canSendDuringEvent = clientManager.CanSend;
+                isConnectedDuringEvent = clientManager.IsConnected;
+                hasSessionDuringEvent = clientManager.SessionManager.HasSession(ILiminalTransport.SERVER_ID);
+            };
+
+            // Set client mode
+            clientManager.StartClient("127.0.0.1", 9876);
+            Assert.That(clientManager.CanSend, Is.False, "CanSend must be false while Connecting.");
+
+            // Trigger connection from transport
+            transport.TriggerLocalClientConnected(1);
+
+            Assert.That(canSendDuringEvent, Is.True, "CanSend MUST be true inside OnLocalClientConnected callback.");
+            Assert.That(isConnectedDuringEvent, Is.True, "IsConnected MUST be true inside OnLocalClientConnected callback.");
+            Assert.That(hasSessionDuringEvent, Is.True, "SessionManager must have SERVER_ID session ready inside OnLocalClientConnected callback.");
+        }
+
+        [Test]
+        public void Test07_OnClientConnected_OnServer_GuaranteesCanSendIsTrue()
+        {
+            var transport = new MockTransport();
+            var serverManager = new LiminalNetworkManager(transport, _config);
+
+            bool canSendDuringEvent = false;
+            bool isConnectedDuringEvent = false;
+            bool hasSessionDuringEvent = false;
+
+            serverManager.Events.OnClientConnected += id =>
+            {
+                canSendDuringEvent = serverManager.CanSend;
+                isConnectedDuringEvent = serverManager.IsConnected;
+                hasSessionDuringEvent = serverManager.SessionManager.HasSession(id);
+            };
+
+            serverManager.StartServer("127.0.0.1", 9876);
+            Assert.That(serverManager.CanSend, Is.True, "Server CanSend must be true once server is active.");
+
+            transport.TriggerClientConnected(42);
+
+            Assert.That(canSendDuringEvent, Is.True, "CanSend MUST be true inside OnClientConnected callback on server.");
+            Assert.That(isConnectedDuringEvent, Is.True, "IsConnected MUST be true inside OnClientConnected callback on server.");
+            Assert.That(hasSessionDuringEvent, Is.True, "SessionManager must have client session ready inside OnClientConnected callback on server.");
+        }
     }
 }

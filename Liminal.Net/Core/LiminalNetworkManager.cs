@@ -230,8 +230,6 @@ namespace Liminal.Net.Core
 
             _transport.InitializeTransport(config);
             _transport.OnShutdown += HandleTransportShutdown;
-            _transport.OnLocalClientConnected += HandleTransportLocalClientConnected;
-            _transport.OnLocalClientDisconnected += HandleTransportLocalClientDisconnected;
 
             ClientRegistry = new Liminal.Net.Registry.ClientRegistry(this);
 
@@ -245,21 +243,24 @@ namespace Liminal.Net.Core
             Shutdown();
         }
 
-        private void HandleTransportLocalClientConnected(ushort clientId)
+        private void HandlePreLocalClientConnected(ushort clientId)
         {
             if (Role == NetworkRole.Client)
             {
                 LifecycleState = NetworkLifecycleState.Connected;
-                _onConnectedAndReady?.Invoke();
             }
             else if (Role == NetworkRole.Host)
             {
                 LifecycleState = NetworkLifecycleState.HostActive;
-                _onConnectedAndReady?.Invoke();
             }
         }
 
-        private void HandleTransportLocalClientDisconnected(ushort clientId)
+        private void HandlePostLocalClientConnected(ushort clientId)
+        {
+            _onConnectedAndReady?.Invoke();
+        }
+
+        private void HandlePreLocalClientDisconnected(ushort clientId)
         {
             ResetLifecycleState();
         }
@@ -282,7 +283,12 @@ namespace Liminal.Net.Core
             SessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
             DisconnectCoordinator = new DisconnectReasonCoordinator(_transport, Interpreter);
 
-            _eventHub.BindCoreSystems(SessionManager, DisconnectCoordinator);
+            _eventHub.BindCoreSystems(
+                SessionManager,
+                DisconnectCoordinator,
+                HandlePreLocalClientConnected,
+                HandlePostLocalClientConnected,
+                HandlePreLocalClientDisconnected);
 
             DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
