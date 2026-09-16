@@ -1,38 +1,40 @@
 # Liminal.Net
 
-A lightweight, POCO-based netcode library for C#. Define plain structs, wire up callbacks, and go. Currently targets standalone .NET 9.
-Unity support is planned for 6.8 once CoreCLR lands.
+A low-level, tick-based networking library for C# games and real-time apps. It relies on MessagePack for serialization and focuses on zero-allocation buffers, explicit transport control, and straightforward struct payloads.
 
 ---
 
-# Prerequisites
+## Prerequisites
 
-.NET 9.0 SDK or later.
+- .NET 9.0 SDK+
+- [MessagePack-CSharp](https://github.com/MessagePack-CSharp/MessagePack-CSharp)
 
-MessagePack for C# (Liminal.Net relies on MessagePack POCOs for serialization).
+---
 
-## How it fits together
+## Architecture Overview
 
-| # | Inbound | Outbound |
+| Stage | Inbound Flow | Outbound Flow |
 |---|---|---|
-| 1 | `ILiminalTransport` raw bytes arrive from the network | Your code calls `Interpreter.SendCommand(...)` |
-| 2 | `LiminalSessionManager` routes data to the right session | Packet is serialized and buffered into the session |
-| 3 | `LiminalPacketFramerPipeline` runs inbound transformers (decrypt, decompress…) | `LiminalTicker` fires `Flush()` drains the send buffer |
-| 4 | Packet lands in the session's `InboundQueue` | `LiminalPacketFramerPipeline` runs outbound transformers (compress, encrypt…) |
-| 5 | `LiminalTicker` fires `TickEvent` which drains queues inside `LiminalSession` | `ILiminalTransport` bytes go out over the wire |
-| 6 | `LiminalPacketInterpreter` deserializes and fires your subscriber callbacks | |
+| 1 | `ILiminalTransport` receives bytes from socket | User calls `Broadcaster.Send(...)` / `Interpreter.SendCommand(...)` |
+| 2 | `LiminalSessionManager` resolves session | Packet is serialized into the session's staging buffer |
+| 3 | Inbound transformers execute (decrypt, decompress) | `LiminalTicker` calls `Flush()` |
+| 4 | Packet queued in `InboundQueue` | Outbound transformers execute (compress, encrypt) |
+| 5 | `LiminalTicker` fires `TickEvent` to drain queues | `ILiminalTransport` writes to the socket |
+| 6 | `LiminalPacketInterpreter` invokes user handlers | — |
 
-`LiminalNetworkManager` owns the lifecycle and exposes three roles: `StartServer`, `StartClient`, `StartHost`.
+`LiminalNetworkManager` manages instance lifecycles via `StartServer()`, `StartClient()`, and `StartHost()`.
 
 ---
 
-## Getting started
+## Quick Start
 
-**Define a packet.** Just a struct.
+### Define Packets
+
+Packets are plain structs decorated with MessagePack attributes. Liminal scans assemblies on startup and validates packet IDs; duplicates throw at initialization.
 
 ```csharp
 [MessagePackObject]
-[LiminalPacket(id: 100)]
+[LiminalPacket(id: 100)] // Omit id parameter for auto-assignment
 public struct PlayerMovePacket
 {
     [Key(0)] public float X { get; set; }
@@ -40,49 +42,65 @@ public struct PlayerMovePacket
 }
 ```
 
-The library scans your assemblies at startup and registers everything tagged `[LiminalPacket]` automatically. Duplicate IDs throw immediately.
+> **Unity IL2CPP**: If using auto-assigned IDs or runtime reflection, preserve packet types in your `link.xml`:
+> ```xml
+> <assembly fullname="YourAssembly" preserve="all"/>
+> ```
 
-**Configure and start.**
+### Initialization
 
 ```csharp
-var config = new LiminalTransportConfig
+var config = new LiminalNetworkConfig
 {
     Default_Host = "127.0.0.1",
     Default_Port = 7777,
-    TickRate = 30,
-    ClientIdResolver = new BaseResolver(),
+    TickRate = 60,
+    ClientIdResolver = new BaseResolver()
 };
 
 var manager = new LiminalNetworkManager(new TcpTransport(), config);
+
+// Start options:
 manager.StartServer("0.0.0.0", 7777);
-// or manager.StartClient(...)
-// or manager.StartHost() server + local client on same instance
+// manager.StartClient("127.0.0.1", 7777);
+// manager.StartHost(); // Server + loopback client
 ```
 
-**Subscribe and send.**
+### Messaging & Routing
+
+Subscribe via the static `Broadcaster` utility or directly through `manager.Interpreter`.
 
 ```csharp
-manager.Interpreter.Subscribe<PlayerMovePacket>((packet, senderId) =>
+// Subscribe
+Broadcaster.Subscribe<PlayerMovePacket>((packet, senderId) =>
 {
-    Console.WriteLine($"{senderId} moved to {packet.X}, {packet.Y}");
-}, owner: this);
+    Console.WriteLine($"Client {senderId}: {packet.X}, {packet.Y}");
+}, subscriber: this);
 
-// Helper is planned for the future!
-manager.Interpreter.SendCommand(targetId, new PlayerMovePacket { X = 1f, Y = 2f });
+// Send patterns
+Broadcaster.Send(SendTo.Server, new PlayerMovePacket { X = 1f, Y = 2f });
+Broadcaster.Send(SendTo.NotServer, new PlayerMovePacket { X = 1f, Y = 2f });
+Broadcaster.SendToClient(targetId, new PlayerMovePacket { X = 1f, Y = 2f });
 
-// Clean up everything this object subscribed to
-manager.Interpreter.UnsubscribeAll(this);
+// Unsubscribe
+Broadcaster.UnsubscribeAll(this);
 ```
+
+**Common Targets:**
+* `SendTo.Server`: Target ID 0.
+* `SendTo.Me`: Loopback.
+* `SendTo.Everyone`: Server, host, and all clients.
+* `SendTo.NotMe`: Broadcast excluding caller.
+* `SendTo.NotServer`: Connected clients only.
+* `SendTo.NotHost`: Remote peers only.
 
 ---
 
-## Player ID
+## Identity & Client IDs
 
-The library does not stamp a client ID into the packet payload. It never writes identity into the wire bytes.
+Liminal does not append a client ID prefix to packet payloads over the wire. Instead, the transport associates inbound socket sources with a registered `ushort senderId` and passes it directly to your callback. 
 
-What you get instead is a `ushort senderId` in your callback, resolved by the transport from which socket the data came in on. That's it.
-
-If your game logic needs an identity field in a packet (say, the server broadcasting another player's position), you add it yourself:
+If your game logic requires broadcasting identity to other clients, include it explicitly in the packet contract:
 
 ```csharp
 [MessagePackObject]
@@ -95,21 +113,17 @@ public struct PlayerStateBroadcast
 }
 ```
 
-This is a deliberate choice. But if you want some lower level access you can directly write your own transformer and include custom data inside the payload with `Ping-pong pipeline`
-
 ---
 
-## Ping-pong pipeline
+## Transformer Pipeline
 
-Packets go through a transform chain before sending and after receiving then you can do: compression, encryption, whatever you need. The pipeline uses a ping-pong pattern to avoid allocations: two staging buffers per session (A and B), and each transformer reads from one and writes to the other, alternating.
+Packets pass through an unmanaged transform chain before egress and after ingress. Buffers alternate across two staging buffers allocated via `NativeMemory.Alloc` to eliminate mid-pipeline GC allocations:
 
 ```
-input → [Transform 0]: A→B → [Transform 1]: B→A → [Transform 2]: A→B → final output
+Input -> [Stage 0: Buf A -> Buf B] -> [Stage 1: Buf B -> Buf A] -> Output
 ```
 
-No heap allocations mid-chain. The buffers are native unmanaged memory (`NativeMemory.Alloc`), completely off the GC.
-
-**Writing a transformer** implement `ILiminalInboundTransformer`, `ILiminalOutboundTransformer`, or both:
+Implement `ILiminalInboundTransformer`, `ILiminalOutboundTransformer`, or both:
 
 ```csharp
 public class XorObfuscator : ILiminalInboundTransformer, ILiminalOutboundTransformer
@@ -131,27 +145,23 @@ public class XorObfuscator : ILiminalInboundTransformer, ILiminalOutboundTransfo
         return input.Length;
     }
 }
+
+// Registration
+config.InboundPacketProcessors.Add(new XorObfuscator(0xAB));
+config.OutboundPacketProcessors.Add(new XorObfuscator(0xAB));
 ```
 
-Register it before starting:
-
-```csharp
-var xor = new XorObfuscator(0xAB);
-config.InboundPacketProcessors.Add(xor);
-config.OutboundPacketProcessors.Add(xor);
-```
-
-A couple of rules to keep in mind:
-- Write into `output`, never touch `input`
-- Return the number of bytes written (can differ from input length, e.g. after compression)
-- Returning `<= 0` on inbound drops the packet silently
-- The `LiminalSession` has the session ID if your transform needs per-client state (e.g. per-client keys)
+**Implementation Rules:**
+* Never mutate `input`; write transformed bytes directly into `output`.
+* Return the exact byte count written to `output`.
+* Inbound transforms returning `<= 0` drop the packet.
+* Session IDs are available on `session.Id` for per-client crypto contexts.
 
 ---
 
-## Custom transport
+## Custom Transports
 
-Implement `ILiminalTransport` to plug in anything like: QUIC, WebSockets, raw UDP, or a fake in-memory transport for tests:
+Implement `ILiminalTransport` to wrap custom protocols (UDP/ENet/QUIC/WebSockets) or in-memory test mocks:
 
 ```csharp
 public interface ILiminalTransport
@@ -169,19 +179,18 @@ public interface ILiminalTransport
     event DataReceivedHandler OnMessageReceivedUnreliable;
     event ClientConnectionHandler OnClientConnected;
     event ClientConnectionHandler OnClientDisconnected;
-    // ... (see interface for full list)
 }
 ```
 
-The only real contract: by the time you fire `OnClientConnected`, the handshake is done and the client has a registered `ushort` ID. Everything else is up to you.
+*Contract:* The underlying connection handshake must be complete and assign a valid `ushort` client ID before invoking `OnClientConnected`.
 
 ---
 
-## Client ID resolver
+## Client ID Resolution & Proxies
 
-The default `BaseResolver` hands out monotonically increasing `ushort` IDs. Works fine for direct connections, and also fine behind a standard Layer 4 TCP proxy, those just forward raw bytes, so each client still has its own socket from the server's perspective and identity resolution works as normal.
+The default `BaseResolver` allocates incremental `ushort` identifiers suitable for typical direct connections and Layer-4 reverse proxies.
 
-Where it gets complicated is merging relays, UDP scenarios where 50 players' packets all arrive from the same source IP:port, or old/custom proxies that might misinterpret the packet framing in which case you may need a transformer to re-frame things correctly on ingress. The `ResolveId(Span<byte> payload)` method exists for these cases. It runs during the handshake and lets you pull an identity token out of the client's opening payload (a lobby slot, a session cookie, a pre-assigned ID from your matchmaking system) and map it to the correct client ID before the connection is fully established.
+For multiplexed relays or custom proxies where client endpoints share sockets or require pre-auth tokens, override `ResolveId`:
 
 ```csharp
 public class ProxyAwareResolver : BaseResolver
@@ -193,34 +202,157 @@ public class ProxyAwareResolver : BaseResolver
     public override ushort ResolveId(Span<byte> payload)
     {
         if (payload.Length < 4) return 0;
-        uint token = BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(0, 4));
-        return _tokenMap.TryRemove(token, out ushort id) ? id : 0;
+        uint token = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
+        return _tokenMap.TryRemove(token, out ushort id) ? id : (ushort)0;
     }
 }
 ```
 
 ---
 
-## Concurrency
+## SyncVar
 
-The session lifecycle, subscription management, and ID reservation all touch shared state from multiple threads. The concurrent-critical paths are tested with [Microsoft Coyote](https://microsoft.github.io/coyote/), which takes control of thread scheduling and systematically explores interleavings you'd almost never hit with a normal stress test things like the reservation cleanup window racing with a new handshake, or a subscriber being disposed mid-dispatch.
+`SyncVar<T>` provides dirty-checked property replication on tick flushes:
+
+```csharp
+var health = new SyncVar<int>("player_health", 100);
+
+health.OnValueChanged += (oldVal, newVal) =>
+{
+    Console.WriteLine($"Health: {oldVal} -> {newVal}");
+};
+
+health.Value = 80; // Marks dirty automatically
+health.SetDirty(); // Forces synchronization flag
+```
+
+* **Authority:** Defaults to Server-authoritative. Unauthorized updates are discarded. Use `AddAuthority(clientId)` or `SetAuthIds(...)` to grant client authority.
+* **Targeting:** Exclude specific peers using `health.AddExclusion(targetClientId)`.
+* **Thread Safety:** While internal buffer pointers are synchronized to avoid segfaults, **do not mutate SyncVars from worker threads**. `OnValueChanged` triggers synchronously on the calling thread; background mutations will invoke UI or game-engine callbacks off-thread and can cause unbatched race writes. Defer updates to `LiminalEventHub.OnPreFlush` or `OnPrePoll`.
 
 ---
 
-## Roadmap
+## BitStreams
 
-**PacketFragmentor**: UDP has a ~1400 byte practical MTU limit. The fragmentor will split large payloads into sequenced fragments and reassemble them on the other end, transparent to the rest of the pipeline.
-
-**QUIC transport (C++)**: A native transport using `msquic` is in progress. Same `ILiminalTransport` interface, drop-in replacement for `TcpTransport`. Multiplexed streams and connection migration without TCP's head-of-line blocking.
-
-**RPC helper**: A small static helper library to reduce boilerplate around common send patterns. Things like broadcasting to everyone except the server, or sending to a subset of sessions, without manually iterating IDs every time. Subscriptions still work end-to-end the same way, this just makes the sending side less repetitive:
+For performance-critical payloads requiring manual bit-packing and float quantization without heap allocs:
 
 ```csharp
-// planned, not yet implemented
-LiminalRpc.Send(manager, new PlayerMovePacket { X = 1f, Y = 2f }, Target.NotServer);
+Span<byte> buffer = stackalloc byte[64];
+var writer = new BitWriter(buffer);
+
+writer.WriteBits(5u, 3);
+writer.WriteBool(true);
+writer.WriteInt(42, 16);
+writer.WriteQuantizedFloat(position.X, -100f, 100f, 16);
+writer.Flush();
+
+var reader = new BitReader(buffer[..writer.BytesWritten]);
+uint val = reader.ReadBits(3);
+bool flag = reader.ReadBool();
+int num = reader.ReadInt(16);
+float posX = reader.ReadQuantizedFloat(-100f, 100f, 16);
 ```
 
-**Unity 6.8 (CoreCLR)**: Unity support is blocked on this. The library currently relies on runtime features that aren't available under Unity's Mono backend. Once 6.8 ships CoreCLR, the plan is to target it. And the native buffer and tight tick loop paths should benefit meaningfully from the improved runtime too.
+### BitStream Messaging
+
+Bind a raw bitstream directly to a metadata header:
+
+```csharp
+[MessagePackObject]
+[LiminalPacket(id: 200)]
+public struct SnapshotMeta
+{
+    [Key(0)] public uint Tick;
+    [Key(1)] public ushort Count;
+}
+
+// Send
+Broadcaster.SendBitStream(SendTo.NotServer, new SnapshotMeta { Tick = 10, Count = 1 }, (ref BitWriter writer) =>
+{
+    writer.WriteQuantizedFloat(playerX, -500f, 500f, 16);
+    writer.WriteQuantizedFloat(playerY, -500f, 500f, 16);
+    writer.WriteBits(stateFlags, 8);
+}, DeliveryMethod.Unreliable);
+
+// Receive
+Broadcaster.SubscribeBitStream<SnapshotMeta>((in SnapshotMeta meta, ref BitReader reader, ushort sender) =>
+{
+    float x = reader.ReadQuantizedFloat(-500f, 500f, 16);
+    float y = reader.ReadQuantizedFloat(-500f, 500f, 16);
+    byte flags = (byte)reader.ReadBits(8);
+}, subscriber: this);
+```
+
+---
+
+## Packet Fragmentation
+
+`LiminalPacketFragmentor` manages slicing, transmission, and reassembly when payloads exceed network MTU.
+
+* Payloads exceeding MTU are split into chunks with 6-byte sequence headers (Sequence: 2B, Index: 2B, Total: 2B).
+* Reassembly allocates out of pooled buffers per-client.
+* Payloads exceeding `MaxPacketSizePerBatch` or presenting malformed chunk sequences will kick the offending client.
+* Incomplete transfers timeout after `ReceiveResponseTimeout`.
+* Unreliable payloads exceeding MTU are promoted to `Reliable | Fragmented` to prevent corrupted partial assemblies.
+
+```csharp
+var config = new LiminalNetworkConfig
+{
+    TickRate = 60,
+    MaxPacketSizePerBatch = 32768,
+    ReceiveResponseTimeout = 5.0f
+};
+```
+
+---
+
+## Concurrency & Testing
+
+Shared critical paths—including ID reuse, multi-client session updates, and internal buffer pooling—are verified using **Microsoft Coyote** and systematic concurrency exploration (**CUZZ**). Tests specifically validate:
+
+* Inbound unsubscription races during active tick interpreter loops.
+* Dynamic authority handover under parallel packet ingestion.
+* Concurrent dirty-marking and buffer swap sequences during `Flush()`.
+
+### Handling Post-Unsubscribe Invocations
+
+To maintain zero allocations in the tick loop, `LiminalPacketInterpreter` snapshots delegates prior to iteration. An `Unsubscribe()` call executing on another thread while a dispatch is underway will not mutate the active dispatch snapshot. Guard disposal state on destroying objects:
+
+```csharp
+private volatile bool _disposed;
+
+public void OnDestroy()
+{
+    _disposed = true;
+    Broadcaster.UnsubscribeAll(this);
+}
+
+private void HandlePacket(PlayerMovePacket pkt, ushort sender)
+{
+    if (_disposed) return;
+    // Process payload
+}
+```
+
+---
+
+## Diagnostics & Telemetry
+
+```csharp
+var telemetryConfig = new LiminalTelemetryConfig
+{
+    Flags = TelemetryFlags.ByteCounting | TelemetryFlags.PacketCounting | TelemetryFlags.End2EndRTT,
+    PollIntervalInSeconds = 1.0f
+};
+
+var manager = new LiminalNetworkManager(transport, networkConfig, telemetryConfig);
+
+manager.TelemetryManager.OnTelemetryUpdated += (sessionSnap, transportSnap) =>
+{
+    Console.WriteLine($"RTT: {manager.TelemetryManager.End2EndRTT:F1}ms");
+    Console.WriteLine($"I/O: {transportSnap.InboundKB:F1} KB/s In | {transportSnap.OutboundKB:F1} KB/s Out");
+};
+```
 
 ---
 

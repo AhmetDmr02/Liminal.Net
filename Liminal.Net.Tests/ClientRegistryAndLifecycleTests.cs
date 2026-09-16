@@ -230,15 +230,15 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => _serverManager.ClientRegistry.Count == 1, 3000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => client.ClientRegistry.Count == 1, 3000), Is.True);
 
-            Assert.That(joinedOnServer, Is.Not.Null);
+            Assert.That(SpinWait.SpinUntil(() => joinedOnServer != null, 3000), Is.True);
             Assert.That(joinedOnServer.IsLocal, Is.False);
             Assert.That(joinedOnServer.IsHost, Is.False);
 
-            Assert.That(joinedOnClient, Is.Not.Null);
+            Assert.That(SpinWait.SpinUntil(() => joinedOnClient != null, 3000), Is.True);
             Assert.That(joinedOnClient.IsLocal, Is.True);
             Assert.That(joinedOnClient.IsHost, Is.False);
             Assert.That(joinedOnClient.ClientId, Is.EqualTo(client.localID));
-            Assert.That(localReadyClient, Is.Not.Null);
+            Assert.That(SpinWait.SpinUntil(() => localReadyClient != null, 3000), Is.True);
             Assert.That(localReadyClient.ClientId, Is.EqualTo(client.localID));
 
             Assert.That(client.ClientRegistry.IsDedicatedServer, Is.True);
@@ -268,7 +268,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => client1.ClientRegistry.Count == 2, 3000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => client2.ClientRegistry.Count == 2, 3000), Is.True);
 
-            Assert.That(c1JoinedList.Any(c => c.ClientId == client2.localID), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => c1JoinedList.Any(c => c.ClientId == client2.localID), 3000), Is.True);
 
             ushort c2Id = client2.localID;
             client2.Disconnect();
