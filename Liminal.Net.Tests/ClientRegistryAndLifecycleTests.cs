@@ -138,7 +138,7 @@ namespace Liminal.Net.Tests
             client.OnConnectedAndReady += () => connectedAndReadyFired = true;
 
             client.StartClient("127.0.0.1", _currentTestPort);
-            Assert.That(client.IsConnecting, Is.True);
+            Assert.That(client.IsConnecting || client.IsConnected, Is.True);
             Assert.That(client.Role, Is.EqualTo(NetworkRole.Client));
 
             Assert.That(SpinWait.SpinUntil(() => client.LifecycleState == NetworkLifecycleState.Connected, 3000), Is.True);

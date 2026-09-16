@@ -730,6 +730,9 @@ namespace Liminal.Net.Tests
                 if (pkt.Message.StartsWith("RelPriority")) Interlocked.Increment(ref serverReceivedReliable);
             }, this);
 
+            // Stop server background ticker so it doesn't poll mid-flight between unreliable and reliable chunks
+            _serverManager.Ticker.Stop();
+
             for (int i = 0; i < 4; i++)
             {
                 client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new ChatPacket { Message = $"UnrelQueue_{i}" }, DeliveryMethod.Unreliable);
@@ -739,7 +742,20 @@ namespace Liminal.Net.Tests
 
             client.SessionManager.Flush();
 
-            Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref serverReceivedReliable) == 2, 2000), Is.True,
+            // Wait until the reliable packets have arrived and been queued into the server session buffer
+            Assert.That(SpinWait.SpinUntil(() =>
+            {
+                if (_serverManager.SessionManager.TryGetSession(client.localID, out var session))
+                {
+                    return session.InboundPacketCountReliable == 2;
+                }
+                return false;
+            }, 3000), Is.True, "Server did not receive reliable packets in queue.");
+
+            // Now poll the server to dispatch the queued packets to interpreter
+            _serverManager.SessionManager.Poll();
+
+            Assert.That(Volatile.Read(ref serverReceivedReliable), Is.EqualTo(2),
                 $"Expected 2 reliable packets, but got {serverReceivedReliable}");
 
             Assert.That(Volatile.Read(ref serverReceivedUnreliable), Is.EqualTo(0),

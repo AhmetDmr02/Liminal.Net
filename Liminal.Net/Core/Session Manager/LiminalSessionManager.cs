@@ -880,6 +880,14 @@ namespace Liminal.Net.Core
             return !_sessionManagerDisposed && _sessions.ContainsKey(sessionId);
         }
 
+        public bool TryGetSession(ushort sessionId, out LiminalSession session)
+        {
+            if (!_sessionManagerDisposed && _sessions.TryGetValue(sessionId, out session))
+                return true;
+            session = null;
+            return false;
+        }
+
         internal void HandleLocalConnection(ushort clientId)
         {
             if (_sessionManagerDisposed)
