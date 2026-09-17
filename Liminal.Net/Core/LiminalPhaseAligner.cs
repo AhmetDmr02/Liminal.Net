@@ -39,15 +39,12 @@ namespace Liminal.Net.Core
             double owtMs = wireRttMs / 2.0;
             double targetCushionMs = GetProportionalCushionMs();
 
-            // Wrap server countdown to [0, tickIntervalMs)
             double currentServerRemainingMs = serverCountdownMs % tickIntervalMs;
             if (currentServerRemainingMs < 0) currentServerRemainingMs += tickIntervalMs;
 
-            // When the client flushes on its tick (clientCountdownMs = 0), the packet flies for owtMs.
             double expectedArrivalCountdownMs = (currentServerRemainingMs - clientCountdownMs - owtMs) % tickIntervalMs;
             if (expectedArrivalCountdownMs < 0) expectedArrivalCountdownMs += tickIntervalMs;
 
-            //Difference between expected arrival margin and target cushion
             double errorMs = expectedArrivalCountdownMs - targetCushionMs;
 
             // Wrap to [-HalfInterval, +HalfInterval] for shortest slew path
@@ -55,10 +52,8 @@ namespace Liminal.Net.Core
             if (errorMs > halfInterval) errorMs -= tickIntervalMs;
             if (errorMs < -halfInterval) errorMs += tickIntervalMs;
 
-            // Deadband: within 0.5ms of target cushion, do not adjust
             if (Math.Abs(errorMs) < 0.5) return 0;
 
-            // Damping factor of 0.5 prevents 2-tick pipeline limit-cycle oscillation across the deadband
             long errorTicks = (long)(((errorMs * 0.5) / 1000.0) * Stopwatch.Frequency);
 
             // Clamp to + - _maxSlewPerTickTicks per tick
