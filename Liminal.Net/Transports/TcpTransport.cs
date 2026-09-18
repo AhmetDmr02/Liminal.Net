@@ -168,8 +168,14 @@ namespace Liminal.Net.Transports
 
         public virtual void StartServer(string ip, int port)
         {
-            IPAddress address = string.IsNullOrEmpty(ip) ? IPAddress.Any : IPAddress.Parse(ip);
-            _listener = new TcpListener(address, port);
+            if (string.IsNullOrEmpty(ip) || ip == "0.0.0.0" || ip == "127.0.0.1")
+            {
+                _listener = Socket.OSSupportsIPv6 ? TcpListener.Create(port) : new TcpListener(IPAddress.Any, port);
+            }
+            else
+            {
+                _listener = new TcpListener(IPAddress.Parse(ip), port);
+            }
             _listener.Start(100);
 
             _isServer = true;
@@ -188,7 +194,15 @@ namespace Liminal.Net.Transports
                 _clientConnectCts?.Dispose();
                 _clientConnectCts = new CancellationTokenSource();
 
-                TcpClient client = new TcpClient();
+                TcpClient client;
+                if (IPAddress.TryParse(ip, out var addr) && addr.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    client = new TcpClient(AddressFamily.InterNetworkV6);
+                }
+                else
+                {
+                    client = new TcpClient();
+                }
                 client.NoDelay = true;
 
                 _isClient = true;

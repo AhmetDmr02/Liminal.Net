@@ -812,6 +812,66 @@ namespace Liminal.Net.Tests
             Assert.DoesNotThrow(() => _serverManager.ManualPoll());
         }
 
+        [Test]
+        public void Test29_DualModeServer_AcceptsIpv6Client()
+        {
+            if (!System.Net.Sockets.Socket.OSSupportsIPv6)
+                Assert.Ignore("IPv6 is not supported on this OS.");
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var config = new LiminalNetworkConfig
+            {
+                Default_Host = "::1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), config);
+            _clientManagers.Add(client);
+
+            bool started = client.StartClient("::1", _currentTestPort);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Test30_DualModeServer_AcceptsBothIpv4AndIpv6ClientsSimultaneously()
+        {
+            if (!System.Net.Sockets.Socket.OSSupportsIPv6)
+                Assert.Ignore("IPv6 is not supported on this OS.");
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var ipv4Client = CreateAndStartClient();
+
+            var ipv6Config = new LiminalNetworkConfig
+            {
+                Default_Host = "::1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+            var ipv6Client = new LiminalNetworkManager(new TcpTransport(), ipv6Config);
+            _clientManagers.Add(ipv6Client);
+
+            bool started = ipv6Client.StartClient("::1", _currentTestPort);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => ipv6Client.IsConnected, 3000), Is.True);
+
+            Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(2));
+            Assert.That(ipv4Client.IsConnected, Is.True);
+            Assert.That(ipv6Client.IsConnected, Is.True);
+        }
+
         #endregion
     }
 }
