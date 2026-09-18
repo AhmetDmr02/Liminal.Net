@@ -1,3 +1,4 @@
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
@@ -223,6 +224,7 @@ namespace Liminal.Net.Core
         {
             if (transport == null) throw new ArgumentNullException(nameof(transport));
             if (config == null) throw new ArgumentNullException(nameof(config));
+            if (config.ClientIdResolver == null) new BaseResolver();
 
             _transport = transport;
             _config = config;
