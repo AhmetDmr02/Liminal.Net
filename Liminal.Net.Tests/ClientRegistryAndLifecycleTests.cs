@@ -211,6 +211,33 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
+        public void HostMode_JustHosted_RegistryClientId_IsOne()
+        {
+            ConnectedClient joinedClient = null;
+            ConnectedClient readyClient = null;
+            _serverManager.ClientRegistry.OnClientJoined += c => joinedClient = c;
+            _serverManager.ClientRegistry.OnLocalClientReady += c => readyClient = c;
+
+            bool started = _serverManager.StartHost();
+            Assert.That(started, Is.True);
+
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.LifecycleState == NetworkLifecycleState.HostActive, 3000), Is.True);
+
+            var registry = _serverManager.ClientRegistry;
+            Assert.That(registry.Count, Is.EqualTo(1));
+            Assert.That(registry.HostClientId, Is.EqualTo(1));
+            Assert.That(registry.LocalClient?.ClientId, Is.EqualTo(1));
+            Assert.That(registry.HostClient?.ClientId, Is.EqualTo(1));
+            Assert.That(_serverManager.localID, Is.EqualTo(1));
+
+            Assert.That(joinedClient?.ClientId, Is.EqualTo(1));
+            Assert.That(readyClient?.ClientId, Is.EqualTo(1));
+
+            Assert.That(registry.ContainsClient(1), Is.True);
+            Assert.That(registry.ContainsClient(0), Is.False);
+        }
+
+        [Test]
         public void ClientConnectsToDedicatedServer_PopulatesBothRegistries()
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
