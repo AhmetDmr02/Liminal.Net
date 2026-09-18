@@ -106,6 +106,7 @@ namespace Liminal.Net.Core
 
         private LiminalPacketFramerPipeline _pipeline;
 
+        private readonly LiminalTicker _customTicker;
         private LiminalTicker _ticker;
         public LiminalTicker Ticker => _ticker;
         private LiminalPhaseAligner _phaseAligner;
@@ -217,7 +218,7 @@ namespace Liminal.Net.Core
         public Liminal.Net.SyncVar.SyncVarManager SyncVarManager { get; private set; }
 
         public LiminalNetworkManager(ILiminalTransport transport, LiminalNetworkConfig config,
-        LiminalTelemetryConfig telemetryConfig = null)
+            LiminalTelemetryConfig telemetryConfig = null, LiminalTicker customTicker = null)
         {
             if (transport == null) throw new ArgumentNullException(nameof(transport));
             if (config == null) throw new ArgumentNullException(nameof(config));
@@ -225,6 +226,7 @@ namespace Liminal.Net.Core
             _transport = transport;
             _config = config;
             _telemetryConfig = telemetryConfig ?? new LiminalTelemetryConfig { Flags = TelemetryFlags.None };
+            _customTicker = customTicker;
 
             Interpreter = new LiminalPacketInterpreter(this, _config);
 
@@ -297,7 +299,7 @@ namespace Liminal.Net.Core
 
             DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
-            _ticker = _config.TickerFactory != null ? _config.TickerFactory(_config) : new LiminalTicker(_config);
+            _ticker = _customTicker ?? new LiminalTicker(_config);
 
             if (_transport is ITransportTelemetryProvider telemetryProvider)
             {
@@ -323,7 +325,13 @@ namespace Liminal.Net.Core
             _eventHub.RaiseManagerShutdown();
             _eventHub.UnbindCoreSystems();
 
-            _ticker?.Stop();
+            if (_ticker != null)
+            {
+                _ticker.OnTick -= HostTick;
+                _ticker.OnTick -= ServerTick;
+                _ticker.OnTick -= ClientBackgroundTick;
+                _ticker.Stop();
+            }
 
             TelemetryManager?.Dispose();
             TelemetryManager = null;

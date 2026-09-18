@@ -96,20 +96,20 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void NetworkManager_With_UnityTickerFactory_IntegratesProperly()
+        public void NetworkManager_With_CustomTicker_IntegratesProperly()
         {
             var config = new LiminalNetworkConfig
             {
                 Default_Host = "127.0.0.1",
                 Default_Port = 9988,
                 TickRate = 60,
-                ClientIdResolver = new BaseResolver(),
-                TickerFactory = cfg => new LiminalUnityTicker(cfg)
+                ClientIdResolver = new BaseResolver()
             };
 
-            var manager = new LiminalNetworkManager(new TcpTransport(), config);
+            var unityTicker = new LiminalUnityTicker(config);
+            var manager = new LiminalNetworkManager(new TcpTransport(), config, customTicker: unityTicker);
 
-            Assert.That(manager.Ticker, Is.InstanceOf<LiminalUnityTicker>());
+            Assert.That(manager.Ticker, Is.SameAs(unityTicker));
 
             manager.Shutdown();
         }

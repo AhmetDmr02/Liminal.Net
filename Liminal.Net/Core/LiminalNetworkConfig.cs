@@ -88,7 +88,6 @@ namespace Liminal.Net.Core
         public ILiminalTransportFramingProvider TransportFramingProvider { get; set; } = new DefaultTransportFramingProvider();
 
         public ILiminalClientIdResolver ClientIdResolver;
-        public Func<LiminalNetworkConfig, LiminalTicker> TickerFactory;
 
         public void Validate()
         {
