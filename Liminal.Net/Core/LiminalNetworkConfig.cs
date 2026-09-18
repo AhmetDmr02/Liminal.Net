@@ -1,4 +1,5 @@
 using Liminal.Net.Interfaces;
+using System;
 using System.Collections.Generic;
 
 namespace Liminal.Net.Core
@@ -87,6 +88,7 @@ namespace Liminal.Net.Core
         public ILiminalTransportFramingProvider TransportFramingProvider { get; set; } = new DefaultTransportFramingProvider();
 
         public ILiminalClientIdResolver ClientIdResolver;
+        public Func<LiminalNetworkConfig, LiminalTicker> TickerFactory;
 
         public void Validate()
         {

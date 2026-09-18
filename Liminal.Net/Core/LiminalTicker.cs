@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Threading;
 
@@ -6,18 +6,18 @@ namespace Liminal.Net.Core
 {
     public class LiminalTicker
     {
-        private readonly LiminalNetworkConfig _config;
+        protected readonly LiminalNetworkConfig _config;
         public event Action OnTick;
 
-        private volatile bool _isRunning;
+        protected volatile bool _isRunning;
         private Thread _tickThread;
 
-        private long _nextTickTimestamp;
+        protected long _nextTickTimestamp;
         public long NextTickTimestamp => Volatile.Read(ref _nextTickTimestamp);
 
         public long NominalTickTicks => Stopwatch.Frequency / _config.TickRate;
 
-        private long _slewAdjustmentTicks = 0;
+        protected long _slewAdjustmentTicks = 0;
 
         public LiminalTicker(LiminalNetworkConfig config)
         {
@@ -28,7 +28,7 @@ namespace Liminal.Net.Core
         {
             Interlocked.Exchange(ref _slewAdjustmentTicks, adjustmentTicks);
         }
-        //For testing
+
         public void TickOnce()
         {
             long currentSlew = Interlocked.Exchange(
@@ -46,7 +46,13 @@ namespace Liminal.Net.Core
 
             OnTick?.Invoke();
         }
-        public void Start()
+
+        protected void InvokeTick()
+        {
+            OnTick?.Invoke();
+        }
+
+        public virtual void Start()
         {
             if (_isRunning) return;
             _isRunning = true;

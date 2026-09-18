@@ -137,6 +137,7 @@ namespace Liminal.Net.Unity
 
         private void Update()
         {
+            TickUnityTicker();
             DrainEvents();
 
             if (_pollInUpdate)
@@ -169,6 +170,7 @@ namespace Liminal.Net.Unity
 
         public void Update()
         {
+            TickUnityTicker();
             DrainEvents();
             if (PollInUpdate) PollPackets();
         }
@@ -309,6 +311,14 @@ namespace Liminal.Net.Unity
             if (_manager != null && _manager.IsConnected)
             {
                 _manager.ManualPoll();
+            }
+        }
+
+        public void TickUnityTicker()
+        {
+            if (_manager?.Ticker is LiminalUnityTicker unityTicker)
+            {
+                unityTicker.TickUpdate();
             }
         }
         #endregion

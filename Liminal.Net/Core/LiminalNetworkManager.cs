@@ -297,7 +297,7 @@ namespace Liminal.Net.Core
 
             DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
 
-            _ticker = new LiminalTicker(_config);
+            _ticker = _config.TickerFactory != null ? _config.TickerFactory(_config) : new LiminalTicker(_config);
 
             if (_transport is ITransportTelemetryProvider telemetryProvider)
             {
@@ -348,7 +348,7 @@ namespace Liminal.Net.Core
             ClientRegistry?.Reset();
             SyncVarManager = null;
 
-            _config.ClientIdResolver.ResetResolver();
+            _config.ClientIdResolver?.ResetResolver();
         }
 
         #region Start Methods
