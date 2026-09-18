@@ -58,28 +58,10 @@ namespace Liminal.Net.Unity
     public class LiminalUnityBridge : MonoBehaviour
     {
         public static LiminalUnityBridge Instance { get; private set; }
-
-        [Header("Packet Polling Configuration")]
-        [SerializeField] private bool _pollInFixedUpdate = true;
-        [SerializeField] private bool _pollInUpdate = false;
-
-        public bool PollInFixedUpdate
-        {
-            get => _pollInFixedUpdate;
-            set => _pollInFixedUpdate = value;
-        }
-
-        public bool PollInUpdate
-        {
-            get => _pollInUpdate;
-            set => _pollInUpdate = value;
-        }
 #else
     public class LiminalUnityBridge : IDisposable
     {
         public static LiminalUnityBridge Instance { get; set; }
-        public bool PollInFixedUpdate { get; set; } = true;
-        public bool PollInUpdate { get; set; } = false;
 #endif
 
         #region Main Thread Events - LiminalNetworkManager
@@ -139,19 +121,6 @@ namespace Liminal.Net.Unity
         {
             TickUnityTicker();
             DrainEvents();
-
-            if (_pollInUpdate)
-            {
-                PollPackets();
-            }
-        }
-
-        private void FixedUpdate()
-        {
-            if (_pollInFixedUpdate)
-            {
-                PollPackets();
-            }
         }
 
         private void OnDestroy()
@@ -172,12 +141,6 @@ namespace Liminal.Net.Unity
         {
             TickUnityTicker();
             DrainEvents();
-            if (PollInUpdate) PollPackets();
-        }
-
-        public void FixedUpdate()
-        {
-            if (PollInFixedUpdate) PollPackets();
         }
 
         public void Dispose()

@@ -76,5 +76,35 @@ namespace Liminal.Net.Tests
             Assert.That(joinedClients.Count, Is.EqualTo(1));
             Assert.That(joinedClients[0], Is.EqualTo(_clientManager.localID));
         }
+
+        [Test]
+        public void UnityBridge_Update_DrivesUnityTicker_AndPollsNetwork()
+        {
+            var serverConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = Interlocked.Increment(ref _portCounter),
+                TickRate = 60,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var unityTicker = new LiminalUnityTicker(serverConfig);
+            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig, customTicker: unityTicker);
+            var bridge = new LiminalUnityBridge();
+            bridge.Attach(server);
+
+            int tickCount = 0;
+            unityTicker.OnTick += () => tickCount++;
+
+            server.StartServer();
+
+            Thread.Sleep(25);
+            bridge.Update();
+
+            Assert.That(tickCount, Is.GreaterThanOrEqualTo(1));
+
+            bridge.Dispose();
+            server.Shutdown();
+        }
     }
 }
