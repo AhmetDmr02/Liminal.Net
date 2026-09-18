@@ -100,6 +100,7 @@ namespace Liminal.Net.Core
         public ILiminalTransport Transport => _transport;
 
         private readonly LiminalNetworkConfig _config;
+        public LiminalNetworkConfig Config => _config;
 
         public LiminalSessionManager SessionManager { get; private set; }
         public LiminalPacketInterpreter Interpreter { get; private set; }
@@ -361,10 +362,11 @@ namespace Liminal.Net.Core
 
         #region Start Methods
 
-        /// <summary>
-        /// Starts as a Host: Acts as a Server, but also connects a local client to itself.
-        /// </summary>
-        public bool StartHost()
+        public bool StartHost() => StartHost(_config.Default_Host, _config.Default_Port);
+
+        public bool StartHost(int port) => StartHost(_config.Default_Host, port);
+
+        public bool StartHost(string host, int port)
         {
             if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
             {
@@ -381,15 +383,19 @@ namespace Liminal.Net.Core
 
             LiminalLogger.Log("[Manager] Starting Host Mode...");
 
-            _transport.StartServer(_config.Default_Host, _config.Default_Port);
-            _transport.StartClient(_config.Default_Host, _config.Default_Port);
+            _transport.StartServer(host, port);
+            _transport.StartClient(host, port);
 
             _ticker.OnTick += HostTick;
             _ticker.Start();
 
-            LiminalLogger.Log($"[Manager] Host running on {_config.Default_Host}:{_config.Default_Port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+            LiminalLogger.Log($"[Manager] Host running on {host}:{port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
             return true;
         }
+
+        public bool StartServer() => StartServer(_config.Default_Host, _config.Default_Port);
+
+        public bool StartServer(int port) => StartServer(_config.Default_Host, port);
 
         public bool StartServer(string ip, int port)
         {
@@ -419,6 +425,12 @@ namespace Liminal.Net.Core
             _onConnectedAndReady?.Invoke();
             return true;
         }
+
+        public bool StartClient() => StartClient(_config.Default_Host, _config.Default_Port);
+
+        public bool StartClient(string ip) => StartClient(ip, _config.Default_Port);
+
+        public bool StartClient(int port) => StartClient(_config.Default_Host, port);
 
         public bool StartClient(string ip, int port)
         {

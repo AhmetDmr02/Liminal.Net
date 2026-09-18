@@ -397,6 +397,70 @@ namespace Liminal.Net.Tests
             Assert.That(client.IsConnected, Is.False);
         }
 
+        [Test]
+        public void Manager_ExposesConfigProperty()
+        {
+            Assert.That(_serverManager.Config, Is.SameAs(_serverConfig));
+        }
+
+        [Test]
+        public void StartHost_WithCustomPort_StartsSuccessfully()
+        {
+            int customPort = Interlocked.Increment(ref _portCounter);
+            bool started = _serverManager.StartHost(customPort);
+
+            Assert.That(started, Is.True);
+            Assert.That(_serverManager.IsHost, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.IsConnected, 3000), Is.True);
+        }
+
+        [Test]
+        public void StartServer_Parameterless_StartsSuccessfully()
+        {
+            bool started = _serverManager.StartServer();
+
+            Assert.That(started, Is.True);
+            Assert.That(_serverManager.IsServer, Is.True);
+            Assert.That(_serverManager.IsConnected, Is.True);
+        }
+
+        [Test]
+        public void StartClient_Parameterless_ConnectsToServer()
+        {
+            _serverManager.StartServer();
+
+            var client = CreateClientManager();
+            bool started = client.StartClient();
+
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+        }
+
+        [Test]
+        public void StartClient_WithIpOnly_ConnectsToServer()
+        {
+            _serverManager.StartServer();
+
+            var client = CreateClientManager();
+            bool started = client.StartClient("127.0.0.1");
+
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+        }
+
+        [Test]
+        public void StartClient_WithPortOnly_ConnectsToServer()
+        {
+            int customPort = Interlocked.Increment(ref _portCounter);
+            _serverManager.StartServer(customPort);
+
+            var client = CreateClientManager();
+            bool started = client.StartClient(customPort);
+
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+        }
+
         #endregion
     }
 }
