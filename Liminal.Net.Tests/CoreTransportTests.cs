@@ -21,8 +21,7 @@ namespace Liminal.Net.Tests
         private ConcurrentBag<LiminalNetworkManager> _clientManagers;
         private LiminalNetworkConfig _serverConfig;
 
-        // Prevent port exhaustion between tests
-        private static int _portCounter = 7770;
+        private static int _portCounter = 17770;
         private int _currentTestPort;
 
         [SetUp]

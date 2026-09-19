@@ -3,6 +3,7 @@ using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Registry;
 using Liminal.Net.Transports;
+using Liminal.Net.Unity;
 using NUnit.Framework;
 using System;
 using System.Collections.Concurrent;
@@ -459,6 +460,83 @@ namespace Liminal.Net.Tests
 
             Assert.That(started, Is.True);
             Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+        }
+
+        [Test]
+        public void Rapid_Disconnect_StartHost_Shutdown_StartHost_DoesNotCorruptOrThrow()
+        {
+            var bridge = new LiminalUnityBridge();
+            bridge.Attach(_serverManager);
+
+            int clientJoinedCount = 0;
+            bridge.OnClientJoined += c => clientJoinedCount++;
+
+            _serverManager.Disconnect();
+            _serverManager.StartHost();
+            _serverManager.Shutdown();
+            bool started = _serverManager.StartHost();
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.IsConnected, 4000), Is.True);
+
+            bridge.Update();
+            Assert.That(clientJoinedCount, Is.GreaterThanOrEqualTo(1));
+            bridge.Dispose();
+        }
+
+        [Test]
+        public void EventHub_ThrowingSubscriber_DoesNotKillConnectionOrPreventOtherSubscribers()
+        {
+            bool secondSubscriberRan = false;
+            _serverManager.OnClientConnected += id => throw new Exception("Boom!");
+            _serverManager.OnClientConnected += id => secondSubscriberRan = true;
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateClientManager();
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            Assert.That(secondSubscriberRan, Is.True);
+        }
+
+        [Test]
+        public void Bridge_ThrowingSubscriber_DoesNotStopDrainLoopOrPreventOtherSubscribers()
+        {
+            var bridge = new LiminalUnityBridge();
+            bridge.Attach(_serverManager);
+
+            bool secondSubscriberRan = false;
+            bool subsequentEventRan = false;
+
+            bridge.OnClientConnected += id => throw new Exception("Boom in bridge subscriber!");
+            bridge.OnClientConnected += id => secondSubscriberRan = true;
+            bridge.OnClientJoined += client => subsequentEventRan = true;
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateClientManager();
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+
+            Assert.DoesNotThrow(() => bridge.DrainEvents());
+            Assert.That(secondSubscriberRan, Is.True);
+            Assert.That(subsequentEventRan, Is.True);
+
+            bridge.Dispose();
+        }
+
+        [Test]
+        public void ClientRegistry_ThrowingSubscriber_DoesNotCrashPromotionOrPreventOtherSubscribers()
+        {
+            bool secondJoinedRan = false;
+            _serverManager.ClientRegistry.OnClientJoined += c => throw new Exception("Boom in client joined!");
+            _serverManager.ClientRegistry.OnClientJoined += c => secondJoinedRan = true;
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateClientManager();
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            Assert.That(secondJoinedRan, Is.True);
         }
 
         #endregion

@@ -5,6 +5,9 @@ using System.Collections.Generic;
 
 namespace Liminal.Net.Core
 {
+#if UNITY_5_3_OR_NEWER
+[Serializable]
+#endif
     public class LiminalNetworkConfig
     {
         /// <summary>

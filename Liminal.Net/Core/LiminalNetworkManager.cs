@@ -1,6 +1,7 @@
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
+using Liminal.Net.Misc;
 using System;
 using System.Diagnostics;
 using System.Threading;
@@ -36,7 +37,12 @@ namespace Liminal.Net.Core
         public NetworkRole Role { get; private set; } = NetworkRole.None;
         public NetworkLifecycleState LifecycleState { get; private set; } = NetworkLifecycleState.Stopped;
 
-        public event Action<NetworkLifecycleState> OnLifecycleStateChanged;
+        private Action<NetworkLifecycleState> _onLifecycleStateChanged;
+        public event Action<NetworkLifecycleState> OnLifecycleStateChanged
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLifecycleStateChanged, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLifecycleStateChanged, value);
+        }
 
         public bool IsConnected => LifecycleState switch
         {
@@ -245,6 +251,7 @@ namespace Liminal.Net.Core
 
         private void HandleTransportShutdown()
         {
+            if (_isShuttingDown != 0) return;
             LiminalLogger.Log("[Manager] Transport reported shutdown. Resetting state...");
             ResetLifecycleState();
             Shutdown();
@@ -255,18 +262,18 @@ namespace Liminal.Net.Core
             if (Role == NetworkRole.Client)
             {
                 LifecycleState = NetworkLifecycleState.Connected;
-                OnLifecycleStateChanged?.Invoke(LifecycleState);
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
             }
             else if (Role == NetworkRole.Host)
             {
                 LifecycleState = NetworkLifecycleState.HostActive;
-                OnLifecycleStateChanged?.Invoke(LifecycleState);
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
             }
         }
 
         private void HandlePostLocalClientConnected(ushort clientId)
         {
-            _onConnectedAndReady?.Invoke();
+            LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
         }
 
         private void HandlePreLocalClientDisconnected(ushort clientId)
@@ -278,7 +285,7 @@ namespace Liminal.Net.Core
         {
             Role = NetworkRole.None;
             LifecycleState = NetworkLifecycleState.Stopped;
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
         }
 
         private void InitializeSystems()
@@ -379,7 +386,7 @@ namespace Liminal.Net.Core
             LifecycleState = NetworkLifecycleState.StartingHost;
             Role = NetworkRole.Host;
 
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             InitializeSystems();
 
@@ -410,7 +417,7 @@ namespace Liminal.Net.Core
             LifecycleState = NetworkLifecycleState.StartingServer;
             Role = NetworkRole.Server;
 
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             InitializeSystems();
 
@@ -419,12 +426,12 @@ namespace Liminal.Net.Core
 
             LifecycleState = NetworkLifecycleState.ServerActive;
 
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             _ticker.OnTick += ServerTick;
             _ticker.Start();
 
-            _onConnectedAndReady?.Invoke();
+            LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
             return true;
         }
 
@@ -444,7 +451,7 @@ namespace Liminal.Net.Core
 
             LifecycleState = NetworkLifecycleState.Connecting;
 
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             Role = NetworkRole.Client;
 
@@ -465,17 +472,15 @@ namespace Liminal.Net.Core
             LifecycleState = NetworkLifecycleState.Stopping;
             Role = NetworkRole.None;
 
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             _transport.Disconnect();
 
             ShutdownSystems();
 
-            _eventHub.Clear();
-
             LifecycleState = NetworkLifecycleState.Stopped;
 
-            OnLifecycleStateChanged?.Invoke(LifecycleState);
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             LiminalLogger.Log("[Manager] Network State Disconnected.");
         }
@@ -492,20 +497,17 @@ namespace Liminal.Net.Core
                 LifecycleState = NetworkLifecycleState.Stopping;
                 Role = NetworkRole.None;
 
-                OnLifecycleStateChanged?.Invoke(LifecycleState);
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
                 _ticker?.Stop();
 
-                //Maybe we can reset the transport here but for now just shut it down
                 _transport.Shutdown();
 
                 ShutdownSystems();
 
-                _eventHub.Clear();
-
                 LifecycleState = NetworkLifecycleState.Stopped;
 
-                OnLifecycleStateChanged?.Invoke(LifecycleState);
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
                 if (wasActive)
                 {

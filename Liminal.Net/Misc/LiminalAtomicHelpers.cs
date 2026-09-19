@@ -28,5 +28,80 @@ namespace Liminal.Net.Misc
                 current = original;
             }
         }
+
+        public static void SafeInvoke(Action action)
+        {
+            if (action == null) return;
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {ex}");
+                var list = action.GetInvocationList();
+                for (int i = 1; i < list.Length; i++)
+                {
+                    try
+                    {
+                        ((Action)list[i])();
+                    }
+                    catch (Exception nextEx)
+                    {
+                        Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {nextEx}");
+                    }
+                }
+            }
+        }
+
+        public static void SafeInvoke<T>(Action<T> action, T arg)
+        {
+            if (action == null) return;
+            try
+            {
+                action(arg);
+            }
+            catch (Exception ex)
+            {
+                Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {ex}");
+                var list = action.GetInvocationList();
+                for (int i = 1; i < list.Length; i++)
+                {
+                    try
+                    {
+                        ((Action<T>)list[i])(arg);
+                    }
+                    catch (Exception nextEx)
+                    {
+                        Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {nextEx}");
+                    }
+                }
+            }
+        }
+
+        public static void SafeInvoke<T1, T2, T3>(Action<T1, T2, T3> action, T1 arg1, T2 arg2, T3 arg3)
+        {
+            if (action == null) return;
+            try
+            {
+                action(arg1, arg2, arg3);
+            }
+            catch (Exception ex)
+            {
+                Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {ex}");
+                var list = action.GetInvocationList();
+                for (int i = 1; i < list.Length; i++)
+                {
+                    try
+                    {
+                        ((Action<T1, T2, T3>)list[i])(arg1, arg2, arg3);
+                    }
+                    catch (Exception nextEx)
+                    {
+                        Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {nextEx}");
+                    }
+                }
+            }
+        }
     }
 }

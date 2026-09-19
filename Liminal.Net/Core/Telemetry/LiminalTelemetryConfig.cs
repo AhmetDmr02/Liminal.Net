@@ -17,6 +17,7 @@ namespace Liminal.Net.Core
         BasicThroughput = ByteCounting | PacketCounting
     }
 
+
     public class LiminalTelemetryConfig
     {
         public TelemetryFlags Flags { get; set; } = TelemetryFlags.None;

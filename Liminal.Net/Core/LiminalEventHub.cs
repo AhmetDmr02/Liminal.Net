@@ -173,82 +173,82 @@ namespace Liminal.Net.Core
         #region Staged Transport Event Handlers
         private void HandleTransportClientConnected(ushort clientId)
         {
-            if (_disposed) return;
+            if (_disposed || _sessionManager == null) return;
 
-            _sessionManager?.HandleClientConnected(clientId);
+            _sessionManager.HandleClientConnected(clientId);
 
-            _onClientConnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onClientConnected, clientId);
         }
 
         private void HandleTransportLocalClientConnected(ushort clientId)
         {
-            if (_disposed) return;
+            if (_disposed || _sessionManager == null) return;
 
-            _sessionManager?.HandleLocalConnection(clientId);
+            _sessionManager.HandleLocalConnection(clientId);
 
-            _onPreLocalClientConnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientConnected, clientId);
 
-            _onLocalClientConnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onLocalClientConnected, clientId);
 
-            _onPostLocalClientConnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onPostLocalClientConnected, clientId);
         }
 
         private void HandleTransportClientDisconnected(ushort clientId)
         {
-            if (_disposed) return;
+            if (_disposed || _sessionManager == null) return;
 
-            _sessionManager?.HandleClientDisconnected(clientId);
+            _sessionManager.HandleClientDisconnected(clientId);
 
-            _onClientDisconnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onClientDisconnected, clientId);
         }
 
         private void HandleTransportLocalClientDisconnected(ushort clientId)
         {
-            if (_disposed) return;
+            if (_disposed || _sessionManager == null) return;
 
-            _onPreLocalClientDisconnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientDisconnected, clientId);
 
-            _sessionManager?.HandleClientDisconnected(clientId);
-            _sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
+            _sessionManager.HandleClientDisconnected(clientId);
+            _sessionManager.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
 
-            _onLocalClientDisconnected?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, clientId);
         }
 
         private void HandleTransportClientKicked(ushort clientId)
         {
-            if (_disposed) return;
+            if (_disposed || _sessionManager == null) return;
 
-            _sessionManager?.HandleClientDisconnected(clientId);
+            _sessionManager.HandleClientDisconnected(clientId);
 
-            _onClientKicked?.Invoke(clientId);
+            LiminalAtomicHelpers.SafeInvoke(_onClientKicked, clientId);
         }
 
         private void HandleTransportServerStarted()
         {
-            if (_disposed) return;
-            _onServerStarted?.Invoke();
+            if (_disposed || _sessionManager == null) return;
+            LiminalAtomicHelpers.SafeInvoke(_onServerStarted);
         }
 
         private void HandleTransportShutdown()
         {
             if (_disposed) return;
-            _onTransportShutdown?.Invoke();
+            LiminalAtomicHelpers.SafeInvoke(_onTransportShutdown);
         }
         #endregion
 
         #region Internal Dispatchers for Manager
         internal void RaiseDisconnectResolved(ushort id, DisconnectReason reason, string message)
         {
-            _onDisconnectResolved?.Invoke(id, reason, message);
+            LiminalAtomicHelpers.SafeInvoke(_onDisconnectResolved, id, reason, message);
         }
 
-        internal void RaiseManagerPreInitialize() => _onManagerPreInitialize?.Invoke();
-        internal void RaiseManagerPostInitialize() => _onManagerPostInitialize?.Invoke();
-        internal void RaiseManagerShutdown() => _onManagerShutdown?.Invoke();
-        internal void RaisePreFlush() => _onPreFlush?.Invoke();
-        internal void RaisePostFlush() => _onPostFlush?.Invoke();
-        internal void RaisePrePoll() => _onPrePoll?.Invoke();
-        internal void RaisePostPoll() => _onPostPoll?.Invoke();
+        internal void RaiseManagerPreInitialize() => LiminalAtomicHelpers.SafeInvoke(_onManagerPreInitialize);
+        internal void RaiseManagerPostInitialize() => LiminalAtomicHelpers.SafeInvoke(_onManagerPostInitialize);
+        internal void RaiseManagerShutdown() => LiminalAtomicHelpers.SafeInvoke(_onManagerShutdown);
+        internal void RaisePreFlush() => LiminalAtomicHelpers.SafeInvoke(_onPreFlush);
+        internal void RaisePostFlush() => LiminalAtomicHelpers.SafeInvoke(_onPostFlush);
+        internal void RaisePrePoll() => LiminalAtomicHelpers.SafeInvoke(_onPrePoll);
+        internal void RaisePostPoll() => LiminalAtomicHelpers.SafeInvoke(_onPostPoll);
         #endregion
 
         #region Lifecycle Cleanup

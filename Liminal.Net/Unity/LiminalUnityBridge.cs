@@ -3,6 +3,7 @@ using UnityEngine;
 #endif
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
+using Liminal.Net.Misc;
 using Liminal.Net.Registry;
 using System;
 
@@ -65,25 +66,100 @@ namespace Liminal.Net.Unity
 #endif
 
         #region Main Thread Events - LiminalNetworkManager
-        public event Action<NetworkLifecycleState> OnLifecycleStateChanged;
-        public event Action OnConnectedAndReady;
+        private Action<NetworkLifecycleState> _onLifecycleStateChanged;
+        public event Action<NetworkLifecycleState> OnLifecycleStateChanged
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLifecycleStateChanged, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLifecycleStateChanged, value);
+        }
+
+        private Action _onConnectedAndReady;
+        public event Action OnConnectedAndReady
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onConnectedAndReady, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onConnectedAndReady, value);
+        }
         #endregion
 
         #region Main Thread Events - LiminalEventHub
-        public event Action<ushort> OnClientConnected;
-        public event Action<ushort> OnClientDisconnected;
-        public event Action<ushort> OnLocalClientConnected;
-        public event Action<ushort> OnLocalClientDisconnected;
-        public event Action<ushort> OnClientKicked;
-        public event Action OnServerStarted;
-        public event Action OnTransportShutdown;
-        public event Action<ushort, DisconnectReason, string> OnDisconnectResolved;
+        private Action<ushort> _onClientConnected;
+        public event Action<ushort> OnClientConnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientConnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientConnected, value);
+        }
+
+        private Action<ushort> _onClientDisconnected;
+        public event Action<ushort> OnClientDisconnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientDisconnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientDisconnected, value);
+        }
+
+        private Action<ushort> _onLocalClientConnected;
+        public event Action<ushort> OnLocalClientConnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLocalClientConnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLocalClientConnected, value);
+        }
+
+        private Action<ushort> _onLocalClientDisconnected;
+        public event Action<ushort> OnLocalClientDisconnected
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLocalClientDisconnected, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLocalClientDisconnected, value);
+        }
+
+        private Action<ushort> _onClientKicked;
+        public event Action<ushort> OnClientKicked
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientKicked, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientKicked, value);
+        }
+
+        private Action _onServerStarted;
+        public event Action OnServerStarted
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onServerStarted, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onServerStarted, value);
+        }
+
+        private Action _onTransportShutdown;
+        public event Action OnTransportShutdown
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onTransportShutdown, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onTransportShutdown, value);
+        }
+
+        private Action<ushort, DisconnectReason, string> _onDisconnectResolved;
+        public event Action<ushort, DisconnectReason, string> OnDisconnectResolved
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onDisconnectResolved, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onDisconnectResolved, value);
+        }
         #endregion
 
         #region Main Thread Events - ClientRegistry
-        public event Action<ConnectedClient> OnClientJoined;
-        public event Action<ConnectedClient> OnClientLeft;
-        public event Action<ConnectedClient> OnLocalClientReady;
+        private Action<ConnectedClient> _onClientJoined;
+        public event Action<ConnectedClient> OnClientJoined
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientJoined, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientJoined, value);
+        }
+
+        private Action<ConnectedClient> _onClientLeft;
+        public event Action<ConnectedClient> OnClientLeft
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onClientLeft, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onClientLeft, value);
+        }
+
+        private Action<ConnectedClient> _onLocalClientReady;
+        public event Action<ConnectedClient> OnLocalClientReady
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _onLocalClientReady, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _onLocalClientReady, value);
+        }
         #endregion
 
         private LiminalNetworkManager _manager;
@@ -100,7 +176,6 @@ namespace Liminal.Net.Unity
             if (Instance == null)
             {
                 Instance = this;
-                DontDestroyOnLoad(gameObject);
                 InitializeBuffer();
             }
             else if (Instance != this)
@@ -227,43 +302,43 @@ namespace Liminal.Net.Unity
                 switch (ev.Type)
                 {
                     case UnityNetworkEventType.LifecycleStateChanged:
-                        OnLifecycleStateChanged?.Invoke(ev.LifecycleState);
+                        LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, ev.LifecycleState);
                         break;
                     case UnityNetworkEventType.ConnectedAndReady:
-                        OnConnectedAndReady?.Invoke();
+                        LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
                         break;
                     case UnityNetworkEventType.ClientConnected:
-                        OnClientConnected?.Invoke(ev.ClientId);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientConnected, ev.ClientId);
                         break;
                     case UnityNetworkEventType.ClientDisconnected:
-                        OnClientDisconnected?.Invoke(ev.ClientId);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientDisconnected, ev.ClientId);
                         break;
                     case UnityNetworkEventType.LocalClientConnected:
-                        OnLocalClientConnected?.Invoke(ev.ClientId);
+                        LiminalAtomicHelpers.SafeInvoke(_onLocalClientConnected, ev.ClientId);
                         break;
                     case UnityNetworkEventType.LocalClientDisconnected:
-                        OnLocalClientDisconnected?.Invoke(ev.ClientId);
+                        LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, ev.ClientId);
                         break;
                     case UnityNetworkEventType.ClientKicked:
-                        OnClientKicked?.Invoke(ev.ClientId);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientKicked, ev.ClientId);
                         break;
                     case UnityNetworkEventType.ServerStarted:
-                        OnServerStarted?.Invoke();
+                        LiminalAtomicHelpers.SafeInvoke(_onServerStarted);
                         break;
                     case UnityNetworkEventType.TransportShutdown:
-                        OnTransportShutdown?.Invoke();
+                        LiminalAtomicHelpers.SafeInvoke(_onTransportShutdown);
                         break;
                     case UnityNetworkEventType.DisconnectResolved:
-                        OnDisconnectResolved?.Invoke(ev.ClientId, ev.DisconnectReason, ev.DisconnectMessage);
+                        LiminalAtomicHelpers.SafeInvoke(_onDisconnectResolved, ev.ClientId, ev.DisconnectReason, ev.DisconnectMessage);
                         break;
                     case UnityNetworkEventType.ClientJoined:
-                        OnClientJoined?.Invoke(ev.Client);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientJoined, ev.Client);
                         break;
                     case UnityNetworkEventType.ClientLeft:
-                        OnClientLeft?.Invoke(ev.Client);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientLeft, ev.Client);
                         break;
                     case UnityNetworkEventType.LocalClientReady:
-                        OnLocalClientReady?.Invoke(ev.Client);
+                        LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, ev.Client);
                         break;
                 }
             }

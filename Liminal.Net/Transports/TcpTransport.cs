@@ -594,7 +594,7 @@ namespace Liminal.Net.Transports
                     result = await ClientHandshaker(client, _config).ConfigureAwait(false);
                 }
 
-                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                if (cancelToken.IsCancellationRequested)
                 {
                     _localClientId = 0;
                     try { client.Close(); } catch { }
@@ -611,6 +611,9 @@ namespace Liminal.Net.Transports
                     _localClientId = 0;
                     try { client.Close(); } catch { }
 
+                    if (cancelToken.IsCancellationRequested)
+                        return;
+
                     OnTransportDisconnectReason?.Invoke(ILiminalTransport.SERVER_ID, result.FailureReason, result.FailureMessage);
 
                     _onLocalClientDisconnected?.Invoke(0);
@@ -626,6 +629,8 @@ namespace Liminal.Net.Transports
             {
                 _localClientId = 0;
                 try { client.Close(); } catch { }
+                if (cancelToken.IsCancellationRequested)
+                    return;
                 LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
                 Shutdown();
             }

@@ -121,8 +121,8 @@ namespace Liminal.Net.Registry
                 uint newVersion = (uint)Interlocked.Increment(ref _rosterVersion);
                 if (isHost) LocalClient = client;
 
-                _onClientJoined?.Invoke(client);
-                if (isHost) _onLocalClientReady?.Invoke(client);
+                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, client);
+                if (isHost) LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, client);
             }
 
             if (!isHost)
@@ -163,7 +163,7 @@ namespace Liminal.Net.Registry
                     Interlocked.Exchange(ref _hostClientId, 0);
                 }
 
-                _onClientLeft?.Invoke(client);
+                LiminalAtomicHelpers.SafeInvoke(_onClientLeft, client);
 
                 foreach (var remainingId in _clients.Keys)
                 {
@@ -219,10 +219,10 @@ namespace Liminal.Net.Registry
                     var hostClient = new ConnectedClient(localId, isLocal: true, isHost: true);
                     _clients.TryAdd(localId, hostClient);
                     LocalClient = hostClient;
-                    _onClientJoined?.Invoke(hostClient);
+                    LiminalAtomicHelpers.SafeInvoke(_onClientJoined, hostClient);
                 }
 
-                _onLocalClientReady?.Invoke(LocalClient);
+                LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, LocalClient);
                 return;
             }
 
@@ -231,10 +231,10 @@ namespace Liminal.Net.Registry
 
             if (_clients.TryAdd(localId, localClient))
             {
-                _onClientJoined?.Invoke(localClient);
+                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, localClient);
             }
 
-            _onLocalClientReady?.Invoke(localClient);
+            LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, localClient);
         }
 
         private void HandleLocalClientDisconnected(ushort localId)
@@ -263,7 +263,7 @@ namespace Liminal.Net.Registry
                 {
                     if (_clients.TryRemove(kvp.Key, out var removed))
                     {
-                        _onClientLeft?.Invoke(removed);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientLeft, removed);
                     }
                 }
             }
@@ -288,7 +288,7 @@ namespace Liminal.Net.Registry
                     if (_clients.TryAdd(id, newClient))
                     {
                         if (isLocal) LocalClient = newClient;
-                        _onClientJoined?.Invoke(newClient);
+                        LiminalAtomicHelpers.SafeInvoke(_onClientJoined, newClient);
                     }
                 }
             }
@@ -319,7 +319,7 @@ namespace Liminal.Net.Registry
             if (_clients.TryAdd(packet.ClientId, client))
             {
                 if (isLocal) LocalClient = client;
-                _onClientJoined?.Invoke(client);
+                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, client);
             }
         }
 
@@ -343,7 +343,7 @@ namespace Liminal.Net.Registry
             Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
             if (_clients.TryRemove(packet.ClientId, out var client))
             {
-                _onClientLeft?.Invoke(client);
+                LiminalAtomicHelpers.SafeInvoke(_onClientLeft, client);
             }
         }
 
