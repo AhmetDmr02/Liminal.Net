@@ -168,6 +168,12 @@ namespace Liminal.Net.Core
             });
         }
 
+        public void RecordReason(ushort clientId, DisconnectReason reason, string message)
+        {
+            if (_disposed) return;
+            _resolved[clientId] = (reason, message);
+        }
+
         private void HandleTransportReason(ushort id, DisconnectReason reason, string msg)
         {
             if (_resolved.TryGetValue(id, out var existing))

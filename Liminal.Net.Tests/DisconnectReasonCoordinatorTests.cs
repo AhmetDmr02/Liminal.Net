@@ -617,6 +617,86 @@ namespace Liminal.Net.Tests
             Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
         }
 
+        [Test]
+        public void Test49_ReliablePacket_SerializationOverflow_DisconnectsClientWithOutboundBufferOverflow()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var clientConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                MaxPacketSizePerBatch = 512,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(client);
+
+            DisconnectReason resolvedReason = DisconnectReason.Unknown;
+            var resolvedEvent = new ManualResetEventSlim(false);
+
+            client.OnDisconnectResolved += (id, r, msg) =>
+            {
+                resolvedReason = r;
+                resolvedEvent.Set();
+            };
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+
+            byte[] oversized = new byte[4000];
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new FilePacket
+            {
+                FileName = "oversized-reliable",
+                Data = oversized
+            }, DeliveryMethod.Reliable);
+
+            Assert.That(resolvedEvent.Wait(3000), Is.True, "Client did not resolve disconnect after reliable serialization overflow.");
+            Assert.That(resolvedReason, Is.EqualTo(DisconnectReason.OutboundBufferOverflow));
+            Assert.That(client.IsConnected, Is.False);
+            Assert.That(client.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
+        }
+
+        [Test]
+        public void Test50_UnreliablePacket_SerializationOverflow_DoesNotDisconnectClient()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var clientConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                MaxPacketSizePerBatch = 512,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(client);
+
+            bool disconnected = false;
+            client.OnDisconnectResolved += (id, r, msg) => disconnected = true;
+
+            client.StartClient("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+
+            byte[] oversized = new byte[4000];
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new FilePacket
+            {
+                FileName = "oversized-unreliable",
+                Data = oversized
+            }, DeliveryMethod.Unreliable);
+
+            Thread.Sleep(200);
+
+            Assert.That(disconnected, Is.False, "Unreliable packet overflow should NOT sever the connection.");
+            Assert.That(client.IsConnected, Is.True);
+        }
+
         #endregion
 
         #region Supporting Types for Test 48

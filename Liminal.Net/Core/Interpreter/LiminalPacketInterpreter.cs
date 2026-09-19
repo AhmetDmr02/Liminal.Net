@@ -736,7 +736,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionId, typeof(TSendStruct).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -809,7 +809,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Packet {typeof(TSendStruct).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionIds, typeof(TSendStruct).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -883,7 +883,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionId, typeof(TMeta).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -963,7 +963,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionIds, typeof(TMeta).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -1024,7 +1024,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionId, typeof(TMeta).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -1085,7 +1085,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionId, typeof(TMeta).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -1155,7 +1155,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionIds, typeof(TMeta).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -1200,7 +1200,7 @@ namespace Liminal.Net.Core
             }
             catch (MessagePackSerializationException ex)
             {
-                LiminalLogger.LogError($"[Interpreter] Bitstream packet {typeof(TMeta).Name} failed to send: {ex.InnerException?.Message ?? ex.Message}");
+                HandleOutboundSerializationFailure(targetSessionIds, typeof(TMeta).Name, ex, deliveryMethod);
             }
             finally
             {
@@ -1257,6 +1257,69 @@ namespace Liminal.Net.Core
         #endregion
 
         #endregion
+
+        private void HandleOutboundSerializationFailure(ushort targetSessionId, string packetName, Exception ex, DeliveryMethod deliveryMethod)
+        {
+            Span<ushort> targets = stackalloc ushort[1] { targetSessionId };
+            HandleOutboundSerializationFailure(targets, packetName, ex, deliveryMethod);
+        }
+
+        private void HandleOutboundSerializationFailure(ReadOnlySpan<ushort> targetSessionIds, string packetName, Exception ex, DeliveryMethod deliveryMethod)
+        {
+            string msg = ex.InnerException?.Message ?? ex.Message;
+            LiminalLogger.LogError($"[Interpreter] Packet {packetName} failed to send: {msg}");
+
+            if (deliveryMethod == DeliveryMethod.Unreliable)
+            {
+                // Unreliable packets may be safely dropped without breaking determinism
+                return;
+            }
+
+            LiminalLogger.LogError($"[Interpreter] Reliable packet {packetName} failed serialization. Severing connection to preserve determinism.");
+
+            var reason = DisconnectReason.OutboundBufferOverflow;
+            string reasonMsg = $"Reliable packet {packetName} exceeded buffer capacity: {msg}";
+
+            if (_manager.Role == NetworkRole.Client)
+            {
+                ushort myId = _manager.localID != 0 ? _manager.localID : _manager.Transport?.LocalClientId ?? 0;
+                _manager.DisconnectCoordinator?.RecordReason(myId, reason, reasonMsg);
+                _manager.Disconnect();
+            }
+            else if (_manager.Role == NetworkRole.Server)
+            {
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                {
+                    ushort targetId = targetSessionIds[i];
+                    _manager.DisconnectCoordinator?.RecordReason(targetId, reason, reasonMsg);
+                    _manager.Transport?.Kick(targetId);
+                }
+            }
+            else if (_manager.Role == NetworkRole.Host)
+            {
+                bool containsLocalOrServer = false;
+                for (int i = 0; i < targetSessionIds.Length; i++)
+                {
+                    ushort targetId = targetSessionIds[i];
+                    if (targetId == ILiminalTransport.SERVER_ID || targetId == _manager.localID)
+                    {
+                        containsLocalOrServer = true;
+                    }
+                    else
+                    {
+                        _manager.DisconnectCoordinator?.RecordReason(targetId, reason, reasonMsg);
+                        _manager.Transport?.Kick(targetId);
+                    }
+                }
+
+                if (containsLocalOrServer)
+                {
+                    ushort myId = _manager.localID != 0 ? _manager.localID : _manager.Transport?.LocalClientId ?? 0;
+                    _manager.DisconnectCoordinator?.RecordReason(myId, reason, reasonMsg);
+                    _manager.Disconnect();
+                }
+            }
+        }
 
         #region Dispatch
 
