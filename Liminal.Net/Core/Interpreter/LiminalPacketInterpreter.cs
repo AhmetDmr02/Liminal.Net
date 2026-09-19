@@ -413,7 +413,7 @@ namespace Liminal.Net.Core
                     subList.Add(subscription);
                 }
 
-                LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})");
+                LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})", LiminalLogger.LogLevel.Detailed);
             }
         }
 

@@ -186,8 +186,7 @@ namespace Liminal.Net.Transports
 
             try
             {
-                _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                _listener.ExclusiveAddressUse = false;
+                _listener.ExclusiveAddressUse = true;
             }
             catch { }
 

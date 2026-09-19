@@ -565,6 +565,29 @@ namespace Liminal.Net.Tests
             Assert.That(_serverManager.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
         }
 
+        [Test]
+        public void StartHost_WhenAnotherHostActiveOnSamePort_FailsAndDoesNotConnectOrAnnounceAsHost()
+        {
+            int testPort = Interlocked.Increment(ref _portCounter);
+            bool hostAStarted = _serverManager.StartHost("127.0.0.1", testPort);
+            Assert.That(hostAStarted, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.IsConnected, 4000), Is.True);
+
+            var hostB = CreateClientManager();
+            Assert.Throws<System.Net.Sockets.SocketException>(() => hostB.StartHost("127.0.0.1", testPort));
+            Assert.That(hostB.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
+            Assert.That(hostB.Role, Is.EqualTo(NetworkRole.None));
+            Assert.That(hostB.IsConnected, Is.False);
+            Assert.That(hostB.IsServer, Is.False);
+            Assert.That(hostB.IsClient, Is.False);
+
+            Assert.That(_serverManager.ClientRegistry.Count, Is.EqualTo(1));
+            Assert.That(_serverManager.IsConnected, Is.True);
+
+            hostB.Shutdown();
+            _serverManager.Shutdown();
+        }
+
         #endregion
     }
 }
