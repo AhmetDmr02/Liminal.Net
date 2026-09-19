@@ -169,6 +169,12 @@ namespace Liminal.Net.Transports
 
         public virtual void StartServer(string ip, int port)
         {
+            if (_listener != null)
+            {
+                try { _listener.Stop(); } catch { }
+                _listener = null;
+            }
+
             if (string.IsNullOrEmpty(ip) || ip == "0.0.0.0")
             {
                 _listener = Socket.OSSupportsIPv6 ? TcpListener.Create(port) : new TcpListener(IPAddress.Any, port);
@@ -177,7 +183,24 @@ namespace Liminal.Net.Transports
             {
                 _listener = new TcpListener(IPAddress.Parse(ip), port);
             }
-            _listener.Start(100);
+
+            try
+            {
+                _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                _listener.ExclusiveAddressUse = false;
+            }
+            catch { }
+
+            try
+            {
+                _listener.Start(100);
+            }
+            catch
+            {
+                try { _listener.Stop(); } catch { }
+                _listener = null;
+                throw;
+            }
 
             _isServer = true;
             _isConnected = true;
@@ -243,7 +266,10 @@ namespace Liminal.Net.Transports
 
                 Shutdown();
                 LiminalLogger.Log("[Transport] Disconnected from server.");
+                return;
             }
+
+            Shutdown();
         }
 
         public virtual void Kick(ushort clientId)

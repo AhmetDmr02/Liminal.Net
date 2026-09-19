@@ -392,14 +392,23 @@ namespace Liminal.Net.Core
 
             LiminalLogger.Log("[Manager] Starting Host Mode...");
 
-            _transport.StartServer(host, port);
-            _transport.StartClient(host, port);
+            try
+            {
+                _transport.StartServer(host, port);
+                _transport.StartClient(host, port);
 
-            _ticker.OnTick += HostTick;
-            _ticker.Start();
+                _ticker.OnTick += HostTick;
+                _ticker.Start();
 
-            LiminalLogger.Log($"[Manager] Host running on {host}:{port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
-            return true;
+                LiminalLogger.Log($"[Manager] Host running on {host}:{port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] StartHost failed: {ex.Message}");
+                Shutdown();
+                throw;
+            }
         }
 
         public bool StartServer() => StartServer(_config.Default_Host, _config.Default_Port);
@@ -422,17 +431,27 @@ namespace Liminal.Net.Core
             InitializeSystems();
 
             LiminalLogger.Log($"[Manager] Starting Dedicated Server on {ip}:{port}");
-            _transport.StartServer(ip, port);
 
-            LifecycleState = NetworkLifecycleState.ServerActive;
+            try
+            {
+                _transport.StartServer(ip, port);
 
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                LifecycleState = NetworkLifecycleState.ServerActive;
 
-            _ticker.OnTick += ServerTick;
-            _ticker.Start();
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
-            LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
-            return true;
+                _ticker.OnTick += ServerTick;
+                _ticker.Start();
+
+                LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] StartServer failed: {ex.Message}");
+                Shutdown();
+                throw;
+            }
         }
 
         public bool StartClient() => StartClient(_config.Default_Host, _config.Default_Port);
@@ -458,11 +477,21 @@ namespace Liminal.Net.Core
             InitializeSystems();
 
             LiminalLogger.Log($"[Manager] Starting Client connecting to {ip}:{port}");
-            _transport.StartClient(ip, port);
 
-            _ticker.OnTick += ClientBackgroundTick;
-            _ticker.Start();
-            return true;
+            try
+            {
+                _transport.StartClient(ip, port);
+
+                _ticker.OnTick += ClientBackgroundTick;
+                _ticker.Start();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] StartClient failed: {ex.Message}");
+                Shutdown();
+                throw;
+            }
         }
 
         public void Disconnect()

@@ -539,6 +539,32 @@ namespace Liminal.Net.Tests
             Assert.That(secondJoinedRan, Is.True);
         }
 
+        [Test]
+        public void StartHost_WhenPortBlocked_RollsBackStateToStoppedAndAllowsSubsequentHosting()
+        {
+            int blockedPort = Interlocked.Increment(ref _portCounter);
+            var blocker = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Parse("127.0.0.1"), blockedPort);
+            blocker.ExclusiveAddressUse = true;
+            blocker.Start();
+
+            try
+            {
+                Assert.Throws<System.Net.Sockets.SocketException>(() => _serverManager.StartHost("127.0.0.1", blockedPort));
+                Assert.That(_serverManager.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
+                Assert.That(_serverManager.Role, Is.EqualTo(NetworkRole.None));
+            }
+            finally
+            {
+                blocker.Stop();
+            }
+
+            bool started = _serverManager.StartHost("127.0.0.1", blockedPort);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.IsConnected, 4000), Is.True);
+            _serverManager.Shutdown();
+            Assert.That(_serverManager.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
+        }
+
         #endregion
     }
 }
