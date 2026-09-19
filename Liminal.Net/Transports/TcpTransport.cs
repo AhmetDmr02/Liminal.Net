@@ -1,3 +1,4 @@
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Handshakes;
 using Liminal.Net.Interfaces;
@@ -162,13 +163,13 @@ namespace Liminal.Net.Transports
             _framing = config.TransportFramingProvider as ILiminalTransportFramingProvider<TContext>;
             _totalHeaderSize = LiminalTransportHeader.GetHeaderSize(_framing);
 
-            _clientIdResolver = _config.ClientIdResolver;
-            _clientIdResolver?.Initialize(this);
+            _clientIdResolver = _config.ClientIdResolver ?? new BaseResolver();
+            _clientIdResolver.Initialize(this);
         }
 
         public virtual void StartServer(string ip, int port)
         {
-            if (string.IsNullOrEmpty(ip) || ip == "0.0.0.0" || ip == "127.0.0.1")
+            if (string.IsNullOrEmpty(ip) || ip == "0.0.0.0")
             {
                 _listener = Socket.OSSupportsIPv6 ? TcpListener.Create(port) : new TcpListener(IPAddress.Any, port);
             }

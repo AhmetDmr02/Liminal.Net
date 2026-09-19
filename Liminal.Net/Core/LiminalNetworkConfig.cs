@@ -1,3 +1,4 @@
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Generic;
@@ -87,10 +88,14 @@ namespace Liminal.Net.Core
 
         public ILiminalTransportFramingProvider TransportFramingProvider { get; set; } = new DefaultTransportFramingProvider();
 
-        public ILiminalClientIdResolver ClientIdResolver;
+        public ILiminalClientIdResolver ClientIdResolver { get; set; } = new BaseResolver();
 
         public void Validate()
         {
+            if (ClientIdResolver == null)
+            {
+                ClientIdResolver = new BaseResolver();
+            }
             Hiccup.Validate(MaxPacketSizePerBatch, MaxPacketCount, MaxConnectionCount);
         }
     }

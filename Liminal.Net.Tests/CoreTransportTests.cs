@@ -818,7 +818,7 @@ namespace Liminal.Net.Tests
             if (!System.Net.Sockets.Socket.OSSupportsIPv6)
                 Assert.Ignore("IPv6 is not supported on this OS.");
 
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            _serverManager.StartServer("0.0.0.0", _currentTestPort);
 
             var config = new LiminalNetworkConfig
             {
@@ -846,7 +846,7 @@ namespace Liminal.Net.Tests
             if (!System.Net.Sockets.Socket.OSSupportsIPv6)
                 Assert.Ignore("IPv6 is not supported on this OS.");
 
-            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            _serverManager.StartServer("0.0.0.0", _currentTestPort);
 
             var ipv4Client = CreateAndStartClient();
 
@@ -870,6 +870,34 @@ namespace Liminal.Net.Tests
             Assert.That(_serverManager.SessionManager.GetActiveSessionCount(), Is.EqualTo(2));
             Assert.That(ipv4Client.IsConnected, Is.True);
             Assert.That(ipv6Client.IsConnected, Is.True);
+        }
+
+        [Test]
+        public void Test31_DefaultConfig_WithoutExplicitResolver_ConnectsSuccessfully()
+        {
+            int port = Interlocked.Increment(ref _portCounter);
+            var serverCfg = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port
+            };
+            var server = new LiminalNetworkManager(new TcpTransport(), serverCfg);
+            server.StartServer("127.0.0.1", port);
+
+            var clientCfg = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port
+            };
+            var client = new LiminalNetworkManager(new TcpTransport(), clientCfg);
+            _clientManagers.Add(client);
+
+            bool started = client.StartClient("127.0.0.1", port);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            Assert.That(server.SessionManager.GetActiveSessionCount(), Is.EqualTo(1));
+
+            server.Shutdown();
         }
 
         #endregion

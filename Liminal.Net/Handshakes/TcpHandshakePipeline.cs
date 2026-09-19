@@ -1,4 +1,5 @@
 using Liminal.Net.BasePackets;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
@@ -20,7 +21,7 @@ namespace Liminal.Net.Handshakes
 
         public TcpHandshakePipeline(ILiminalClientIdResolver resolver, LiminalNetworkConfig config, int maxHandshakeSize = 256, float timeoutS = 5)
         {
-            _resolver = resolver;
+            _resolver = resolver ?? new BaseResolver();
             _timeoutSeconds = timeoutS;
             _maxHandshakeSize = maxHandshakeSize;
             _config = config;
@@ -153,7 +154,7 @@ namespace Liminal.Net.Handshakes
             }
             catch (Exception ex)
             {
-                Drop(client, $"Fatal Handshake Error: {ex.Message}");
+                Drop(client, $"Fatal Handshake Error: {ex}");
                 return HandshakeResult.Fail(DisconnectReason.Custom, ex.Message);
             }
         }
