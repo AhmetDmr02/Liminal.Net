@@ -395,23 +395,16 @@ namespace Liminal.Net.Core
             string serverBindHost = host;
             string clientConnectHost = host;
 
-            if (string.IsNullOrWhiteSpace(host) || host == "0.0.0.0" || host == "::" || host == "::0")
+            bool isWildcard = string.IsNullOrWhiteSpace(host) || host == "0.0.0.0" || host == "::" || host == "::0";
+            if (!isWildcard && System.Net.IPAddress.TryParse(host, out var parsedAddr))
+            {
+                isWildcard = parsedAddr.Equals(System.Net.IPAddress.Any) || parsedAddr.Equals(System.Net.IPAddress.IPv6Any);
+            }
+
+            if (isWildcard)
             {
                 serverBindHost = host;
-                clientConnectHost = (host == "::" || host == "::0") ? "::1" : "127.0.0.1";
-            }
-            else if (System.Net.IPAddress.TryParse(host, out var parsedAddr))
-            {
-                if (parsedAddr.Equals(System.Net.IPAddress.Any))
-                {
-                    serverBindHost = host;
-                    clientConnectHost = "127.0.0.1";
-                }
-                else if (parsedAddr.Equals(System.Net.IPAddress.IPv6Any))
-                {
-                    serverBindHost = host;
-                    clientConnectHost = "::1";
-                }
+                clientConnectHost = (host == "::" || host == "::0" || (System.Net.IPAddress.TryParse(host, out var addr) && addr.Equals(System.Net.IPAddress.IPv6Any))) ? "::1" : "127.0.0.1";
             }
 
             try
@@ -422,7 +415,8 @@ namespace Liminal.Net.Core
                 _ticker.OnTick += HostTick;
                 _ticker.Start();
 
-                LiminalLogger.Log($"[Manager] Host running on {serverBindHost}:{port} (client connected via {clientConnectHost}) local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+                string displayBind = (isWildcard && System.Net.Sockets.Socket.OSSupportsIPv6) ? $"[::]:{port} (DualMode IPv4/IPv6)" : $"{serverBindHost}:{port}";
+                LiminalLogger.Log($"[Manager] Host running on {displayBind} (client connected via {clientConnectHost}) local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
                 return true;
             }
             catch (Exception ex)

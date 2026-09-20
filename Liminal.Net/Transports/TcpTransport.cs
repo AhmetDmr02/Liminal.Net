@@ -212,7 +212,8 @@ namespace Liminal.Net.Transports
             _onServerStarted?.Invoke();
 
             _ = Task.Run(() => AcceptConnectionsAsync(_listener));
-            LiminalLogger.Log($"Server started on {ip}:{port}");
+            string dualModeInfo = (isWildcard && Socket.OSSupportsIPv6) ? " (Dual-Mode: IPv4 + IPv6)" : "";
+            LiminalLogger.Log($"Server started on {_listener.LocalEndpoint}{dualModeInfo}");
         }
 
         public virtual void StartClient(string ip, int port)
