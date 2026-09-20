@@ -46,8 +46,14 @@ namespace Liminal.Net.SyncVar
         private readonly Utf8TokenRegistry _tokenRegistry = new();
         private readonly ConcurrentDictionary<string, (uint Version, byte[] Data)> _unboundCache = new();
         private readonly ConcurrentDictionary<string, ushort[]> _unboundAuth = new();
+        private readonly ConcurrentQueue<string> _unboundEvictionQueue = new();
         private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
+        private readonly int _maxUnboundCapacity;
+
+        public int MaxUnboundCapacity => _maxUnboundCapacity;
+        public int UnboundCacheCount => _unboundCache.Count;
+        public int DirtyQueueCount => _dirtyQueue.Count;
 
         public SyncVarSlab Slab { get; private set; }
         public LockFreeDirtyBitset DirtyBitset { get; } = new();
@@ -62,6 +68,14 @@ namespace Liminal.Net.SyncVar
         public SyncVarManager(LiminalNetworkManager manager, LiminalNetworkConfig config)
         {
             Slab = new SyncVarSlab(config);
+
+            int maxPlayers = config?.MaxConnectionCount > 0 ? config.MaxConnectionCount : 32;
+            int scale = (config?.Hiccup != null && config.Hiccup.Enabled)
+                ? Math.Max(1, config.Hiccup.MaxRecoveryScale)
+                : 4;
+            const int VarsPerPlayerEstimate = 128;
+            _maxUnboundCapacity = Math.Max(maxPlayers * scale * VarsPerPlayerEstimate, 2048);
+
             if (manager != null)
             {
                 AttachToManager(manager);
@@ -81,6 +95,8 @@ namespace Liminal.Net.SyncVar
             _attachedManager.Interpreter.Subscribe<SyncVarAuthUpdatePacket>(HandleAuthUpdate, this);
 
             _attachedManager.Events.OnClientConnected += HandleClientConnected;
+            _attachedManager.Events.OnLocalClientDisconnected += HandleLocalClientDisconnected;
+            _attachedManager.Events.OnManagerShutdown += HandleShutdown;
             _attachedManager.OnPreFlush += FlushDirty;
         }
 
@@ -92,17 +108,84 @@ namespace Liminal.Net.SyncVar
             {
                 _attachedManager.OnPreFlush -= FlushDirty;
                 _attachedManager.Events.OnClientConnected -= HandleClientConnected;
+                _attachedManager.Events.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
+                _attachedManager.Events.OnManagerShutdown -= HandleShutdown;
                 _attachedManager.Interpreter.UnsubscribeAll(this);
             }
             catch { }
 
             _attachedManager = null;
+            ResetPendingState();
         }
 
         public void Reattach(LiminalNetworkManager manager)
         {
+            ResetPendingState();
             AttachToManager(manager);
+        }
+
+        public void ResetPendingState()
+        {
+            while (_dirtyQueue.TryDequeue(out var syncVar))
+            {
+                syncVar.ClearDirty();
+            }
+            _reusableDirtyList.Clear();
+            _unboundCache.Clear();
+            _unboundAuth.Clear();
+            while (_unboundEvictionQueue.TryDequeue(out _)) { }
             DirtyBitset.Clear();
+        }
+
+        public bool UnregisterSyncVar(ISyncVarInternal syncVar)
+        {
+            if (syncVar == null) return false;
+            return UnregisterSyncVar(syncVar.Token);
+        }
+
+        public bool UnregisterSyncVar(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return false;
+            _unboundCache.TryRemove(token, out _);
+            _unboundAuth.TryRemove(token, out _);
+            return _tokenRegistry.TryRemove(token, out _);
+        }
+
+        private void HandleLocalClientDisconnected(ushort clientId)
+        {
+            ResetPendingState();
+        }
+
+        private void HandleShutdown()
+        {
+            ResetPendingState();
+        }
+
+        private void StoreUnboundAuth(string token, ushort[] authIds)
+        {
+            _unboundAuth[token] = authIds;
+        }
+
+        private void StoreUnboundData(string token, uint version, byte[] data)
+        {
+            if (_unboundCache.TryAdd(token, (version, data)))
+            {
+                _unboundEvictionQueue.Enqueue(token);
+                EnforceUnboundCapacity();
+            }
+            else
+            {
+                _unboundCache[token] = (version, data);
+            }
+        }
+
+        private void EnforceUnboundCapacity()
+        {
+            while (_unboundCache.Count > _maxUnboundCapacity && _unboundEvictionQueue.TryDequeue(out var oldestToken))
+            {
+                _unboundCache.TryRemove(oldestToken, out _);
+                _unboundAuth.TryRemove(oldestToken, out _);
+            }
         }
 
         public void RegisterSyncVar(ISyncVarInternal syncVar)
@@ -400,7 +483,7 @@ namespace Liminal.Net.SyncVar
                 {
                     string token = System.Text.Encoding.UTF8.GetString(tokenSpan);
                     byte[] data = rawSlice.ToArray();
-                    _unboundCache[token] = (version, data);
+                    StoreUnboundData(token, version, data);
                 }
             }
         }
@@ -451,7 +534,7 @@ namespace Liminal.Net.SyncVar
             }
             else
             {
-                _unboundAuth[packet.Token] = packet.AuthIds;
+                StoreUnboundAuth(packet.Token, packet.AuthIds);
             }
         }
 
@@ -507,11 +590,11 @@ namespace Liminal.Net.SyncVar
                 {
                     if (entry.AuthIds != null)
                     {
-                        _unboundAuth[entry.Token] = entry.AuthIds;
+                        StoreUnboundAuth(entry.Token, entry.AuthIds);
                     }
                     if (entry.Data != null && entry.Data.Length > 0)
                     {
-                        _unboundCache[entry.Token] = (entry.Version, entry.Data);
+                        StoreUnboundData(entry.Token, entry.Version, entry.Data);
                     }
                 }
             }

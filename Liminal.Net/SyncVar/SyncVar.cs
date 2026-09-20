@@ -44,7 +44,7 @@ namespace Liminal.Net.SyncVar
         void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options);
     }
 
-    public class SyncVar<T> : ISyncVarInternal
+    public class SyncVar<T> : ISyncVarInternal, IDisposable
     {
         private const int STATE_IDLE = 0;
         private const int STATE_READING = 1;
@@ -546,6 +546,16 @@ namespace Liminal.Net.SyncVar
         public void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options)
         {
             MessagePackSerializer.Serialize(writer, _value, options);
+        }
+
+        public void Unregister()
+        {
+            _manager?.UnregisterSyncVar(this);
+        }
+
+        public void Dispose()
+        {
+            Unregister();
         }
     }
 }

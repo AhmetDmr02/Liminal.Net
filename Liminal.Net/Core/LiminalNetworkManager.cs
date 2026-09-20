@@ -364,6 +364,7 @@ namespace Liminal.Net.Core
             //_ticker = null;
             //SessionManager = null;
             ClientRegistry?.Reset();
+            SyncVarManager?.DetachFromManager();
             SyncVarManager = null;
 
             _config.ClientIdResolver?.ResetResolver();

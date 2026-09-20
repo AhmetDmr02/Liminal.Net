@@ -7,6 +7,7 @@ using MessagePack;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
@@ -836,6 +837,131 @@ namespace Liminal.Net.Tests
 
             Assert.That(SpinWait.SpinUntil(() => serverVar.Value == 777, 2000), Is.True);
             Assert.That(SpinWait.SpinUntil(() => c2Var.Value == 777, 2000), Is.True);
+        }
+
+        [Test]
+        public void Test27_Lifecycle_UnboundCapacity_CalculatesGenerouslyAndEvictsOldest()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                MaxConnectionCount = 10,
+                Hiccup = { Enabled = true, MaxRecoveryScale = 4 }
+            };
+
+            var manager = new SyncVarManager(null, config);
+            Assert.That(manager.MaxUnboundCapacity, Is.EqualTo(5120));
+
+            var smallConfig = new LiminalNetworkConfig
+            {
+                MaxConnectionCount = 1,
+                Hiccup = { Enabled = false }
+            };
+            var smallManager = new SyncVarManager(null, smallConfig);
+            Assert.That(smallManager.MaxUnboundCapacity, Is.EqualTo(2048));
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var attachedSyncManager = netManager.SyncVarManager;
+
+            for (int i = 0; i < 100; i++)
+            {
+                var buffer = new ArrayBufferWriter<byte>();
+                var writer = new MessagePackWriter(buffer);
+                writer.WriteArrayHeader(1);
+                var tokenBytes = System.Text.Encoding.UTF8.GetBytes($"unbound_{i}");
+                writer.WriteUInt8((byte)tokenBytes.Length);
+                writer.WriteRaw(tokenBytes);
+                writer.WriteUInt32((uint)i);
+                var valBuf = new ArrayBufferWriter<byte>();
+                MessagePackSerializer.Serialize(valBuf, i);
+                writer.WriteInt32(valBuf.WrittenCount);
+                writer.WriteRaw(valBuf.WrittenSpan);
+                writer.Flush();
+
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    MessagePackSerializer.Serialize(new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(buffer.WrittenMemory))));
+            }
+
+            Assert.That(attachedSyncManager.UnboundCacheCount, Is.EqualTo(100));
+        }
+
+        [Test]
+        public void Test28_Lifecycle_ResetPendingState_ClearsDirtyQueueAndUnboundCache()
+        {
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, new LiminalNetworkConfig());
+            var manager = netManager.SyncVarManager;
+
+            var v1 = new SyncVar<int>("reset_test_var", 42, manager);
+            v1.Value = 100;
+
+            Assert.That(manager.DirtyQueueCount, Is.GreaterThan(0));
+            Assert.That(v1.IsDirty, Is.True);
+
+            var buffer = new ArrayBufferWriter<byte>();
+            var writer = new MessagePackWriter(buffer);
+            writer.WriteArrayHeader(1);
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes("unbound_to_reset");
+            writer.WriteUInt8((byte)tokenBytes.Length);
+            writer.WriteRaw(tokenBytes);
+            writer.WriteUInt32(1);
+            var valBuf = new ArrayBufferWriter<byte>();
+            MessagePackSerializer.Serialize(valBuf, 999);
+            writer.WriteInt32(valBuf.WrittenCount);
+            writer.WriteRaw(valBuf.WrittenSpan);
+            writer.Flush();
+
+            netManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(buffer.WrittenMemory))));
+
+            Assert.That(manager.UnboundCacheCount, Is.GreaterThan(0));
+
+            manager.ResetPendingState();
+
+            Assert.That(manager.DirtyQueueCount, Is.EqualTo(0), "DirtyQueue was not cleared.");
+            Assert.That(manager.UnboundCacheCount, Is.EqualTo(0), "UnboundCache was not cleared.");
+            Assert.That(v1.IsDirty, Is.False, "SyncVar IsDirty flag was not reset.");
+        }
+
+        [Test]
+        public void Test29_Lifecycle_Reattach_PreventsStaleWritesFromFlushing()
+        {
+            var config = new LiminalNetworkConfig();
+            var transport1 = new MockTransport();
+            var netManager1 = new LiminalNetworkManager(transport1, config);
+            var manager = netManager1.SyncVarManager;
+
+            var staleVar = new SyncVar<int>("stale_var", 10, manager);
+            staleVar.Value = 999;
+
+            Assert.That(manager.DirtyQueueCount, Is.EqualTo(1));
+
+            var transport2 = new MockTransport();
+            var netManager2 = new LiminalNetworkManager(transport2, config);
+            manager.Reattach(netManager2);
+
+            Assert.That(manager.DirtyQueueCount, Is.EqualTo(0), "Reattach did not clear stale dirty queue.");
+            Assert.That(staleVar.IsDirty, Is.False, "Reattach did not clear dirty bit on stale variable.");
+
+            manager.FlushDirty();
+            Assert.That(transport2.SentPackets.Count, Is.EqualTo(0), "Stale variable was flushed to new transport.");
+        }
+
+        [Test]
+        public void Test30_Lifecycle_UnregisterSyncVar_CleansRegistry()
+        {
+            var manager = new SyncVarManager(null, new LiminalNetworkConfig());
+            var syncVar = new SyncVar<int>("disposable_token", 123, manager);
+
+            Assert.That(manager.TryGetSyncVar("disposable_token", out _), Is.True);
+
+            syncVar.Dispose();
+
+            Assert.That(manager.TryGetSyncVar("disposable_token", out _), Is.False, "SyncVar was not removed from registry after Dispose.");
         }
 
         #endregion
