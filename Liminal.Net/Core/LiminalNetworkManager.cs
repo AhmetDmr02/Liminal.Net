@@ -230,7 +230,7 @@ namespace Liminal.Net.Core
         {
             if (transport == null) throw new ArgumentNullException(nameof(transport));
             if (config == null) throw new ArgumentNullException(nameof(config));
-            if (config.ClientIdResolver == null) new BaseResolver();
+            if (config.ClientIdResolver == null) config.ClientIdResolver = new BaseResolver();
 
             _transport = transport;
             _config = config;

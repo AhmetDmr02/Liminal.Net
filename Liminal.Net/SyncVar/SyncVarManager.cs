@@ -43,16 +43,30 @@ namespace Liminal.Net.SyncVar
             return _lastCreatedManager;
         }
 
+        private sealed class UnboundEntry
+        {
+            public uint Version;
+            public byte[] Data;
+            public LinkedListNode<string> Node;
+        }
+
         private readonly Utf8TokenRegistry _tokenRegistry = new();
-        private readonly ConcurrentDictionary<string, (uint Version, byte[] Data)> _unboundCache = new();
-        private readonly ConcurrentDictionary<string, ushort[]> _unboundAuth = new();
-        private readonly ConcurrentQueue<string> _unboundEvictionQueue = new();
+        private readonly object _unboundLock = new();
+        private readonly Dictionary<string, UnboundEntry> _unboundCache = new();
+        private readonly LinkedList<string> _unboundOrder = new();
+        private readonly Dictionary<string, ushort[]> _unboundAuth = new();
         private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
         private readonly int _maxUnboundCapacity;
 
         public int MaxUnboundCapacity => _maxUnboundCapacity;
-        public int UnboundCacheCount => _unboundCache.Count;
+        public int UnboundCacheCount
+        {
+            get
+            {
+                lock (_unboundLock) return _unboundCache.Count;
+            }
+        }
         public int DirtyQueueCount => _dirtyQueue.Count;
 
         public SyncVarSlab Slab { get; private set; }
@@ -131,9 +145,12 @@ namespace Liminal.Net.SyncVar
                 syncVar.ClearDirty();
             }
             _reusableDirtyList.Clear();
-            _unboundCache.Clear();
-            _unboundAuth.Clear();
-            while (_unboundEvictionQueue.TryDequeue(out _)) { }
+            lock (_unboundLock)
+            {
+                _unboundCache.Clear();
+                _unboundOrder.Clear();
+                _unboundAuth.Clear();
+            }
             DirtyBitset.Clear();
         }
 
@@ -146,9 +163,15 @@ namespace Liminal.Net.SyncVar
         public bool UnregisterSyncVar(string token)
         {
             if (string.IsNullOrEmpty(token)) return false;
-            _unboundCache.TryRemove(token, out _);
-            _unboundAuth.TryRemove(token, out _);
-            return _tokenRegistry.TryRemove(token, out _);
+            lock (_unboundLock)
+            {
+                if (_unboundCache.Remove(token, out var entry))
+                {
+                    _unboundOrder.Remove(entry.Node);
+                }
+                _unboundAuth.Remove(token);
+                return _tokenRegistry.TryRemove(token, out _);
+            }
         }
 
         private void HandleLocalClientDisconnected(ushort clientId)
@@ -163,41 +186,70 @@ namespace Liminal.Net.SyncVar
 
         private void StoreUnboundAuth(string token, ushort[] authIds)
         {
-            _unboundAuth[token] = authIds;
+            ISyncVarInternal registered = null;
+
+            lock (_unboundLock)
+            {
+                if (_tokenRegistry.TryGet(token, out registered))
+                {
+                }
+                else
+                {
+                    _unboundAuth[token] = authIds;
+                }
+            }
+
+            if (registered != null)
+            {
+                registered.ApplyAuthUpdateFromRemote(authIds);
+            }
         }
 
         private void StoreUnboundData(string token, uint version, byte[] data)
         {
-            if (_unboundCache.TryAdd(token, (version, data)))
-            {
-                _unboundEvictionQueue.Enqueue(token);
-                EnforceUnboundCapacity();
-            }
-            else
-            {
-                _unboundCache[token] = (version, data);
-            }
-        }
+            ISyncVarInternal registered = null;
 
-        private void EnforceUnboundCapacity()
-        {
-            while (_unboundCache.Count > _maxUnboundCapacity && _unboundEvictionQueue.TryDequeue(out var oldestToken))
+            lock (_unboundLock)
             {
-                _unboundCache.TryRemove(oldestToken, out _);
-                _unboundAuth.TryRemove(oldestToken, out _);
+                if (_tokenRegistry.TryGet(token, out registered))
+                {
+                }
+                else if (_unboundCache.TryGetValue(token, out var existing))
+                {
+                    if (version <= existing.Version && existing.Version != 0)
+                    {
+                        return;
+                    }
+
+                    existing.Version = version;
+                    existing.Data = data;
+                    _unboundOrder.Remove(existing.Node);
+                    _unboundOrder.AddLast(existing.Node);
+                }
+                else
+                {
+                    while (_unboundCache.Count >= _maxUnboundCapacity && _unboundOrder.First != null)
+                    {
+                        string oldest = _unboundOrder.First.Value;
+                        _unboundOrder.RemoveFirst();
+                        _unboundCache.Remove(oldest);
+                        _unboundAuth.Remove(oldest);
+                    }
+
+                    var node = _unboundOrder.AddLast(token);
+                    _unboundCache[token] = new UnboundEntry { Version = version, Data = data, Node = node };
+                }
+            }
+
+            if (registered != null)
+            {
+                registered.ApplyRemoteBytes(new ReadOnlySequence<byte>(data), version, SerializerOptions);
             }
         }
 
         public void RegisterSyncVar(ISyncVarInternal syncVar)
         {
             if (syncVar == null) throw new ArgumentNullException(nameof(syncVar));
-
-            _tokenRegistry.TryAdd(syncVar);
-
-            if (_unboundAuth.TryRemove(syncVar.Token, out var authIds))
-            {
-                syncVar.ApplyAuthUpdateFromRemote(authIds);
-            }
 
             var writer = new ArrayBufferWriter<byte>(128);
             syncVar.SerializeInitial(writer, SerializerOptions);
@@ -208,9 +260,29 @@ namespace Liminal.Net.SyncVar
 
             writer.WrittenSpan.CopyTo(Slab.GetSpan(syncVar.ActivePageIndex, syncVar.ActivePageOffset, size));
 
-            if (_unboundCache.TryRemove(syncVar.Token, out var cached))
+            byte[] cachedData = null;
+            uint cachedVersion = 0;
+
+            lock (_unboundLock)
             {
-                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(cached.Data), cached.Version, SerializerOptions);
+                if (_unboundAuth.Remove(syncVar.Token, out var a))
+                {
+                    syncVar.ApplyAuthUpdateFromRemote(a);
+                }
+
+                if (_unboundCache.Remove(syncVar.Token, out var entry))
+                {
+                    _unboundOrder.Remove(entry.Node);
+                    cachedData = entry.Data;
+                    cachedVersion = entry.Version;
+                }
+
+                _tokenRegistry.TryAdd(syncVar);
+            }
+
+            if (cachedData != null)
+            {
+                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(cachedData), cachedVersion, SerializerOptions);
             }
 
             if (_attachedManager != null && _attachedManager.Role != NetworkRole.Client && _attachedManager.Role != NetworkRole.None)
@@ -551,15 +623,13 @@ namespace Liminal.Net.SyncVar
                 var syncVar = allVars[i];
                 if (syncVar.IsExcluded(clientId)) continue;
 
-                int page = syncVar.ActivePageIndex;
-                int offset = syncVar.ActivePageOffset;
-                int length = syncVar.Length;
-                byte[] data = Slab.GetSpan(page, offset, length).ToArray();
+                if (!syncVar.TryExtractSnapshotData(out byte[] data, out uint version))
+                    continue;
 
                 entries.Add(new SyncVarSnapshotEntry
                 {
                     Token = syncVar.Token,
-                    Version = syncVar.Version,
+                    Version = version,
                     AuthIds = syncVar.AuthIds,
                     Data = data
                 });

@@ -413,5 +413,438 @@ namespace Liminal.Net.Tests.Coyote
             Specification.Assert(successfulReads == workerIterations * 2,
                 $"Expected {workerIterations * 2} successful reads, got {successfulReads}");
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_RegistrationPublication_ConcurrentRemoteBytes()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const int count = 10;
+            var createdVars = new SyncVar<CoyoteStatePayload>[count];
+
+            var workerCreate = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    createdVars[i] = new SyncVar<CoyoteStatePayload>(
+                        $"pub_race_{i}",
+                        new CoyoteStatePayload { Iteration = i, Checksum = i ^ 0x5A5A5A5A },
+                        syncVarManager);
+                    await Task.Yield();
+                }
+            });
+
+            var workerRemote = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var payload = new CoyoteStatePayload { Iteration = 100 + i, Checksum = (100 + i) ^ 0x5A5A5A5A };
+                    var valBuf = new ArrayBufferWriter<byte>();
+                    MessagePackSerializer.Serialize(valBuf, payload);
+
+                    var buffer = new ArrayBufferWriter<byte>();
+                    var writer = new MessagePackWriter(buffer);
+                    writer.WriteArrayHeader(1);
+                    var tokenBytes = System.Text.Encoding.UTF8.GetBytes($"pub_race_{i}");
+                    writer.WriteUInt8((byte)tokenBytes.Length);
+                    writer.WriteRaw(tokenBytes);
+                    writer.WriteUInt32((uint)(i + 1));
+                    writer.WriteInt32(valBuf.WrittenCount);
+                    writer.WriteRaw(valBuf.WrittenSpan);
+                    writer.Flush();
+
+                    var batchPacket = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(buffer.WrittenMemory));
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                        ILiminalTransport.SERVER_ID,
+                        MessagePackSerializer.Serialize(batchPacket));
+
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(workerCreate, workerRemote);
+
+            for (int i = 0; i < count; i++)
+            {
+                var v = createdVars[i];
+                Specification.Assert(v != null, $"SyncVar {i} was not created.");
+                Specification.Assert(v.Value.IsConsistent, $"SyncVar {i} has torn or inconsistent state.");
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ApplyRemoteBytes_ConcurrentFlushDirty_ZeroTornWireSlots()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            var syncVar = new SyncVar<CoyoteStatePayload>(
+                "token_apply_wire_race",
+                new CoyoteStatePayload { Iteration = 0, Checksum = 0 ^ 0x5A5A5A5A },
+                syncVarManager);
+
+            const int iterations = 20;
+            int tornWireReads = 0;
+
+            var workerApply = Task.Run(async () =>
+            {
+                for (int i = 1; i <= iterations; i++)
+                {
+                    var payload = new CoyoteStatePayload
+                    {
+                        Iteration = i,
+                        TimestampTicks = i * 1000L,
+                        Checksum = i ^ 0x5A5A5A5A
+                    };
+
+                    var valBuf = new ArrayBufferWriter<byte>();
+                    MessagePackSerializer.Serialize(valBuf, payload);
+                    syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(valBuf.WrittenMemory), (uint)i, syncVarManager.SerializerOptions);
+                    syncVar.SetDirty();
+
+                    await Task.Yield();
+                }
+            });
+
+            var workerFlush = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.FlushDirty();
+
+                    while (transport.SentPackets.Count > 0)
+                    {
+                        var packetRecord = transport.SentPackets[0];
+                        transport.SentPackets.Clear();
+
+                        var batch = MessagePackSerializer.Deserialize<SyncVarSlabBatchPacket>(packetRecord.Data);
+                        if (!batch.Payload.IsEmpty)
+                        {
+                            var reader = new MessagePackReader(batch.Payload);
+                            int count = reader.ReadArrayHeader();
+                            for (int c = 0; c < count; c++)
+                            {
+                                byte tokenLen = reader.ReadByte();
+                                reader.ReadRaw(tokenLen);
+                                uint ver = reader.ReadUInt32();
+                                int len = reader.ReadInt32();
+                                var rawSlice = reader.ReadRaw(len);
+
+                                var deserialized = MessagePackSerializer.Deserialize<CoyoteStatePayload>(rawSlice);
+                                if (!deserialized.IsConsistent)
+                                {
+                                    Interlocked.Increment(ref tornWireReads);
+                                }
+                            }
+                        }
+                    }
+
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(workerApply, workerFlush);
+
+            Specification.Assert(tornWireReads == 0,
+                $"Torn wire reads detected! Count: {tornWireReads}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_UnboundStore_ConcurrentWithRegistration_NoLostUpdates()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const int count = 10;
+            var createdVars = new SyncVar<int>[count];
+
+            var taskRegister = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    createdVars[i] = new SyncVar<int>($"toctou_token_{i}", 1, syncVarManager);
+                    await Task.Yield();
+                }
+            });
+
+            var taskDispatch = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var valBuf = new ArrayBufferWriter<byte>();
+                    MessagePackSerializer.Serialize(valBuf, 100 + i);
+
+                    var buffer = new ArrayBufferWriter<byte>();
+                    var writer = new MessagePackWriter(buffer);
+                    writer.WriteArrayHeader(1);
+                    var tokenBytes = System.Text.Encoding.UTF8.GetBytes($"toctou_token_{i}");
+                    writer.WriteUInt8((byte)tokenBytes.Length);
+                    writer.WriteRaw(tokenBytes);
+                    writer.WriteUInt32(2);
+                    writer.WriteInt32(valBuf.WrittenCount);
+                    writer.WriteRaw(valBuf.WrittenSpan);
+                    writer.Flush();
+
+                    var batch = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(buffer.WrittenMemory));
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                        ILiminalTransport.SERVER_ID,
+                        MessagePackSerializer.Serialize(batch));
+
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskRegister, taskDispatch);
+
+            Specification.Assert(syncVarManager.UnboundCacheCount == 0,
+                $"Unbound cache has trapped entries! Count: {syncVarManager.UnboundCacheCount}");
+
+            for (int i = 0; i < count; i++)
+            {
+                Specification.Assert(createdVars[i].Value == 100 + i,
+                    $"SyncVar {i} missed update. Expected {100 + i}, got {createdVars[i].Value}");
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_DynamicPayload_ConcurrentGrowthAndWireReads_ZeroTearing()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            var strVar = new SyncVar<string>("dyn_str_token", "init", syncVarManager);
+
+            const int iterations = 15;
+            int corruptedReads = 0;
+
+            var workerWriter = Task.Run(async () =>
+            {
+                for (int i = 1; i <= iterations; i++)
+                {
+                    string longString = $"iter_{i}_" + new string((char)('A' + (i % 26)), 350);
+                    strVar.Value = longString;
+                    await Task.Yield();
+                }
+            });
+
+            var workerReader = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.FlushDirty();
+
+                    while (transport.SentPackets.Count > 0)
+                    {
+                        var packetRecord = transport.SentPackets[0];
+                        transport.SentPackets.Clear();
+
+                        var batch = MessagePackSerializer.Deserialize<SyncVarSlabBatchPacket>(packetRecord.Data);
+                        if (!batch.Payload.IsEmpty)
+                        {
+                            var reader = new MessagePackReader(batch.Payload);
+                            int count = reader.ReadArrayHeader();
+                            for (int c = 0; c < count; c++)
+                            {
+                                byte tokenLen = reader.ReadByte();
+                                reader.ReadRaw(tokenLen);
+                                uint ver = reader.ReadUInt32();
+                                int len = reader.ReadInt32();
+                                var rawSlice = reader.ReadRaw(len);
+
+                                try
+                                {
+                                    string wireStr = MessagePackSerializer.Deserialize<string>(rawSlice);
+                                    if (string.IsNullOrEmpty(wireStr) || !wireStr.StartsWith("iter_"))
+                                    {
+                                        Interlocked.Increment(ref corruptedReads);
+                                    }
+                                }
+                                catch
+                                {
+                                    Interlocked.Increment(ref corruptedReads);
+                                }
+                            }
+                        }
+                    }
+
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(workerWriter, workerReader);
+
+            Specification.Assert(corruptedReads == 0,
+                $"Corrupted/torn wire reads during dynamic slot reallocation! Count: {corruptedReads}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_TornStruct_ConcurrentReadersAndWriters_ZeroTornReads()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            var syncVar = new SyncVar<CoyoteStatePayload>(
+                "torn_struct_test_token",
+                new CoyoteStatePayload { Iteration = 0, TimestampTicks = 0, Checksum = 0 ^ 0x5A5A5A5A },
+                syncVarManager);
+
+            const int iterations = 20;
+            int tornReadsObserved = 0;
+            int successfulReads = 0;
+
+            var writerTask = Task.Run(async () =>
+            {
+                for (int i = 1; i <= iterations; i++)
+                {
+                    syncVar.Value = new CoyoteStatePayload
+                    {
+                        Iteration = i,
+                        TimestampTicks = i * 1000L,
+                        Checksum = i ^ 0x5A5A5A5A
+                    };
+                    await Task.Yield();
+                }
+            });
+
+            const int readerCount = 3;
+            var readerTasks = new Task[readerCount];
+            for (int r = 0; r < readerCount; r++)
+            {
+                readerTasks[r] = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        var val = syncVar.Value;
+                        if (!val.IsConsistent)
+                        {
+                            Interlocked.Increment(ref tornReadsObserved);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref successfulReads);
+                        }
+                        await Task.Yield();
+                    }
+                });
+            }
+
+            await Task.WhenAll(writerTask, Task.WhenAll(readerTasks));
+
+            Specification.Assert(tornReadsObserved == 0,
+                $"Torn struct reads observed in Value.get! Count: {tornReadsObserved}");
+            Specification.Assert(successfulReads > 0,
+                "No successful reads occurred.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_Registration_ConcurrentAuthUpdate_ZeroAuthStomp()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const string token = "auth_stomp_token";
+
+            // Pre-seed unbound authority with Client 10 (old cached state)
+            netManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarAuthUpdatePacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(new SyncVarAuthUpdatePacket
+                {
+                    Token = token,
+                    AuthIds = new ushort[] { 10 }
+                }));
+
+            SyncVar<int> createdVar = null;
+
+            // Task A: Registers the variable
+            var taskRegister = Task.Run(async () =>
+            {
+                createdVar = new SyncVar<int>(token, 0, syncVarManager);
+                await Task.Yield();
+            });
+
+            // Task B: Sends a newer authority update to Client 20
+            var taskUpdate = Task.Run(async () =>
+            {
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarAuthUpdatePacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    MessagePackSerializer.Serialize(new SyncVarAuthUpdatePacket
+                    {
+                        Token = token,
+                        AuthIds = new ushort[] { 20 }
+                    }));
+                await Task.Yield();
+            });
+
+            await Task.WhenAll(taskRegister, taskUpdate);
+
+            Specification.Assert(createdVar != null, "SyncVar was not initialized.");
+            Specification.Assert(createdVar.AuthIds.Length == 1 && createdVar.AuthIds[0] == 20,
+                $"Auth stomp detected! Expected Client 20, got {(createdVar.AuthIds.Length > 0 ? createdVar.AuthIds[0].ToString() : "empty")}");
+        }
     }
 }

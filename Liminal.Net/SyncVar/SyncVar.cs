@@ -41,6 +41,7 @@ namespace Liminal.Net.SyncVar
         void AllocateSlots(int size);
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
+        bool TryExtractSnapshotData(out byte[] data, out uint version);
         void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options);
     }
 
@@ -52,7 +53,11 @@ namespace Liminal.Net.SyncVar
 
         private readonly object _authLock = new();
         private readonly object _exclusionLock = new();
+        private readonly object _writeLock = new();
         private readonly SyncVarManager _manager;
+
+        [ThreadStatic]
+        private static ArrayBufferWriter<byte> _threadLocalWriter;
 
         private readonly (int PageIndex, int PageOffset)[] _slots = new (int, int)[2];
         private readonly int[] _slotCapacities = new int[2];
@@ -63,7 +68,8 @@ namespace Liminal.Net.SyncVar
         private int _gate = STATE_IDLE;
         private int _isDirty = 0;
 
-        private T _value;
+        private readonly T[] _values = new T[2];
+        private int _valueSeq = 0;
         private uint _version;
         private ushort[] _authIds = Array.Empty<ushort>();
         private ushort[] _exclusionIds = Array.Empty<ushort>();
@@ -106,7 +112,32 @@ namespace Liminal.Net.SyncVar
 
         public T Value
         {
-            get => _value;
+            get
+            {
+                var spinner = new SpinWait();
+                while (true)
+                {
+                    int seq1 = Volatile.Read(ref _valueSeq);
+                    if ((seq1 & 1) != 0)
+                    {
+                        spinner.SpinOnce();
+                        continue;
+                    }
+
+                    int front = Volatile.Read(ref _frontIndex);
+                    T val = _values[front];
+
+                    Thread.MemoryBarrier();
+
+                    int seq2 = Volatile.Read(ref _valueSeq);
+                    if (seq1 == seq2)
+                    {
+                        return val;
+                    }
+
+                    spinner.SpinOnce();
+                }
+            }
             set
             {
                 if (!HasAuthority)
@@ -130,7 +161,8 @@ namespace Liminal.Net.SyncVar
                 throw new ArgumentException($"[SyncVar] Token '{token}' UTF-8 length exceeds 255 bytes.");
             }
 
-            _value = initialValue;
+            _values[0] = initialValue;
+            _values[1] = initialValue;
             _manager = manager ?? SyncVarManager.GetManagerForRegistration();
             _manager.RegisterSyncVar(this);
         }
@@ -145,7 +177,7 @@ namespace Liminal.Net.SyncVar
                 return;
             }
 
-            WriteFromOwningThread(_value, force: true);
+            WriteFromOwningThread(Value, force: true);
         }
 
         public bool TryMarkDirty()
@@ -448,46 +480,66 @@ namespace Liminal.Net.SyncVar
 
         private void WriteFromOwningThread(T newValue, bool force = false)
         {
-            if (!force && EqualityComparer<T>.Default.Equals(_value, newValue)) return;
+            if (!force && EqualityComparer<T>.Default.Equals(Value, newValue)) return;
 
-            int backIndex = 1 - Volatile.Read(ref _frontIndex);
-            var (page, offset) = _slots[backIndex];
+            T old;
+            bool shouldFireChanged = false;
 
-            var writer = FixedBufferWriter.ThreadInstance;
-            byte[] pageArray = _manager.Slab.GetPage(page);
-            writer.Reset(pageArray, offset, _slotCapacities[backIndex]);
-            MessagePackSerializer.Serialize(writer, newValue, _manager.SerializerOptions);
-
-            int writtenLength = writer.WrittenCount;
-            uint newVersion = _version + 1;
-
-            _slotLengths[backIndex] = writtenLength;
-            _slotVersions[backIndex] = newVersion;
-            T old = _value;
-            _value = newValue;
-            Volatile.Write(ref _version, newVersion);
-
-            var spinner = new SpinWait();
-            while (Interlocked.CompareExchange(ref _gate, STATE_SWAPPING, STATE_IDLE) != STATE_IDLE)
+            lock (_writeLock)
             {
-                spinner.SpinOnce();
+                int currentFront = Volatile.Read(ref _frontIndex);
+                if (!force && EqualityComparer<T>.Default.Equals(_values[currentFront], newValue)) return;
+
+                int backIndex = 1 - currentFront;
+
+                _threadLocalWriter ??= new ArrayBufferWriter<byte>(256);
+                _threadLocalWriter.Clear();
+                MessagePackSerializer.Serialize(_threadLocalWriter, newValue, _manager.SerializerOptions);
+
+                int writtenLength = _threadLocalWriter.WrittenCount;
+                if (writtenLength > _slotCapacities[backIndex])
+                {
+                    int newCapacity = Math.Max(writtenLength + 128, _slotCapacities[backIndex] * 2);
+                    _slots[backIndex] = _manager.Slab.AllocateSlot(newCapacity);
+                    _slotCapacities[backIndex] = newCapacity;
+                }
+
+                var (page, offset) = _slots[backIndex];
+                _threadLocalWriter.WrittenSpan.CopyTo(_manager.Slab.GetSpan(page, offset, writtenLength));
+
+                uint newVersion = _version + 1;
+                _slotLengths[backIndex] = writtenLength;
+                _slotVersions[backIndex] = newVersion;
+                old = _values[currentFront];
+                _values[backIndex] = newValue;
+                Volatile.Write(ref _version, newVersion);
+
+                var spinner = new SpinWait();
+                while (Interlocked.CompareExchange(ref _gate, STATE_SWAPPING, STATE_IDLE) != STATE_IDLE)
+                {
+                    spinner.SpinOnce();
+                }
+
+                try
+                {
+                    Interlocked.Increment(ref _valueSeq);
+                    Volatile.Write(ref _frontIndex, backIndex);
+                    Interlocked.Increment(ref _valueSeq);
+                }
+                finally
+                {
+                    Volatile.Write(ref _gate, STATE_IDLE);
+                }
+
+                if (TryMarkDirty())
+                {
+                    _manager?.EnqueueDirty(this);
+                }
+
+                shouldFireChanged = force || !EqualityComparer<T>.Default.Equals(old, newValue);
             }
 
-            try
-            {
-                Volatile.Write(ref _frontIndex, backIndex);
-            }
-            finally
-            {
-                Volatile.Write(ref _gate, STATE_IDLE);
-            }
-
-            if (TryMarkDirty())
-            {
-                _manager?.EnqueueDirty(this);
-            }
-
-            if (force || !EqualityComparer<T>.Default.Equals(old, newValue))
+            if (shouldFireChanged)
             {
                 OnValueChanged?.Invoke(old, newValue);
             }
@@ -522,30 +574,86 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        public bool TryExtractSnapshotData(out byte[] data, out uint version)
+        {
+            var spinner = new SpinWait();
+            while (Interlocked.CompareExchange(ref _gate, STATE_READING, STATE_IDLE) != STATE_IDLE)
+            {
+                spinner.SpinOnce();
+            }
+
+            try
+            {
+                int front = Volatile.Read(ref _frontIndex);
+                var (page, offset) = _slots[front];
+                int length = _slotLengths[front];
+                version = _slotVersions[front];
+
+                data = _manager.Slab.GetSpan(page, offset, length).ToArray();
+                return true;
+            }
+            finally
+            {
+                Volatile.Write(ref _gate, STATE_IDLE);
+            }
+        }
+
         public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options)
         {
             if (newVersion <= _version && _version != 0) return;
 
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
+            T old;
 
-            T old = _value;
-            _value = deserialized;
-            Volatile.Write(ref _version, newVersion);
+            lock (_writeLock)
+            {
+                if (newVersion <= _version && _version != 0) return;
 
-            int front = Volatile.Read(ref _frontIndex);
-            var (page, offset) = _slots[front];
+                int currentFront = Volatile.Read(ref _frontIndex);
+                int backIndex = 1 - currentFront;
+                int length = (int)incomingBytes.Length;
 
-            int length = (int)incomingBytes.Length;
-            incomingBytes.CopyTo(_manager.Slab.GetSpan(page, offset, length));
-            _slotLengths[front] = length;
-            _slotVersions[front] = newVersion;
+                if (length > _slotCapacities[backIndex])
+                {
+                    int newCapacity = Math.Max(length + 128, _slotCapacities[backIndex] * 2);
+                    _slots[backIndex] = _manager.Slab.AllocateSlot(newCapacity);
+                    _slotCapacities[backIndex] = newCapacity;
+                }
+
+                var (page, offset) = _slots[backIndex];
+                incomingBytes.CopyTo(_manager.Slab.GetSpan(page, offset, length));
+                _slotLengths[backIndex] = length;
+                _slotVersions[backIndex] = newVersion;
+
+                old = _values[currentFront];
+                _values[backIndex] = deserialized;
+                Volatile.Write(ref _version, newVersion);
+
+                var spinner = new SpinWait();
+                while (Interlocked.CompareExchange(ref _gate, STATE_SWAPPING, STATE_IDLE) != STATE_IDLE)
+                {
+                    spinner.SpinOnce();
+                }
+
+                try
+                {
+                    Interlocked.Increment(ref _valueSeq);
+                    Volatile.Write(ref _frontIndex, backIndex);
+                    Interlocked.Increment(ref _valueSeq);
+                }
+                finally
+                {
+                    Volatile.Write(ref _gate, STATE_IDLE);
+                }
+
+            }
 
             OnValueChanged?.Invoke(old, deserialized);
         }
 
         public void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options)
         {
-            MessagePackSerializer.Serialize(writer, _value, options);
+            MessagePackSerializer.Serialize(writer, Value, options);
         }
 
         public void Unregister()
