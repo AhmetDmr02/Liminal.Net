@@ -899,6 +899,87 @@ namespace Liminal.Net.Tests
             server.Shutdown();
         }
 
+        [Test]
+        public void Test32_StartHost_WithWildcardIpv4_StartsAndConnectsLocalClientSuccessfully()
+        {
+            bool started = _serverManager.StartHost("0.0.0.0", _currentTestPort);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.LifecycleState == NetworkLifecycleState.HostActive, 3000), Is.True);
+            Assert.That(_serverManager.IsConnected, Is.True);
+            Assert.That(_serverManager.IsServer, Is.True);
+            Assert.That(_serverManager.IsClient, Is.True);
+
+            // Verify a separate client can also connect to it
+            var client = CreateAndStartClient();
+            Assert.That(client.IsConnected, Is.True);
+        }
+
+        [Test]
+        public void Test33_StartClient_WithWildcardIpv4_NormalizesToLoopbackAndConnects()
+        {
+            int port = Interlocked.Increment(ref _portCounter);
+            _serverManager.StartServer("0.0.0.0", port);
+
+            var clientConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "0.0.0.0",
+                Default_Port = port,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(client);
+
+            bool started = client.StartClient("0.0.0.0", port);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+        }
+
+        [Test]
+        public void Test34_StartHost_WithWildcardIpv6_StartsAndConnectsLocalClientSuccessfully()
+        {
+            if (!System.Net.Sockets.Socket.OSSupportsIPv6)
+                Assert.Ignore("IPv6 is not supported on this OS.");
+
+            int port = Interlocked.Increment(ref _portCounter);
+            bool started = _serverManager.StartHost("::", port);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.LifecycleState == NetworkLifecycleState.HostActive, 3000), Is.True);
+            Assert.That(_serverManager.IsConnected, Is.True);
+        }
+
+        [Test]
+        public void Test35_StartClient_WithWildcardIpv6_NormalizesToLoopbackAndConnects()
+        {
+            if (!System.Net.Sockets.Socket.OSSupportsIPv6)
+                Assert.Ignore("IPv6 is not supported on this OS.");
+
+            int port = Interlocked.Increment(ref _portCounter);
+            _serverManager.StartServer("::", port);
+
+            var clientConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "::",
+                Default_Port = port,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver(),
+                ConnectionTimeout = 15,
+                HandshakeTimeout = 15
+            };
+
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
+            _clientManagers.Add(client);
+
+            bool started = client.StartClient("::", port);
+            Assert.That(started, Is.True);
+            Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+        }
+
         #endregion
     }
 }

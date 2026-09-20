@@ -392,15 +392,37 @@ namespace Liminal.Net.Core
 
             LiminalLogger.Log("[Manager] Starting Host Mode...");
 
+            string serverBindHost = host;
+            string clientConnectHost = host;
+
+            if (string.IsNullOrWhiteSpace(host) || host == "0.0.0.0" || host == "::" || host == "::0")
+            {
+                serverBindHost = host;
+                clientConnectHost = (host == "::" || host == "::0") ? "::1" : "127.0.0.1";
+            }
+            else if (System.Net.IPAddress.TryParse(host, out var parsedAddr))
+            {
+                if (parsedAddr.Equals(System.Net.IPAddress.Any))
+                {
+                    serverBindHost = host;
+                    clientConnectHost = "127.0.0.1";
+                }
+                else if (parsedAddr.Equals(System.Net.IPAddress.IPv6Any))
+                {
+                    serverBindHost = host;
+                    clientConnectHost = "::1";
+                }
+            }
+
             try
             {
-                _transport.StartServer(host, port);
-                _transport.StartClient(host, port);
+                _transport.StartServer(serverBindHost, port);
+                _transport.StartClient(clientConnectHost, port);
 
                 _ticker.OnTick += HostTick;
                 _ticker.Start();
 
-                LiminalLogger.Log($"[Manager] Host running on {host}:{port} local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+                LiminalLogger.Log($"[Manager] Host running on {serverBindHost}:{port} (client connected via {clientConnectHost}) local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
                 return true;
             }
             catch (Exception ex)

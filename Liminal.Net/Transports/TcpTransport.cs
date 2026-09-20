@@ -175,7 +175,13 @@ namespace Liminal.Net.Transports
                 _listener = null;
             }
 
-            if (string.IsNullOrEmpty(ip) || ip == "0.0.0.0")
+            bool isWildcard = string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0" || ip == "::" || ip == "::0";
+            if (!isWildcard && IPAddress.TryParse(ip, out var parsedBind))
+            {
+                isWildcard = parsedBind.Equals(IPAddress.Any) || parsedBind.Equals(IPAddress.IPv6Any);
+            }
+
+            if (isWildcard)
             {
                 _listener = Socket.OSSupportsIPv6 ? TcpListener.Create(port) : new TcpListener(IPAddress.Any, port);
             }
@@ -217,8 +223,25 @@ namespace Liminal.Net.Transports
                 _clientConnectCts?.Dispose();
                 _clientConnectCts = new CancellationTokenSource();
 
+                string targetIp = ip;
+                if (string.IsNullOrWhiteSpace(targetIp) || targetIp == "0.0.0.0")
+                {
+                    targetIp = "127.0.0.1";
+                }
+                else if (targetIp == "::" || targetIp == "::0")
+                {
+                    targetIp = "::1";
+                }
+                else if (IPAddress.TryParse(targetIp, out var parsedTarget))
+                {
+                    if (parsedTarget.Equals(IPAddress.Any))
+                        targetIp = "127.0.0.1";
+                    else if (parsedTarget.Equals(IPAddress.IPv6Any))
+                        targetIp = "::1";
+                }
+
                 TcpClient client;
-                if (IPAddress.TryParse(ip, out var addr) && addr.AddressFamily == AddressFamily.InterNetworkV6)
+                if (IPAddress.TryParse(targetIp, out var addr) && addr.AddressFamily == AddressFamily.InterNetworkV6)
                 {
                     client = new TcpClient(AddressFamily.InterNetworkV6);
                 }
@@ -231,7 +254,7 @@ namespace Liminal.Net.Transports
                 _isClient = true;
 
                 var token = _clientConnectCts.Token;
-                _ = Task.Run(() => TryToConnectAsync(client, (ip, port), token), token);
+                _ = Task.Run(() => TryToConnectAsync(client, (targetIp, port), token), token);
             }
             catch (Exception ex)
             {
