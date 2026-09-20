@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using MessagePack;
 using System;
@@ -10,8 +10,8 @@ namespace Liminal.Net.SyncVar
 {
     public interface ISyncVarInternal
     {
-        ushort Id { get; set; }
         string Token { get; }
+        byte[] TokenBytes { get; }
         uint Version { get; }
         int ActivePageIndex { get; }
         int ActivePageOffset { get; }
@@ -34,6 +34,9 @@ namespace Liminal.Net.SyncVar
         void RemoveExclusion(ushort clientId);
 
         void SetDirty();
+        bool TryMarkDirty();
+        void ClearDirty();
+        bool IsDirty { get; }
 
         void AllocateSlots(int size);
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
@@ -58,16 +61,18 @@ namespace Liminal.Net.SyncVar
 
         private int _frontIndex = 0;
         private int _gate = STATE_IDLE;
+        private int _isDirty = 0;
 
         private T _value;
         private uint _version;
         private ushort[] _authIds = Array.Empty<ushort>();
         private ushort[] _exclusionIds = Array.Empty<ushort>();
+        private readonly byte[] _tokenBytes;
 
         public event Action<bool> OnAuthorityChanged;
 
-        public ushort Id { get; set; }
         public string Token { get; }
+        public byte[] TokenBytes => _tokenBytes;
         public uint Version => Volatile.Read(ref _version);
         public int ActivePageIndex => _slots[Volatile.Read(ref _frontIndex)].PageIndex;
         public int ActivePageOffset => _slots[Volatile.Read(ref _frontIndex)].PageOffset;
@@ -75,6 +80,7 @@ namespace Liminal.Net.SyncVar
         public ushort[] AuthIds => Volatile.Read(ref _authIds);
         public ushort[] ExclusionIds => Volatile.Read(ref _exclusionIds);
         public SyncVarManager Manager => _manager;
+        public bool IsDirty => Volatile.Read(ref _isDirty) != 0;
 
         public event Action<T, T> OnValueChanged;
 
@@ -118,8 +124,13 @@ namespace Liminal.Net.SyncVar
         public SyncVar(string token, T initialValue = default, SyncVarManager manager = null)
         {
             Token = token ?? throw new ArgumentNullException(nameof(token));
-            _value = initialValue;
+            _tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+            if (_tokenBytes.Length > 255)
+            {
+                throw new ArgumentException($"[SyncVar] Token '{token}' UTF-8 length exceeds 255 bytes.");
+            }
 
+            _value = initialValue;
             _manager = manager ?? SyncVarManager.GetManagerForRegistration();
             _manager.RegisterSyncVar(this);
         }
@@ -135,6 +146,16 @@ namespace Liminal.Net.SyncVar
             }
 
             WriteFromOwningThread(_value, force: true);
+        }
+
+        public bool TryMarkDirty()
+        {
+            return Interlocked.Exchange(ref _isDirty, 1) == 0;
+        }
+
+        public void ClearDirty()
+        {
+            Volatile.Write(ref _isDirty, 0);
         }
 
         #region Authority Management
@@ -271,7 +292,7 @@ namespace Liminal.Net.SyncVar
             var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
             if (netManager != null && (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
             {
-                _manager.BroadcastAuthChange(Id, newAuthIds);
+                _manager.BroadcastAuthChange(Token, newAuthIds);
             }
         }
 
@@ -461,7 +482,10 @@ namespace Liminal.Net.SyncVar
                 Volatile.Write(ref _gate, STATE_IDLE);
             }
 
-            _manager?.DirtyBitset.SetDirty(Id);
+            if (TryMarkDirty())
+            {
+                _manager?.EnqueueDirty(this);
+            }
 
             if (force || !EqualityComparer<T>.Default.Equals(old, newValue))
             {
@@ -485,7 +509,8 @@ namespace Liminal.Net.SyncVar
                 version = _slotVersions[front];
 
                 var span = _manager.Slab.GetSpan(page, offset, length);
-                writer.WriteUInt16(Id);
+                writer.WriteUInt8((byte)_tokenBytes.Length);
+                writer.WriteRaw(_tokenBytes);
                 writer.WriteUInt32(version);
                 writer.WriteInt32(length);
                 writer.WriteRaw(span);

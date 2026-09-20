@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers;
 using System.Collections.Generic;
 using MessagePack;
@@ -7,26 +7,22 @@ using Liminal.Net.Core;
 
 namespace Liminal.Net.SyncVar
 {
-    #region Handshake Packets
+    #region Snapshot Packets
 
     [MessagePackObject]
-    public struct SyncVarDescriptor
+    public struct SyncVarSnapshotEntry
     {
-        [Key(0)] public ushort Id;
-        [Key(1)] public string Token;
+        [Key(0)] public string Token;
+        [Key(1)] public uint Version;
         [Key(2)] public ushort[] AuthIds;
-        [Key(3)] public int PageIndex;
-        [Key(4)] public int PageOffset;
-        [Key(5)] public int Length;
-        [Key(6)] public uint Version;
+        [Key(3)] public byte[] Data;
     }
 
     [MessagePackObject]
     [LiminalPacket]
-    public struct SyncVarSlabInitPacket
+    public struct SyncVarSnapshotPacket
     {
-        [Key(0)] public List<SyncVarDescriptor> Descriptors;
-        [Key(1)] public byte[] RawSlab;
+        [Key(0)] public List<SyncVarSnapshotEntry> Entries;
     }
 
     #endregion
@@ -113,7 +109,7 @@ namespace Liminal.Net.SyncVar
     [LiminalPacket]
     public struct SyncVarAuthUpdatePacket
     {
-        [Key(0)] public ushort VarId;
+        [Key(0)] public string Token;
         [Key(1)] public ushort[] AuthIds;
     }
 

@@ -49,13 +49,13 @@ namespace Liminal.Net.Tests
             var syncVar = syncVarManager.Bind<int>("test_counter", 100);
             syncVar.Value = 200;
 
-            Assert.That(syncVarManager.DirtyBitset.IsDirty(syncVar.Id), Is.True, "SyncVar should be dirty after value mutation.");
+            Assert.That(syncVar.IsDirty, Is.True, "SyncVar should be dirty after value mutation.");
 
             // Attempt to flush dirty while client is not connected
             syncVarManager.FlushDirty();
 
             // The dirty bit MUST NOT be consumed/lost!
-            Assert.That(syncVarManager.DirtyBitset.IsDirty(syncVar.Id), Is.True, "Dirty bit must be preserved when FlushDirty is called while CanSend is false.");
+            Assert.That(syncVar.IsDirty, Is.True, "Dirty bit must be preserved when FlushDirty is called while CanSend is false.");
         }
 
         [Test]

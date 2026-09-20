@@ -1,4 +1,4 @@
-﻿using Liminal.Net.BasePackets;
+using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
@@ -267,12 +267,14 @@ namespace Liminal.Net.Tests.Coyote
             var serverVar = new SyncVar<int>("token_pipeline", 100, syncVarManager);
             serverVar.AddAuthority(authorizedClientId);
 
-            byte[] BuildRequestPayload(ushort varId, uint version, int value)
+            byte[] BuildRequestPayload(string token, uint version, int value)
             {
+                var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
                 var buffer = new ArrayBufferWriter<byte>(128);
                 var writer = new MessagePackWriter(buffer);
                 writer.WriteArrayHeader(1);
-                writer.WriteUInt16(varId);
+                writer.WriteUInt8((byte)tokenBytes.Length);
+                writer.WriteRaw(tokenBytes);
                 writer.WriteUInt32(version);
 
                 var valBuffer = new ArrayBufferWriter<byte>(32);
@@ -296,7 +298,7 @@ namespace Liminal.Net.Tests.Coyote
             {
                 for (int i = 1; i <= iterations; i++)
                 {
-                    byte[] payload = BuildRequestPayload(serverVar.Id, (uint)i, 200 + i);
+                    byte[] payload = BuildRequestPayload(serverVar.Token, (uint)i, 200 + i);
                     var packet = new SyncVarSlabClientRequestPacket(new ReadOnlySequence<byte>(payload));
 
                     netManager.Interpreter.Dispatch(
@@ -324,6 +326,92 @@ namespace Liminal.Net.Tests.Coyote
                 $"Pipeline mismatch. Expected {200 + iterations}, got {lastSeenValue}.");
             Specification.Assert(serverVar.Version >= (uint)iterations,
                 $"SyncVar version mismatch. Version {serverVar.Version} < {iterations}.");
+        }
+
+        [Test]
+        public static async Task Coyote_Utf8TokenRegistry_ConcurrentReadersAndWriters_NoRaceOrDeadlock()
+        {
+            var registry = new Utf8TokenRegistry(8); 
+
+            const int preSeedCount = 10;
+            for (int i = 0; i < preSeedCount; i++)
+            {
+                registry.TryAdd(new SyncVar<int>($"seed_token_{i}", i));
+            }
+
+            const int workerIterations = 15;
+            int successfulReads = 0;
+            int failedReads = 0;
+
+            var reader1 = Task.Run(async () =>
+            {
+                byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("seed_token_5");
+                byte[] nonExistent = System.Text.Encoding.UTF8.GetBytes("missing_token");
+
+                for (int i = 0; i < workerIterations; i++)
+                {
+                    if (registry.TryGet(targetBytes.AsSpan(), out var syncVar))
+                    {
+                        Interlocked.Increment(ref successfulReads);
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref failedReads);
+                    }
+
+                    _ = registry.TryGet(nonExistent.AsSpan(), out _);
+                    await Task.Yield();
+                }
+            });
+
+            var reader2 = Task.Run(async () =>
+            {
+                byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("seed_token_2");
+
+                for (int i = 0; i < workerIterations; i++)
+                {
+                    if (registry.TryGet(targetBytes.AsSpan(), out var syncVar))
+                    {
+                        Interlocked.Increment(ref successfulReads);
+                    }
+                    else
+                    {
+                        Interlocked.Increment(ref failedReads);
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            // Writer 1: Adds new tokens and removes some, forcing resizes
+            var writer1 = Task.Run(async () =>
+            {
+                for (int i = 0; i < workerIterations; i++)
+                {
+                    registry.TryAdd(new SyncVar<int>($"w1_token_{i}", i));
+                    if (i > 3)
+                    {
+                        registry.TryRemove($"w1_token_{i - 3}", out _);
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            // Writer 2: Adds different new tokens
+            var writer2 = Task.Run(async () =>
+            {
+                for (int i = 0; i < workerIterations; i++)
+                {
+                    registry.TryAdd(new SyncVar<int>($"w2_token_{i}", i));
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(reader1, reader2, writer1, writer2);
+
+            Specification.Assert(failedReads == 0,
+                $"Pre-seeded token was not found during concurrent operations. Failed reads: {failedReads}");
+            Specification.Assert(successfulReads == workerIterations * 2,
+                $"Expected {workerIterations * 2} successful reads, got {successfulReads}");
         }
     }
 }

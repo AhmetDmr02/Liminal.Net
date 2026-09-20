@@ -6,6 +6,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace Liminal.Net.SyncVar
 {
@@ -42,15 +43,15 @@ namespace Liminal.Net.SyncVar
             return _lastCreatedManager;
         }
 
-        private readonly ConcurrentDictionary<string, ISyncVarInternal> _tokenRegistry = new();
-        private readonly ConcurrentDictionary<ushort, ISyncVarInternal> _idRegistry = new();
-        private readonly ConcurrentDictionary<string, SyncVarDescriptor> _receivedDescriptors = new();
+        private readonly Utf8TokenRegistry _tokenRegistry = new();
+        private readonly ConcurrentDictionary<string, (uint Version, byte[] Data)> _unboundCache = new();
+        private readonly ConcurrentDictionary<string, ushort[]> _unboundAuth = new();
+        private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
 
         public SyncVarSlab Slab { get; private set; }
         public LockFreeDirtyBitset DirtyBitset { get; } = new();
 
-        private ushort _nextIdCounter = 1;
         private LiminalNetworkManager _attachedManager;
         public LiminalNetworkManager AttachedManager => _attachedManager;
         private int _totalAllocatedBytes;
@@ -74,7 +75,7 @@ namespace Liminal.Net.SyncVar
 
             _attachedManager = manager;
 
-            _attachedManager.Interpreter.Subscribe<SyncVarSlabInitPacket>(HandleInitialSlabSync, this);
+            _attachedManager.Interpreter.Subscribe<SyncVarSnapshotPacket>(HandleSnapshot, this);
             _attachedManager.Interpreter.Subscribe<SyncVarSlabBatchPacket>(HandleBatchDelta, this);
             _attachedManager.Interpreter.Subscribe<SyncVarSlabClientRequestPacket>(HandleClientRequest, this);
             _attachedManager.Interpreter.Subscribe<SyncVarAuthUpdatePacket>(HandleAuthUpdate, this);
@@ -106,9 +107,14 @@ namespace Liminal.Net.SyncVar
 
         public void RegisterSyncVar(ISyncVarInternal syncVar)
         {
-            syncVar.Id = _nextIdCounter++;
-            _tokenRegistry[syncVar.Token] = syncVar;
-            _idRegistry[syncVar.Id] = syncVar;
+            if (syncVar == null) throw new ArgumentNullException(nameof(syncVar));
+
+            _tokenRegistry.TryAdd(syncVar);
+
+            if (_unboundAuth.TryRemove(syncVar.Token, out var authIds))
+            {
+                syncVar.ApplyAuthUpdateFromRemote(authIds);
+            }
 
             var writer = new ArrayBufferWriter<byte>(128);
             syncVar.SerializeInitial(writer, SerializerOptions);
@@ -119,86 +125,84 @@ namespace Liminal.Net.SyncVar
 
             writer.WrittenSpan.CopyTo(Slab.GetSpan(syncVar.ActivePageIndex, syncVar.ActivePageOffset, size));
 
+            if (_unboundCache.TryRemove(syncVar.Token, out var cached))
+            {
+                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(cached.Data), cached.Version, SerializerOptions);
+            }
+
             if (_attachedManager != null && _attachedManager.Role != NetworkRole.Client && _attachedManager.Role != NetworkRole.None)
             {
-                DirtyBitset.SetDirty(syncVar.Id);
+                if (syncVar.TryMarkDirty())
+                {
+                    EnqueueDirty(syncVar);
+                }
             }
         }
 
         public SyncVar<T> Bind<T>(string token, T defaultValue = default)
         {
-            if (_tokenRegistry.TryGetValue(token, out var existing))
+            if (_tokenRegistry.TryGet(token, out var existing))
             {
                 return (SyncVar<T>)existing;
             }
 
-            var newVar = new SyncVar<T>(token, defaultValue, this);
-
-            if (_receivedDescriptors.TryGetValue(token, out var desc))
-            {
-                _idRegistry.TryRemove(newVar.Id, out _);
-                newVar.Id = desc.Id;
-                newVar.ApplyAuthUpdateFromRemote(desc.AuthIds);
-                _idRegistry[desc.Id] = newVar;
-
-                var memorySeq = new ReadOnlySequence<byte>(Slab.GetPage(desc.PageIndex), desc.PageOffset, desc.Length);
-                newVar.ApplyRemoteBytes(memorySeq, desc.Version, SerializerOptions);
-            }
-
-            return newVar;
+            return new SyncVar<T>(token, defaultValue, this);
         }
 
-        public bool TryGetSyncVar(ushort id, out ISyncVarInternal syncVar)
+        public bool TryGetSyncVar(ReadOnlySpan<byte> tokenSpan, out ISyncVarInternal syncVar)
         {
-            return _idRegistry.TryGetValue(id, out syncVar);
+            return _tokenRegistry.TryGet(tokenSpan, out syncVar);
         }
 
-        internal void BroadcastAuthChange(ushort varId, ushort[] newAuthIds)
+        public bool TryGetSyncVar(string token, out ISyncVarInternal syncVar)
+        {
+            return _tokenRegistry.TryGet(token, out syncVar);
+        }
+
+        public void EnqueueDirty(ISyncVarInternal syncVar)
+        {
+            if (syncVar == null) return;
+            _dirtyQueue.Enqueue(syncVar);
+        }
+
+        internal void BroadcastAuthChange(string token, ushort[] newAuthIds)
         {
             if (_attachedManager == null || _attachedManager.Role == NetworkRole.Client || !_attachedManager.CanSend)
                 return;
 
             SendViaManager(SendTo.Everyone, new SyncVarAuthUpdatePacket
             {
-                VarId = varId,
+                Token = token,
                 AuthIds = newAuthIds
             });
         }
 
         private readonly ArrayBufferWriter<byte> _sharedFlushWriter = new(4096);
         private readonly ArrayBufferWriter<byte> _tailoredFlushWriter = new(2048);
+        private int _isFlushing = 0;
+
         public void FlushDirty()
         {
             if (_attachedManager == null || !_attachedManager.CanSend)
                 return;
 
-            _reusableDirtyList.Clear();
+            if (Interlocked.CompareExchange(ref _isFlushing, 1, 0) != 0)
+                return;
 
-            for (int bucket = 0; bucket < 64; bucket++)
+            try
             {
-                if (!DirtyBitset.TryConsumeBucket(bucket, out long mask))
-                    continue;
-
-                ulong umask = (ulong)mask;
-                while (umask != 0)
+                _reusableDirtyList.Clear();
+                while (_dirtyQueue.TryDequeue(out var syncVar))
                 {
-                    int bitPos = BitOperationsCompat.TrailingZeroCount(umask);
-                    ushort id = (ushort)((bucket << 6) + bitPos);
-
-                    if (_idRegistry.TryGetValue(id, out var syncVar))
-                    {
-                        _reusableDirtyList.Add(syncVar);
-                    }
-
-                    umask &= umask - 1;
+                    syncVar.ClearDirty();
+                    _reusableDirtyList.Add(syncVar);
                 }
-            }
 
-            if (_reusableDirtyList.Count == 0) return;
+                if (_reusableDirtyList.Count == 0) return;
 
             if (_attachedManager.Role == NetworkRole.Client)
             {
-                _sharedFlushWriter.Clear(); 
+                _sharedFlushWriter.Clear();
                 var writer = new MessagePackWriter(_sharedFlushWriter);
                 writer.WriteArrayHeader(_reusableDirtyList.Count);
 
@@ -207,7 +211,8 @@ namespace Liminal.Net.SyncVar
                     var syncVar = _reusableDirtyList[i];
                     if (!syncVar.TryWriteSlotForWire(ref writer, out _))
                     {
-                        DirtyBitset.SetDirty(syncVar.Id);
+                        if (syncVar.TryMarkDirty())
+                            _dirtyQueue.Enqueue(syncVar);
                     }
                 }
 
@@ -217,6 +222,7 @@ namespace Liminal.Net.SyncVar
                 return;
             }
 
+            // Server / Host Flush
             _sharedFlushWriter.Clear();
             var masterWriter = new MessagePackWriter(_sharedFlushWriter);
             masterWriter.WriteArrayHeader(_reusableDirtyList.Count);
@@ -232,7 +238,8 @@ namespace Liminal.Net.SyncVar
 
                 if (!syncVar.TryWriteSlotForWire(ref masterWriter, out _))
                 {
-                    DirtyBitset.SetDirty(syncVar.Id);
+                    if (syncVar.TryMarkDirty())
+                        _dirtyQueue.Enqueue(syncVar);
                 }
             }
 
@@ -283,7 +290,7 @@ namespace Liminal.Net.SyncVar
 
                     if (allowedCount == 0) continue;
 
-                    _tailoredFlushWriter.Clear(); 
+                    _tailoredFlushWriter.Clear();
                     var tailoredWriter = new MessagePackWriter(_tailoredFlushWriter);
                     tailoredWriter.WriteArrayHeader(allowedCount);
 
@@ -319,6 +326,11 @@ namespace Liminal.Net.SyncVar
                 }
             }
         }
+        finally
+        {
+            Volatile.Write(ref _isFlushing, 0);
+        }
+    }
 
         private void SendViaManager<T>(SendTo target, T packet) where T : struct
         {
@@ -372,15 +384,23 @@ namespace Liminal.Net.SyncVar
 
             for (int i = 0; i < count; i++)
             {
-                ushort id = reader.ReadUInt16();
+                byte tokenLen = reader.ReadByte();
+                var tokenRaw = reader.ReadRaw(tokenLen);
+                ReadOnlySpan<byte> tokenSpan = tokenRaw.IsSingleSegment ? tokenRaw.FirstSpan : tokenRaw.ToArray();
+
                 uint version = reader.ReadUInt32();
                 int length = reader.ReadInt32();
                 var rawSlice = reader.ReadRaw(length);
 
-                if (TryGetSyncVar(id, out var syncVar))
+                if (TryGetSyncVar(tokenSpan, out var syncVar))
                 {
-                    ReadOnlySpan<byte> span = rawSlice.IsSingleSegment ? rawSlice.FirstSpan : rawSlice.ToArray();
                     syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions);
+                }
+                else
+                {
+                    string token = System.Text.Encoding.UTF8.GetString(tokenSpan);
+                    byte[] data = rawSlice.ToArray();
+                    _unboundCache[token] = (version, data);
                 }
             }
         }
@@ -394,30 +414,44 @@ namespace Liminal.Net.SyncVar
 
             for (int i = 0; i < count; i++)
             {
-                ushort id = reader.ReadUInt16();
+                byte tokenLen = reader.ReadByte();
+                var tokenRaw = reader.ReadRaw(tokenLen);
+                ReadOnlySpan<byte> tokenSpan = tokenRaw.IsSingleSegment ? tokenRaw.FirstSpan : tokenRaw.ToArray();
+
                 uint version = reader.ReadUInt32();
                 int length = reader.ReadInt32();
                 var rawSlice = reader.ReadRaw(length);
 
-                if (!TryGetSyncVar(id, out var syncVar)) continue;
-
-                if (!syncVar.IsAuthorized(senderId))
+                if (!TryGetSyncVar(tokenSpan, out var syncVar))
                 {
-                    LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify Var #{id}. Dropped.");
+                    string token = System.Text.Encoding.UTF8.GetString(tokenSpan);
+                    LiminalLogger.LogError($"[SyncVarManager] Client {senderId} attempted to write to non-existent SyncVar '{token}'. Dropped.");
                     continue;
                 }
 
-                ReadOnlySpan<byte> span = rawSlice.IsSingleSegment ? rawSlice.FirstSpan : rawSlice.ToArray();
+                if (!syncVar.IsAuthorized(senderId))
+                {
+                    LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify Var '{syncVar.Token}'. Dropped.");
+                    continue;
+                }
+
                 syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions);
-                DirtyBitset.SetDirty(syncVar.Id);
+                if (syncVar.TryMarkDirty())
+                {
+                    EnqueueDirty(syncVar);
+                }
             }
         }
 
         private void HandleAuthUpdate(SyncVarAuthUpdatePacket packet, ushort senderId)
         {
-            if (TryGetSyncVar(packet.VarId, out var syncVar))
+            if (TryGetSyncVar(packet.Token, out var syncVar))
             {
                 syncVar.ApplyAuthUpdateFromRemote(packet.AuthIds);
+            }
+            else
+            {
+                _unboundAuth[packet.Token] = packet.AuthIds;
             }
         }
 
@@ -425,51 +459,60 @@ namespace Liminal.Net.SyncVar
         {
             if (_attachedManager == null || _attachedManager.Role == NetworkRole.Client) return;
 
-            var descriptors = new List<SyncVarDescriptor>(_tokenRegistry.Count);
-            foreach (var kvp in _tokenRegistry)
-            {
-                if (kvp.Value.IsExcluded(clientId))
-                {
-                    continue;
-                }
+            var allVars = new List<ISyncVarInternal>();
+            _tokenRegistry.GetAll(allVars);
 
-                descriptors.Add(new SyncVarDescriptor
+            var entries = new List<SyncVarSnapshotEntry>(allVars.Count);
+            for (int i = 0; i < allVars.Count; i++)
+            {
+                var syncVar = allVars[i];
+                if (syncVar.IsExcluded(clientId)) continue;
+
+                int page = syncVar.ActivePageIndex;
+                int offset = syncVar.ActivePageOffset;
+                int length = syncVar.Length;
+                byte[] data = Slab.GetSpan(page, offset, length).ToArray();
+
+                entries.Add(new SyncVarSnapshotEntry
                 {
-                    Id = kvp.Value.Id,
-                    Token = kvp.Key,
-                    AuthIds = kvp.Value.AuthIds,
-                    PageIndex = kvp.Value.ActivePageIndex,
-                    PageOffset = kvp.Value.ActivePageOffset,
-                    Length = kvp.Value.Length,
-                    Version = kvp.Value.Version
+                    Token = syncVar.Token,
+                    Version = syncVar.Version,
+                    AuthIds = syncVar.AuthIds,
+                    Data = data
                 });
             }
 
-            _attachedManager.Interpreter.SendCommand(clientId, new SyncVarSlabInitPacket
+            _attachedManager.Interpreter.SendCommand(clientId, new SyncVarSnapshotPacket
             {
-                Descriptors = descriptors,
-                RawSlab = Slab.ExtractSnapshot(_totalAllocatedBytes)
+                Entries = entries
             });
         }
 
-        private void HandleInitialSlabSync(SyncVarSlabInitPacket packet, ushort senderId)
+        private void HandleSnapshot(SyncVarSnapshotPacket packet, ushort senderId)
         {
-            Slab.InitializeFromSnapshot(packet.RawSlab);
+            if (packet.Entries == null || packet.Entries.Count == 0) return;
 
-            for (int i = 0; i < packet.Descriptors.Count; i++)
+            for (int i = 0; i < packet.Entries.Count; i++)
             {
-                var desc = packet.Descriptors[i];
-                _receivedDescriptors[desc.Token] = desc;
-
-                if (_tokenRegistry.TryGetValue(desc.Token, out var syncVar))
+                var entry = packet.Entries[i];
+                if (TryGetSyncVar(entry.Token, out var syncVar))
                 {
-                    _idRegistry.TryRemove(syncVar.Id, out _);
-                    syncVar.Id = desc.Id;
-                    syncVar.ApplyAuthUpdateFromRemote(desc.AuthIds);
-                    _idRegistry[desc.Id] = syncVar;
-
-                    var memorySeq = new ReadOnlySequence<byte>(Slab.GetPage(desc.PageIndex), desc.PageOffset, desc.Length);
-                    syncVar.ApplyRemoteBytes(memorySeq, desc.Version, SerializerOptions);
+                    syncVar.ApplyAuthUpdateFromRemote(entry.AuthIds);
+                    if (entry.Data != null && entry.Data.Length > 0)
+                    {
+                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions);
+                    }
+                }
+                else
+                {
+                    if (entry.AuthIds != null)
+                    {
+                        _unboundAuth[entry.Token] = entry.AuthIds;
+                    }
+                    if (entry.Data != null && entry.Data.Length > 0)
+                    {
+                        _unboundCache[entry.Token] = (entry.Version, entry.Data);
+                    }
                 }
             }
         }

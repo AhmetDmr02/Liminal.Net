@@ -299,7 +299,7 @@ namespace Liminal.Net.Tests
             clientVar.OnValueChanged += (_, newVal) =>
             {
                 Interlocked.Increment(ref receivedUpdates);
-                // Invariant validation: CoordX == CoordY == CoordZ. Tearing violates this.
+
                 if (!newVal.IsConsistent)
                 {
                     Interlocked.Increment(ref observedTornSnapshots);
@@ -308,7 +308,6 @@ namespace Liminal.Net.Tests
 
             using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
 
-            // Background worker thread continuously mutating state across multiple variables
             var workerTask = Task.Run(() =>
             {
                 float counter = 1.0f;
@@ -597,6 +596,246 @@ namespace Liminal.Net.Tests
             serverVar.AddExclusion(5);
             clientVar.RemoveExclusion(5);
             Assert.That(serverVar.ContainsExclusion(5), Is.True, "Client was able to remove a server exclusion.");
+        }
+
+        #endregion
+
+        #region Dynamic Token Keys, Stateless Authority & Unbound Cache Tests
+
+        [Test]
+        public void Test18_DynamicRuntimeKeys_BroadcastsAndDispatchesWithoutHandshake()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client1 = CreateAndStartClient();
+            var client2 = CreateAndStartClient();
+
+            string token = $"dyn_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 42, _serverManager.SyncVarManager);
+
+            var c1Var = client1.SyncVarManager.Bind<int>(token);
+            var c2Var = client2.SyncVarManager.Bind<int>(token);
+
+            serverVar.Value = 100;
+
+            Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 100 && c2Var.Value == 100, 2000), Is.True,
+                "Dynamic runtime SyncVar failed to synchronize to existing clients.");
+        }
+
+        [Test]
+        public void Test19_NewSyncVar_And_Bind_FullyInterchangeable()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"interchange_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 5, _serverManager.SyncVarManager);
+
+            var clientVar = new SyncVar<int>(token, 0, client.SyncVarManager);
+
+            serverVar.Value = 999;
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 999, 2000), Is.True,
+                "SyncVar constructed with 'new' failed to receive updates.");
+
+            var boundVar = client.SyncVarManager.Bind<int>(token);
+            Assert.That(ReferenceEquals(clientVar, boundVar), Is.True,
+                "Bind did not return the existing SyncVar instance created via 'new'.");
+        }
+
+        [Test]
+        public void Test20_UnboundTokenCaching_HydratesOnLateInstantiation()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"unbound_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 1234, _serverManager.SyncVarManager);
+
+            serverVar.Value = 5678;
+
+            Thread.Sleep(100);
+
+            var clientVar = new SyncVar<int>(token, 0, client.SyncVarManager);
+
+            Assert.That(clientVar.Value, Is.EqualTo(5678),
+                "Late instantiation failed to hydrate immediately from unbound token cache.");
+        }
+
+        [Test]
+        public void Test21_HashCollisionResilience_SequenceEqualDispatchesCorrectly()
+        {
+            var registry = new Utf8TokenRegistry(16);
+
+            string t1 = "token_alpha_1";
+            string t2 = "token_beta_2";
+            var v1 = new SyncVar<int>(t1, 10);
+            var v2 = new SyncVar<int>(t2, 20);
+
+            registry.TryAdd(v1);
+            registry.TryAdd(v2);
+
+            byte[] b1 = System.Text.Encoding.UTF8.GetBytes(t1);
+            byte[] b2 = System.Text.Encoding.UTF8.GetBytes(t2);
+
+            Assert.That(registry.TryGet(b1, out var found1), Is.True);
+            Assert.That(ReferenceEquals(found1, v1), Is.True);
+
+            Assert.That(registry.TryGet(b2, out var found2), Is.True);
+            Assert.That(ReferenceEquals(found2, v2), Is.True);
+
+            byte[] bNonExistent = System.Text.Encoding.UTF8.GetBytes("token_alpha_99");
+            Assert.That(registry.TryGet(bNonExistent, out _), Is.False);
+        }
+
+        [Test]
+        public void Test22_ZeroGC_SpanLookup_AllocatesZeroBytes()
+        {
+            var registry = new Utf8TokenRegistry(64);
+            for (int i = 0; i < 50; i++)
+            {
+                var v = new SyncVar<int>($"var_{i}", i);
+                registry.TryAdd(v);
+            }
+
+            byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("var_25");
+            ReadOnlySpan<byte> targetSpan = targetBytes;
+
+            registry.TryGet(targetSpan, out _);
+
+            long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            for (int i = 0; i < 1000; i++)
+            {
+                registry.TryGet(targetSpan, out _);
+            }
+
+            long allocatedAfter = GC.GetAllocatedBytesForCurrentThread();
+            long totalAllocated = allocatedAfter - allocatedBefore;
+
+            Assert.That(totalAllocated, Is.EqualTo(0),
+                $"Utf8TokenRegistry.TryGet allocated {totalAllocated} bytes. Expected 0 GC allocations.");
+        }
+
+        [Test]
+        public void Test23_Client_WritesToNonExistentToken_ServerLogsErrorAndDrops()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes("non_existent_token");
+            var buffer = new System.Buffers.ArrayBufferWriter<byte>(128);
+            var writer = new MessagePackWriter(buffer);
+            writer.WriteArrayHeader(1);
+            writer.WriteUInt8((byte)tokenBytes.Length);
+            writer.WriteRaw(tokenBytes);
+            writer.WriteUInt32(1);
+
+            var valBuffer = new System.Buffers.ArrayBufferWriter<byte>(32);
+            MessagePackSerializer.Serialize(valBuffer, 9999);
+            writer.WriteInt32(valBuffer.WrittenCount);
+            writer.WriteRaw(valBuffer.WrittenSpan);
+            writer.Flush();
+
+            var packet = new SyncVarSlabClientRequestPacket(new System.Buffers.ReadOnlySequence<byte>(buffer.WrittenSpan.ToArray()));
+
+            Assert.DoesNotThrow(() =>
+            {
+                client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, packet);
+            });
+
+            Thread.Sleep(100);
+
+            Assert.That(_serverManager.SyncVarManager.TryGetSyncVar("non_existent_token", out _), Is.False,
+                "Server accepted or created a non-existent SyncVar from an untrusted client request.");
+        }
+
+        [Test]
+        public void Test24_AuthorizedClient_CannotModifyAuthority_BlockedLocally()
+        {
+            string token = $"auth_client_guard_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 10);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 10, 2000), Is.True);
+
+            serverVar.AddAuthority(client.localID);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.HasAuthority, 2000), Is.True);
+
+            clientVar.AddAuthority(99);
+            Assert.That(clientVar.AuthIds, Does.Not.Contain(99),
+                "Client was able to call AddAuthority to grant authority to another client.");
+            Assert.That(serverVar.AuthIds, Does.Not.Contain(99));
+
+            clientVar.SetAuthIds(client.localID, 99);
+            Assert.That(clientVar.AuthIds, Does.Not.Contain(99),
+                "Client was able to call SetAuthIds.");
+
+            clientVar.RemoveAuthority(client.localID);
+            Assert.That(clientVar.HasAuthority, Is.True,
+                "Client was able to revoke its own authority via RemoveAuthority.");
+        }
+
+        [Test]
+        public void Test25_DynamicAuthorityChange_StreamsToExistingClients_AndFiresEvent()
+        {
+            string token = $"dyn_auth_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 50);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50, 2000), Is.True);
+            Assert.That(clientVar.HasAuthority, Is.False);
+
+            bool authGrantedFired = false;
+            bool authRevokedFired = false;
+
+            clientVar.OnAuthorityChanged += (hasAuth) =>
+            {
+                if (hasAuth) authGrantedFired = true;
+                else authRevokedFired = true;
+            };
+
+            serverVar.AddAuthority(client.localID);
+            Assert.That(SpinWait.SpinUntil(() => authGrantedFired && clientVar.HasAuthority, 2000), Is.True,
+                "Dynamic authority grant failed to stream to existing client.");
+
+            serverVar.RemoveAuthority(client.localID);
+            Assert.That(SpinWait.SpinUntil(() => authRevokedFired && !clientVar.HasAuthority, 2000), Is.True,
+                "Dynamic authority revocation failed to stream to existing client.");
+        }
+
+        [Test]
+        public void Test26_LateJoiner_ReceivesDynamicAuthorityState_InSnapshot()
+        {
+            string token = $"late_auth_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 100);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client1 = CreateAndStartClient();
+            var c1Var = client1.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 100, 2000), Is.True);
+
+            serverVar.AddAuthority(client1.localID);
+            serverVar.Value = 200;
+
+            Assert.That(SpinWait.SpinUntil(() => c1Var.HasAuthority && c1Var.Value == 200, 2000), Is.True);
+
+            var client2 = CreateAndStartClient();
+            var c2Var = client2.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => c2Var.Value == 200, 2000), Is.True);
+            Assert.That(c2Var.HasAuthority, Is.False, "Late joiner was incorrectly granted authority.");
+            Assert.That(c2Var.AuthIds, Contains.Item(client1.localID), "Late joiner did not receive Client 1's authority in snapshot.");
+
+            c1Var.Value = 777;
+
+            Assert.That(SpinWait.SpinUntil(() => serverVar.Value == 777, 2000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => c2Var.Value == 777, 2000), Is.True);
         }
 
         #endregion
