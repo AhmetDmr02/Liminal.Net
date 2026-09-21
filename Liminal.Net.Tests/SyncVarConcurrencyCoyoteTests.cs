@@ -1220,5 +1220,183 @@ namespace Liminal.Net.Tests.Coyote
             Specification.Assert(authEventsFired >= 0, "Valid auth event count");
             Specification.Assert(valueEventsFired >= 0, "Valid value event count");
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_FlushDirty_ConcurrentAuthorityChange_ZeroMalformedMessagePack()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = false };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartClient("127.0.0.1", 7777);
+            transport.TriggerLocalClientConnected(5);
+
+            var syncVarManager = netManager.SyncVarManager;
+            netManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(new SyncVarSnapshotPacket()));
+
+            const int count = 5;
+            var svs = new SyncVar<int>[count];
+            for (int i = 0; i < count; i++)
+            {
+                svs[i] = new SyncVar<int>($"flaky_var_{i}", 100 + i, syncVarManager);
+                svs[i].ApplyAuthUpdateFromRemote(new ushort[] { 1 });
+                svs[i].Value = 200 + i;
+            }
+
+            var taskFlush = Task.Run(async () =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            var taskRevoke = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    svs[i].ApplyAuthUpdateFromRemote(Array.Empty<ushort>());
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskFlush, taskRevoke);
+
+            for (int p = 0; p < transport.SentPackets.Count; p++)
+            {
+                var record = transport.SentPackets[p];
+                if (record.Data.Length > 2)
+                {
+                    ushort packetId = BitConverter.ToUInt16(record.Data, 0);
+                    if (packetId == LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>())
+                    {
+                        var packet = MessagePackSerializer.Deserialize<SyncVarSlabClientRequestPacket>(
+                            new ReadOnlyMemory<byte>(record.Data, 2, record.Data.Length - 2),
+                            syncVarManager.SerializerOptions);
+
+                        if (!packet.Payload.IsEmpty)
+                        {
+                            var reader = new MessagePackReader(packet.Payload);
+                            int arrayCount = reader.ReadArrayHeader();
+                            int itemsRead = 0;
+                            for (int i = 0; i < arrayCount; i++)
+                            {
+                                if (reader.End)
+                                {
+                                    Specification.Assert(false, $"Truncated payload! ArrayHeader promised {arrayCount} items, but only read {itemsRead} items before EOF.");
+                                }
+                                byte tLen = reader.ReadByte();
+                                reader.ReadRaw(tLen);
+                                reader.ReadUInt32();
+                                int len = reader.ReadInt32();
+                                reader.ReadRaw(len);
+                                itemsRead++;
+                            }
+                            Specification.Assert(itemsRead == arrayCount, $"Mismatch: promised {arrayCount}, read {itemsRead}");
+                        }
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_TailoredFlush_ConcurrentExclusionChange_ZeroMalformedMessagePack()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const ushort client1 = 10;
+            const ushort client2 = 20;
+            transport.TriggerClientConnected(client1);
+            transport.TriggerClientConnected(client2);
+
+            const int count = 5;
+            var svs = new SyncVar<int>[count];
+            for (int i = 0; i < count; i++)
+            {
+                svs[i] = new SyncVar<int>($"excl_var_{i}", 100 + i, syncVarManager);
+                svs[i].Value = 200 + i;
+            }
+            svs[0].AddExclusion(client1);
+
+            var taskFlush = Task.Run(async () =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            var taskExclusionMutate = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    svs[i].AddExclusion(client1);
+                    await Task.Yield();
+                    svs[i].RemoveExclusion(client1);
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskFlush, taskExclusionMutate);
+
+            for (int p = 0; p < transport.SentPackets.Count; p++)
+            {
+                var record = transport.SentPackets[p];
+                if (record.Data.Length > 2)
+                {
+                    ushort packetId = BitConverter.ToUInt16(record.Data, 0);
+                    if (packetId == LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>())
+                    {
+                        var packet = MessagePackSerializer.Deserialize<SyncVarSlabBatchPacket>(
+                            new ReadOnlyMemory<byte>(record.Data, 2, record.Data.Length - 2),
+                            syncVarManager.SerializerOptions);
+
+                        if (!packet.Payload.IsEmpty)
+                        {
+                            var reader = new MessagePackReader(packet.Payload);
+                            int arrayCount = reader.ReadArrayHeader();
+                            int itemsRead = 0;
+                            for (int i = 0; i < arrayCount; i++)
+                            {
+                                if (reader.End)
+                                {
+                                    Specification.Assert(false, $"Truncated payload! ArrayHeader promised {arrayCount} items, but only read {itemsRead} items before EOF.");
+                                }
+                                byte tLen = reader.ReadByte();
+                                reader.ReadRaw(tLen);
+                                reader.ReadUInt32();
+                                int len = reader.ReadInt32();
+                                reader.ReadRaw(len);
+                                itemsRead++;
+                            }
+                            Specification.Assert(itemsRead == arrayCount, $"Mismatch: promised {arrayCount}, read {itemsRead}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

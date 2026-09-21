@@ -59,6 +59,8 @@ namespace Liminal.Net.SyncVar
         private readonly Dictionary<string, ushort[]> _unboundAuth = new();
         private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
+        private readonly List<ISyncVarInternal> _clientAuthorizedList = new(64);
+        private readonly List<ISyncVarInternal> _tailoredVarsList = new(64);
         private readonly int _maxUnboundCapacity;
 
         [ThreadStatic]
@@ -158,6 +160,8 @@ namespace Liminal.Net.SyncVar
                 _unboundAuth.Clear();
             }
             DirtyBitset.Clear();
+            _clientAuthorizedList.Clear();
+            _tailoredVarsList.Clear();
         }
 
         public bool UnregisterSyncVar(ISyncVarInternal syncVar)
@@ -363,26 +367,25 @@ namespace Liminal.Net.SyncVar
 
                 if (netManager.Role == NetworkRole.Client)
                 {
-                    int authorizedCount = 0;
-                    for (int i = 0; i < _reusableDirtyList.Count; i++)
-                    {
-                        if (_reusableDirtyList[i].HasAuthority)
-                        {
-                            authorizedCount++;
-                        }
-                    }
-
-                    if (authorizedCount == 0) return;
-
-                    _sharedFlushWriter.Clear();
-                    var writer = new MessagePackWriter(_sharedFlushWriter);
-                    writer.WriteArrayHeader(authorizedCount);
-
+                    _clientAuthorizedList.Clear();
                     for (int i = 0; i < _reusableDirtyList.Count; i++)
                     {
                         var syncVar = _reusableDirtyList[i];
-                        if (!syncVar.HasAuthority) continue;
+                        if (syncVar.HasAuthority)
+                        {
+                            _clientAuthorizedList.Add(syncVar);
+                        }
+                    }
 
+                    if (_clientAuthorizedList.Count == 0) return;
+
+                    _sharedFlushWriter.Clear();
+                    var writer = new MessagePackWriter(_sharedFlushWriter);
+                    writer.WriteArrayHeader(_clientAuthorizedList.Count);
+
+                    for (int i = 0; i < _clientAuthorizedList.Count; i++)
+                    {
+                        var syncVar = _clientAuthorizedList[i];
                         if (!syncVar.TryWriteSlotForWire(ref writer, out _))
                         {
                             if (syncVar.TryMarkDirty())
@@ -405,7 +408,7 @@ namespace Liminal.Net.SyncVar
                 for (int i = 0; i < _reusableDirtyList.Count; i++)
                 {
                     var syncVar = _reusableDirtyList[i];
-                    if (syncVar.ExclusionIds.Length > 0)
+                    if (syncVar.ExclusionIds != null && syncVar.ExclusionIds.Length > 0)
                     {
                         hasAnyExclusions = true;
                     }
@@ -455,25 +458,23 @@ namespace Liminal.Net.SyncVar
                     }
                     else
                     {
-                        int allowedCount = 0;
-                        for (int i = 0; i < _reusableDirtyList.Count; i++)
-                        {
-                            if (!_reusableDirtyList[i].IsExcluded(targetId))
-                                allowedCount++;
-                        }
-
-                        if (allowedCount == 0) continue;
-
-                        _tailoredFlushWriter.Clear();
-                        var tailoredWriter = new MessagePackWriter(_tailoredFlushWriter);
-                        tailoredWriter.WriteArrayHeader(allowedCount);
-
+                        _tailoredVarsList.Clear();
                         for (int i = 0; i < _reusableDirtyList.Count; i++)
                         {
                             var syncVar = _reusableDirtyList[i];
-                            if (syncVar.IsExcluded(targetId)) continue;
+                            if (!syncVar.IsExcluded(targetId))
+                                _tailoredVarsList.Add(syncVar);
+                        }
 
-                            syncVar.TryWriteSlotForWire(ref tailoredWriter, out _);
+                        if (_tailoredVarsList.Count == 0) continue;
+
+                        _tailoredFlushWriter.Clear();
+                        var tailoredWriter = new MessagePackWriter(_tailoredFlushWriter);
+                        tailoredWriter.WriteArrayHeader(_tailoredVarsList.Count);
+
+                        for (int i = 0; i < _tailoredVarsList.Count; i++)
+                        {
+                            _tailoredVarsList[i].TryWriteSlotForWire(ref tailoredWriter, out _);
                         }
 
                         tailoredWriter.Flush();

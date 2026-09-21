@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using System;
 using System.Buffers;
 using System.Threading;
@@ -72,7 +72,13 @@ namespace Liminal.Net.SyncVar
 
         public Span<byte> GetSpan(int pageIndex, int pageOffset, int length)
         {
-            return _pages[pageIndex].AsSpan(pageOffset, length);
+            var page = Volatile.Read(ref _pages[pageIndex]);
+            if (page == null)
+            {
+                EnsurePageAllocated(pageIndex);
+                page = Volatile.Read(ref _pages[pageIndex]);
+            }
+            return page.AsSpan(pageOffset, length);
         }
 
         public byte[] ExtractSnapshot(int totalBytes)

@@ -9,6 +9,7 @@ namespace Liminal.Net.SyncVar
         public void SetDirty(ushort id)
         {
             int bucket = id >> 6;
+            if ((uint)bucket >= (uint)_masks.Length) return;
             long bit = 1L << (id & 63);
 
 #if NET5_0_OR_GREATER
@@ -28,6 +29,11 @@ namespace Liminal.Net.SyncVar
 
         public bool TryConsumeBucket(int bucketIndex, out long dirtyMask)
         {
+            if ((uint)bucketIndex >= (uint)_masks.Length)
+            {
+                dirtyMask = 0;
+                return false;
+            }
             dirtyMask = Interlocked.Exchange(ref _masks[bucketIndex], 0);
             return dirtyMask != 0;
         }
@@ -43,6 +49,7 @@ namespace Liminal.Net.SyncVar
         public bool IsDirty(ushort id)
         {
             int bucket = id >> 6;
+            if ((uint)bucket >= (uint)_masks.Length) return false;
             long bit = 1L << (id & 63);
             return (Volatile.Read(ref _masks[bucket]) & bit) != 0;
         }

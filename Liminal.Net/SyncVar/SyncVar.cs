@@ -685,7 +685,8 @@ namespace Liminal.Net.SyncVar
 
         public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false)
         {
-            if (!force && newVersion <= _version && _version != 0) return;
+            uint currentVer = Volatile.Read(ref _version);
+            if (!force && newVersion <= currentVer && currentVer != 0) return;
 
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
             T old;
@@ -693,7 +694,8 @@ namespace Liminal.Net.SyncVar
 
             lock (_writeLock)
             {
-                if (!force && newVersion <= _version && _version != 0) return;
+                currentVer = Volatile.Read(ref _version);
+                if (!force && newVersion <= currentVer && currentVer != 0) return;
 
                 int currentFront = Volatile.Read(ref _frontIndex);
                 int backIndex = 1 - currentFront;
