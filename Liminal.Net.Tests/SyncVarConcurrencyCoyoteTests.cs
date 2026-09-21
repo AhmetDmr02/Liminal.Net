@@ -846,5 +846,212 @@ namespace Liminal.Net.Tests.Coyote
             Specification.Assert(createdVar.AuthIds.Length == 1 && createdVar.AuthIds[0] == 20,
                 $"Auth stomp detected! Expected Client 20, got {(createdVar.AuthIds.Length > 0 ? createdVar.AuthIds[0].ToString() : "empty")}");
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_Registration_ConcurrentAuthAndCallbackReentrancy_ZeroDeadlock()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const int count = 10;
+            const ushort testClientId = 5;
+
+            for (int i = 0; i < count; i++)
+            {
+                string token = $"deadlock_test_{i}";
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarAuthUpdatePacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    MessagePackSerializer.Serialize(new SyncVarAuthUpdatePacket
+                    {
+                        Token = token,
+                        AuthIds = new ushort[] { testClientId }
+                    }));
+            }
+
+            var registeredVars = new SyncVar<int>[count];
+            int callbackCount = 0;
+
+            var taskRegister = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    string token = $"deadlock_test_{i}";
+                    var sv = new SyncVar<int>(token, i, syncVarManager);
+                    registeredVars[i] = sv;
+
+                    sv.OnAuthorityChanged += hasAuth =>
+                    {
+                        Interlocked.Increment(ref callbackCount);
+                        _ = sv.Value;
+                        if (hasAuth)
+                        {
+                            sv.Value = 999;
+                        }
+                        _ = syncVarManager.Bind<int>($"reentrant_bound_{token}", 0);
+                    };
+
+                    await Task.Yield();
+                }
+            });
+
+            var taskAuthMutations = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    string token = $"deadlock_test_{i}";
+                    if (syncVarManager.TryGetSyncVar(token, out var sv))
+                    {
+                        sv.AddAuthority(testClientId);
+                        sv.RemoveAuthority(testClientId);
+                        sv.SetAuthIds(testClientId, 99);
+                    }
+                    else
+                    {
+                        netManager.Interpreter.Dispatch(
+                            LiminalPacketLibrary.GetId<SyncVarAuthUpdatePacket>(),
+                            ILiminalTransport.SERVER_ID,
+                            MessagePackSerializer.Serialize(new SyncVarAuthUpdatePacket
+                            {
+                                Token = token,
+                                AuthIds = new ushort[] { testClientId, 99 }
+                            }));
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            var taskFlusher = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskRegister, taskAuthMutations, taskFlusher);
+
+            Specification.Assert(registeredVars.Length == count, "Failed to complete all registrations without deadlock.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_OfflineSnapshotConvergence_ConcurrentFlushAndMutate()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = false };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const int count = 6;
+            var clientVars = new SyncVar<int>[count];
+
+            ushort localClientId = netManager.localID;
+
+            for (int i = 0; i < count; i++)
+            {
+                clientVars[i] = new SyncVar<int>($"offline_conv_{i}", 0, syncVarManager);
+                clientVars[i].Value = 100 + i;
+            }
+
+            netManager.StartClient("127.0.0.1", 7777);
+            netManager.Ticker?.Stop();
+            transport.TriggerLocalClientConnected(localClientId);
+
+            var entries = new System.Collections.Generic.List<SyncVarSnapshotEntry>(count);
+            for (int i = 0; i < count; i++)
+            {
+                var valBuf = new ArrayBufferWriter<byte>();
+                MessagePackSerializer.Serialize(valBuf, 500 + i);
+
+                ushort[] authIds = (i % 2 == 0) ? new ushort[] { localClientId } : Array.Empty<ushort>();
+
+                entries.Add(new SyncVarSnapshotEntry
+                {
+                    Token = $"offline_conv_{i}",
+                    Version = 1,
+                    AuthIds = authIds,
+                    Data = valBuf.WrittenSpan.ToArray()
+                });
+            }
+
+            var snapshotPacket = new SyncVarSnapshotPacket { Entries = entries };
+            byte[] serializedSnapshot = MessagePackSerializer.Serialize(snapshotPacket);
+
+            var taskSnapshot = Task.Run(async () =>
+            {
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    serializedSnapshot);
+                await Task.Yield();
+            });
+
+            var taskMutate = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    if (clientVars[i].HasAuthority)
+                    {
+                        clientVars[i].Value = 800 + i;
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            var taskFlush = Task.Run(async () =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            int readSum = 0;
+            var taskRead = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    readSum += clientVars[i].Value;
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskSnapshot, taskMutate, taskFlush, taskRead);
+
+            for (int i = 0; i < count; i++)
+            {
+                var sv = clientVars[i];
+                if (i % 2 != 0)
+                {
+                    Specification.Assert(!sv.HasAuthority, $"SyncVar {i} should not have authority.");
+                    Specification.Assert(sv.Value == 500 + i,
+                        $"Unauthorized SyncVar {i} failed to overwrite offline value! Expected {500 + i}, got {sv.Value}");
+                }
+                else
+                {
+                    Specification.Assert(sv.HasAuthority, $"SyncVar {i} should have authority.");
+                }
+            }
+        }
     }
 }

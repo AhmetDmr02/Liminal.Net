@@ -22,6 +22,7 @@ namespace Liminal.Net.SyncVar
         bool IsAuthorized(ushort clientId);
         bool IsExcluded(ushort clientId);
         bool ContainsExclusion(ushort clientId);
+        bool HasAuthority { get; }
 
         void SetAuthIds(params ushort[] clientIds);
         void AddAuthority(ushort clientId);
@@ -42,7 +43,7 @@ namespace Liminal.Net.SyncVar
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
         bool TryExtractSnapshotData(out byte[] data, out uint version);
-        void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options);
+        void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false);
     }
 
     public class SyncVar<T> : ISyncVarInternal, IDisposable
@@ -196,33 +197,50 @@ namespace Liminal.Net.SyncVar
         {
             if (!IsServerAuthority("SetAuthIds")) return;
 
+            ushort[] next;
+            bool fireEvent;
+            bool currentAuth;
+
             lock (_authLock)
             {
                 if (clientIds == null || clientIds.Length == 0)
                 {
-                    CommitAuthUpdate(Array.Empty<ushort>());
-                    return;
+                    next = Array.Empty<ushort>();
                 }
-
-                var cleanList = new List<ushort>(clientIds.Length);
-                for (int i = 0; i < clientIds.Length; i++)
+                else
                 {
-                    ushort id = clientIds[i];
-                    if (cleanList.Contains(id))
+                    var cleanList = new List<ushort>(clientIds.Length);
+                    for (int i = 0; i < clientIds.Length; i++)
                     {
-                        LiminalLogger.LogWarning($"[SyncVar] Duplicate authority ID {id} passed into '{Token}'. Overwriting duplicate entry.");
-                        continue;
+                        ushort id = clientIds[i];
+                        if (cleanList.Contains(id))
+                        {
+                            LiminalLogger.LogWarning($"[SyncVar] Duplicate authority ID {id} passed into '{Token}'. Overwriting duplicate entry.");
+                            continue;
+                        }
+                        cleanList.Add(id);
                     }
-                    cleanList.Add(id);
+                    next = cleanList.ToArray();
                 }
 
-                CommitAuthUpdate(cleanList.ToArray());
+                CommitAuthUpdate(next, out fireEvent, out currentAuth);
             }
+
+            if (fireEvent)
+            {
+                OnAuthorityChanged?.Invoke(currentAuth);
+            }
+
+            BroadcastAuthIfServer(next);
         }
 
         public void AddAuthority(ushort clientId)
         {
             if (!IsServerAuthority("AddAuthority")) return;
+
+            ushort[] next = null;
+            bool fireEvent = false;
+            bool currentAuth = false;
 
             lock (_authLock)
             {
@@ -236,17 +254,31 @@ namespace Liminal.Net.SyncVar
                     }
                 }
 
-                var next = new ushort[current.Length + 1];
+                next = new ushort[current.Length + 1];
                 Array.Copy(current, next, current.Length);
                 next[current.Length] = clientId;
 
-                CommitAuthUpdate(next);
+                CommitAuthUpdate(next, out fireEvent, out currentAuth);
+            }
+
+            if (fireEvent)
+            {
+                OnAuthorityChanged?.Invoke(currentAuth);
+            }
+
+            if (next != null)
+            {
+                BroadcastAuthIfServer(next);
             }
         }
 
         public void RemoveAuthority(ushort clientId)
         {
             if (!IsServerAuthority("RemoveAuthority")) return;
+
+            ushort[] next = null;
+            bool fireEvent = false;
+            bool currentAuth = false;
 
             lock (_authLock)
             {
@@ -268,7 +300,7 @@ namespace Liminal.Net.SyncVar
                     return;
                 }
 
-                var next = new ushort[current.Length - 1];
+                next = new ushort[current.Length - 1];
                 if (targetIndex > 0)
                 {
                     Array.Copy(current, 0, next, 0, targetIndex);
@@ -278,22 +310,44 @@ namespace Liminal.Net.SyncVar
                     Array.Copy(current, targetIndex + 1, next, targetIndex, current.Length - targetIndex - 1);
                 }
 
-                CommitAuthUpdate(next);
+                CommitAuthUpdate(next, out fireEvent, out currentAuth);
+            }
+
+            if (fireEvent)
+            {
+                OnAuthorityChanged?.Invoke(currentAuth);
+            }
+
+            if (next != null)
+            {
+                BroadcastAuthIfServer(next);
             }
         }
 
         public void ApplyAuthUpdateFromRemote(ushort[] newAuthIds)
         {
+            bool fireEvent = false;
+            bool currentAuth = false;
+
             lock (_authLock)
             {
                 bool previousAuth = HasAuthority;
                 Volatile.Write(ref _authIds, newAuthIds ?? Array.Empty<ushort>());
 
-                bool currentAuth = HasAuthority;
+                currentAuth = HasAuthority;
                 if (previousAuth != currentAuth)
                 {
-                    OnAuthorityChanged?.Invoke(currentAuth);
+                    if (!currentAuth)
+                    {
+                        ClearDirty();
+                    }
+                    fireEvent = true;
                 }
+            }
+
+            if (fireEvent)
+            {
+                OnAuthorityChanged?.Invoke(currentAuth);
             }
         }
 
@@ -310,17 +364,17 @@ namespace Liminal.Net.SyncVar
             return false;
         }
 
-        private void CommitAuthUpdate(ushort[] newAuthIds)
+        private void CommitAuthUpdate(ushort[] newAuthIds, out bool fireEvent, out bool currentAuth)
         {
             bool previousAuth = HasAuthority;
             Volatile.Write(ref _authIds, newAuthIds);
 
-            bool currentAuth = HasAuthority;
-            if (previousAuth != currentAuth)
-            {
-                OnAuthorityChanged?.Invoke(currentAuth);
-            }
+            currentAuth = HasAuthority;
+            fireEvent = previousAuth != currentAuth;
+        }
 
+        private void BroadcastAuthIfServer(ushort[] newAuthIds)
+        {
             var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
             if (netManager != null && (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
             {
@@ -598,16 +652,16 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options)
+        public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false)
         {
-            if (newVersion <= _version && _version != 0) return;
+            if (!force && newVersion <= _version && _version != 0) return;
 
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
             T old;
 
             lock (_writeLock)
             {
-                if (newVersion <= _version && _version != 0) return;
+                if (!force && newVersion <= _version && _version != 0) return;
 
                 int currentFront = Volatile.Read(ref _frontIndex);
                 int backIndex = 1 - currentFront;
@@ -646,6 +700,10 @@ namespace Liminal.Net.SyncVar
                     Volatile.Write(ref _gate, STATE_IDLE);
                 }
 
+                if (force)
+                {
+                    ClearDirty();
+                }
             }
 
             OnValueChanged?.Invoke(old, deserialized);

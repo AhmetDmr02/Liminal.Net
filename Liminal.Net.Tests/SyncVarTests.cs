@@ -520,17 +520,14 @@ namespace Liminal.Net.Tests
 
             ushort clientId = client.localID;
 
-            // Client attempts to grant itself authority
             clientVar.AddAuthority(clientId);
             Assert.That(clientVar.HasAuthority, Is.False, "Client was able to grant itself authority via AddAuthority.");
             Assert.That(clientVar.AuthIds, Does.Not.Contain(clientId));
 
-            // Client attempts SetAuthIds
             clientVar.SetAuthIds(clientId, 99);
             Assert.That(clientVar.HasAuthority, Is.False, "Client was able to set authority via SetAuthIds.");
             Assert.That(clientVar.AuthIds, Does.Not.Contain(clientId));
 
-            // Client attempts RemoveAuthority
             serverVar.AddAuthority(clientId);
             Assert.That(SpinWait.SpinUntil(() => clientVar.HasAuthority, 2000), Is.True);
 
@@ -544,7 +541,6 @@ namespace Liminal.Net.Tests
             string token = $"exclusion_ops_{Guid.NewGuid():N}";
             var syncVar = new SyncVar<int>(token, 0);
 
-            // Add with deduplication
             syncVar.AddExclusion(1);
             syncVar.AddExclusion(1);
             syncVar.AddExclusion(2);
@@ -557,7 +553,6 @@ namespace Liminal.Net.Tests
                 Assert.That(syncVar.ContainsExclusion(3), Is.False);
             });
 
-            // Remove
             syncVar.RemoveExclusion(1);
             Assert.Multiple(() =>
             {
@@ -566,7 +561,6 @@ namespace Liminal.Net.Tests
                 Assert.That(syncVar.ExclusionIds.Length, Is.EqualTo(1));
             });
 
-            // Set with deduplication
             syncVar.SetExclusionIds(10, 10, 20, 30, 20);
             Assert.Multiple(() =>
             {
@@ -587,7 +581,6 @@ namespace Liminal.Net.Tests
 
             Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 100, 2000), Is.True);
 
-            // Client attempts to modify exclusion lists
             clientVar.AddExclusion(5);
             Assert.That(clientVar.ContainsExclusion(5), Is.False, "Client was able to add an exclusion.");
 
@@ -962,6 +955,136 @@ namespace Liminal.Net.Tests
             syncVar.Dispose();
 
             Assert.That(manager.TryGetSyncVar("disposable_token", out _), Is.False, "SyncVar was not removed from registry after Dispose.");
+        }
+
+        [Test]
+        public void Test31_OfflineModifiedWithoutAuthority_OverwrittenByServerSnapshotOnConnect()
+        {
+            string token = $"offline_unauth_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 50);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var config = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver(),
+                HandshakeTimeout = 15,
+                ConnectionTimeout = 15
+            };
+            var client = new LiminalNetworkManager(new TcpTransport(), config);
+            _clientManagers.Add(client);
+
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            clientVar.Value = 999;
+            Assert.That(clientVar.Value, Is.EqualTo(999));
+            Assert.That(clientVar.IsDirty, Is.True);
+
+            int observedOld = 0;
+            int observedNew = 0;
+            bool changedFired = false;
+            clientVar.OnValueChanged += (oldVal, newVal) =>
+            {
+                observedOld = oldVal;
+                observedNew = newVal;
+                changedFired = true;
+            };
+
+            bool connected = false;
+            client.Events.OnLocalClientConnected += _ => connected = true;
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect.");
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50, 2000), Is.True,
+                "Unauthorized offline client mutation was not overwritten by server snapshot.");
+
+            Assert.That(changedFired, Is.True, "OnValueChanged did not fire when server snapshot corrected the value.");
+            Assert.That(observedOld, Is.EqualTo(999));
+            Assert.That(observedNew, Is.EqualTo(50));
+            Assert.That(clientVar.HasAuthority, Is.False, "Client should not have authority.");
+            Assert.That(serverVar.Value, Is.EqualTo(50), "Server value should remain untouched.");
+        }
+
+        [Test]
+        public void Test32_OfflineModifiedWithAuthority_PreservedAndSyncedToServerOnConnect()
+        {
+            string token = $"offline_auth_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 50);
+
+            serverVar.AddAuthority(1);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var config = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = _currentTestPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver(),
+                HandshakeTimeout = 15,
+                ConnectionTimeout = 15
+            };
+            var client = new LiminalNetworkManager(new TcpTransport(), config);
+            _clientManagers.Add(client);
+
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+            clientVar.Value = 777;
+            Assert.That(clientVar.Value, Is.EqualTo(777));
+
+            bool connected = false;
+            client.Events.OnLocalClientConnected += _ => connected = true;
+            client.StartClient("127.0.0.1", _currentTestPort);
+
+            Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect.");
+
+            Assert.That(SpinWait.SpinUntil(() => serverVar.Value == 777 && clientVar.Value == 777, 2000), Is.True,
+                "Authorized offline client mutation was not synced to server.");
+            Assert.That(clientVar.HasAuthority, Is.True);
+        }
+
+        [Test]
+        public void Test33_ServerDropsUnauthorizedClientRequest_ZeroMutation()
+        {
+            string token = $"unauth_drop_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 100);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 100, 2000), Is.True);
+            Assert.That(clientVar.HasAuthority, Is.False);
+
+            var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+            var buffer = new ArrayBufferWriter<byte>(128);
+            var writer = new MessagePackWriter(buffer);
+            writer.WriteArrayHeader(1);
+            writer.WriteUInt8((byte)tokenBytes.Length);
+            writer.WriteRaw(tokenBytes);
+            writer.WriteUInt32(5);
+
+            var valBuffer = new ArrayBufferWriter<byte>(32);
+            MessagePackSerializer.Serialize(valBuffer, 999);
+            writer.WriteInt32(valBuffer.WrittenCount);
+            writer.WriteRaw(valBuffer.WrittenSpan);
+            writer.Flush();
+
+            var seq = new ReadOnlySequence<byte>(buffer.WrittenMemory);
+            client.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new SyncVarSlabClientRequestPacket(seq));
+
+            Thread.Sleep(200);
+            Assert.That(serverVar.Value, Is.EqualTo(100), "Server value changed from unauthorized packet.");
+            Assert.That(clientVar.Value, Is.EqualTo(100), "Client value desynchronized.");
         }
 
         #endregion

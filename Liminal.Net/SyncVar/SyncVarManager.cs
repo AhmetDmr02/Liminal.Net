@@ -75,6 +75,7 @@ namespace Liminal.Net.SyncVar
         private LiminalNetworkManager _attachedManager;
         public LiminalNetworkManager AttachedManager => _attachedManager;
         private int _totalAllocatedBytes;
+        private int _hasReceivedInitialSnapshot = 0;
 
         public readonly MessagePackSerializerOptions SerializerOptions =
             MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
@@ -140,6 +141,7 @@ namespace Liminal.Net.SyncVar
 
         public void ResetPendingState()
         {
+            Volatile.Write(ref _hasReceivedInitialSnapshot, 0);
             while (_dirtyQueue.TryDequeue(out var syncVar))
             {
                 syncVar.ClearDirty();
@@ -262,12 +264,13 @@ namespace Liminal.Net.SyncVar
 
             byte[] cachedData = null;
             uint cachedVersion = 0;
+            ushort[] cachedAuth = null;
 
             lock (_unboundLock)
             {
                 if (_unboundAuth.Remove(syncVar.Token, out var a))
                 {
-                    syncVar.ApplyAuthUpdateFromRemote(a);
+                    cachedAuth = a;
                 }
 
                 if (_unboundCache.Remove(syncVar.Token, out var entry))
@@ -280,9 +283,15 @@ namespace Liminal.Net.SyncVar
                 _tokenRegistry.TryAdd(syncVar);
             }
 
+            if (cachedAuth != null)
+            {
+                syncVar.ApplyAuthUpdateFromRemote(cachedAuth);
+            }
+
             if (cachedData != null)
             {
-                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(cachedData), cachedVersion, SerializerOptions);
+                bool force = !syncVar.HasAuthority;
+                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(cachedData), cachedVersion, SerializerOptions, force);
             }
 
             if (_attachedManager != null && _attachedManager.Role != NetworkRole.Client && _attachedManager.Role != NetworkRole.None)
@@ -341,6 +350,9 @@ namespace Liminal.Net.SyncVar
             if (_attachedManager == null || !_attachedManager.CanSend)
                 return;
 
+            if (_attachedManager.Role == NetworkRole.Client && Volatile.Read(ref _hasReceivedInitialSnapshot) == 0)
+                return;
+
             if (Interlocked.CompareExchange(ref _isFlushing, 1, 0) != 0)
                 return;
 
@@ -357,13 +369,26 @@ namespace Liminal.Net.SyncVar
 
             if (_attachedManager.Role == NetworkRole.Client)
             {
+                int authorizedCount = 0;
+                for (int i = 0; i < _reusableDirtyList.Count; i++)
+                {
+                    if (_reusableDirtyList[i].HasAuthority)
+                    {
+                        authorizedCount++;
+                    }
+                }
+
+                if (authorizedCount == 0) return;
+
                 _sharedFlushWriter.Clear();
                 var writer = new MessagePackWriter(_sharedFlushWriter);
-                writer.WriteArrayHeader(_reusableDirtyList.Count);
+                writer.WriteArrayHeader(authorizedCount);
 
                 for (int i = 0; i < _reusableDirtyList.Count; i++)
                 {
                     var syncVar = _reusableDirtyList[i];
+                    if (!syncVar.HasAuthority) continue;
+
                     if (!syncVar.TryWriteSlotForWire(ref writer, out _))
                     {
                         if (syncVar.TryMarkDirty())
@@ -643,6 +668,7 @@ namespace Liminal.Net.SyncVar
 
         private void HandleSnapshot(SyncVarSnapshotPacket packet, ushort senderId)
         {
+            Volatile.Write(ref _hasReceivedInitialSnapshot, 1);
             if (packet.Entries == null || packet.Entries.Count == 0) return;
 
             for (int i = 0; i < packet.Entries.Count; i++)
@@ -653,7 +679,16 @@ namespace Liminal.Net.SyncVar
                     syncVar.ApplyAuthUpdateFromRemote(entry.AuthIds);
                     if (entry.Data != null && entry.Data.Length > 0)
                     {
-                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions);
+                        bool force = !syncVar.HasAuthority;
+                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force);
+                    }
+
+                    if (syncVar.HasAuthority && syncVar.Version > entry.Version)
+                    {
+                        if (syncVar.TryMarkDirty())
+                        {
+                            EnqueueDirty(syncVar);
+                        }
                     }
                 }
                 else
