@@ -89,7 +89,7 @@ namespace Liminal.Net.Tests
         public readonly ThreadSafeSet<ushort> ConnectedClients = new();
         public readonly ThreadSafeSet<ushort> KickedClients = new();
 
-        public ushort LocalClientId => 1;
+        public ushort LocalClientId { get; set; } = 1;
         public bool IsServer { get; set; } = true;
         public bool IsClient => !IsServer;
         public bool IsConnected { get; set; } = true;

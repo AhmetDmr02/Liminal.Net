@@ -160,8 +160,6 @@ namespace Liminal.Net.SyncVar
                 _unboundAuth.Clear();
             }
             DirtyBitset.Clear();
-            _clientAuthorizedList.Clear();
-            _tailoredVarsList.Clear();
         }
 
         public bool UnregisterSyncVar(ISyncVarInternal syncVar)
@@ -503,6 +501,9 @@ namespace Liminal.Net.SyncVar
             }
             finally
             {
+                _clientAuthorizedList.Clear();
+                _tailoredVarsList.Clear();
+                _reusableDirtyList.Clear();
                 Volatile.Write(ref _isFlushing, 0);
             }
         }

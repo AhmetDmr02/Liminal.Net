@@ -132,7 +132,14 @@ namespace Liminal.Net.SyncVar
                 var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
                 if (netManager == null || netManager.Role == NetworkRole.None) return true;
 
-                // Server/Host is ALWAYS authorized
+                if (netManager.Role == NetworkRole.Client)
+                {
+                    ushort myId = netManager.localID;
+                    if (myId == 0 || myId == ILiminalTransport.SERVER_ID) return false;
+                    return IsAuthorized(myId);
+                }
+
+                // Server or Host is ALWAYS authorized
                 if (netManager.Role == NetworkRole.Server ||
                     netManager.Role == NetworkRole.Host ||
                     netManager.Transport?.IsServer == true ||
@@ -141,7 +148,7 @@ namespace Liminal.Net.SyncVar
                     return true;
                 }
 
-                return IsAuthorized(netManager.localID);
+                return false;
             }
         }
 
@@ -365,26 +372,29 @@ namespace Liminal.Net.SyncVar
 
             lock (_authLock)
             {
-                bool previousAuth = HasAuthority;
-                Volatile.Write(ref _authIds, newAuthIds ?? Array.Empty<ushort>());
-
-                currentAuth = HasAuthority;
-                if (previousAuth != currentAuth)
+                lock (_writeLock)
                 {
-                    if (!currentAuth)
-                    {
-                        ClearDirty();
-                    }
+                    bool previousAuth = HasAuthority;
+                    Volatile.Write(ref _authIds, newAuthIds ?? Array.Empty<ushort>());
 
-                    if (deferEvent)
+                    currentAuth = HasAuthority;
+                    if (previousAuth != currentAuth)
                     {
-                        _pendingAuthValue = currentAuth;
-                        _hasPendingAuthChanged = true;
-                    }
-                    else
-                    {
-                        _hasPendingAuthChanged = false;
-                        fireEvent = true;
+                        if (!currentAuth)
+                        {
+                            ClearDirty();
+                        }
+
+                        if (deferEvent)
+                        {
+                            _pendingAuthValue = currentAuth;
+                            _hasPendingAuthChanged = true;
+                        }
+                        else
+                        {
+                            _hasPendingAuthChanged = false;
+                            fireEvent = true;
+                        }
                     }
                 }
             }
@@ -410,14 +420,22 @@ namespace Liminal.Net.SyncVar
 
         private void CommitAuthUpdate(ushort[] newAuthIds, out bool fireEvent, out bool currentAuth)
         {
-            bool previousAuth = HasAuthority;
-            Volatile.Write(ref _authIds, newAuthIds);
-
-            currentAuth = HasAuthority;
-            fireEvent = previousAuth != currentAuth;
-            if (fireEvent)
+            lock (_writeLock)
             {
-                _hasPendingAuthChanged = false;
+                bool previousAuth = HasAuthority;
+                Volatile.Write(ref _authIds, newAuthIds);
+
+                currentAuth = HasAuthority;
+                if (previousAuth != currentAuth && !currentAuth)
+                {
+                    ClearDirty();
+                }
+
+                fireEvent = previousAuth != currentAuth;
+                if (fireEvent)
+                {
+                    _hasPendingAuthChanged = false;
+                }
             }
         }
 
@@ -555,6 +573,13 @@ namespace Liminal.Net.SyncVar
                 return true;
             }
 
+            if (netManager.Role == NetworkRole.Client)
+            {
+                ushort myId = netManager.localID;
+                LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {myId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+                return false;
+            }
+
             if (netManager.Role == NetworkRole.Server ||
                 netManager.Role == NetworkRole.Host ||
                 netManager.Transport?.IsServer == true ||
@@ -563,8 +588,8 @@ namespace Liminal.Net.SyncVar
                 return true;
             }
 
-            ushort myId = netManager.localID;
-            LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {myId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+            ushort otherId = netManager.localID;
+            LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {otherId} is not the server. Modifications for '{Token}' can only be performed by the server.");
             return false;
         }
 
@@ -589,6 +614,14 @@ namespace Liminal.Net.SyncVar
 
             lock (_writeLock)
             {
+                if (!HasAuthority)
+                {
+                    var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                    ushort myId = netManager?.localID ?? 0;
+                    LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
+                    return;
+                }
+
                 int currentFront = Volatile.Read(ref _frontIndex);
                 if (!force && EqualityComparer<T>.Default.Equals(_values[currentFront], newValue)) return;
 

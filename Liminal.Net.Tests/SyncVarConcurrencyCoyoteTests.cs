@@ -1113,6 +1113,72 @@ namespace Liminal.Net.Tests.Coyote
         }
 
         [Test]
+        public static async Task Coyote_SyncVar_ClientFlushDirtyAndResetPendingState_ConcurrentRace()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = false };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartClient("127.0.0.1", 7777);
+            transport.TriggerLocalClientConnected(5);
+
+            var syncVarManager = netManager.SyncVarManager;
+            netManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(new SyncVarSnapshotPacket()));
+
+            const int count = 4;
+            var svList = new SyncVar<int>[count];
+            for (int i = 0; i < count; i++)
+            {
+                svList[i] = new SyncVar<int>($"client_race_token_{i}", 0, syncVarManager);
+                svList[i].ApplyAuthUpdateFromRemote(new ushort[] { 5 });
+            }
+
+            const int iterations = 30;
+
+            var taskMutate = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    for (int s = 0; s < count; s++)
+                    {
+                        svList[s].Value = i;
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            var taskFlush = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            var taskReset = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.ResetPendingState();
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskMutate, taskFlush, taskReset);
+        }
+
+        [Test]
         public static async Task Coyote_SyncVar_ZeroAllocDeferredEvents_ConcurrentUpdatesAndReentrancy()
         {
             var config = new LiminalNetworkConfig
@@ -1435,6 +1501,107 @@ namespace Liminal.Net.Tests.Coyote
 
             Specification.Assert(desyncObserved == 0,
                 $"Version and Value publication desynchronized! Reader observed Version ahead of Value {desyncObserved} times.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_AuthorityRevocation_ConcurrentWrite_BlocksUnauthorizedWriteAndPreservesCleanDirtyState()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = false };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartClient("127.0.0.1", 7777);
+            netManager.Ticker.Stop();
+            ushort localId = netManager.localID;
+            transport.TriggerLocalClientConnected(localId);
+
+            var syncVarManager = netManager.SyncVarManager;
+            var sv = new SyncVar<int>("auth_revoke_race", 100, syncVarManager);
+            sv.ApplyAuthUpdateFromRemote(new ushort[] { localId });
+
+            Specification.Assert(sv.HasAuthority, "Local client must have authority initially.");
+
+            try
+            {
+                var taskWriter = Task.Run(async () =>
+                {
+                    sv.Value = 999;
+                    await Task.Yield();
+                });
+
+                var taskRevoke = Task.Run(async () =>
+                {
+                    sv.ApplyAuthUpdateFromRemote(Array.Empty<ushort>());
+                    await Task.Yield();
+                });
+
+                await Task.WhenAll(taskWriter, taskRevoke);
+
+                Specification.Assert(!sv.HasAuthority, "SyncVar must have authority revoked at the end.");
+                Specification.Assert(!sv.IsDirty, $"SyncVar cannot be marked dirty when authority is revoked! IsDirty={sv.IsDirty}");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ClientConnecting_CannotClaimServerAuthorityBeforeHandshake()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = false, LocalClientId = 0 };
+
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartClient("127.0.0.1", 7777);
+            netManager.Ticker.Stop();
+
+            var syncVarManager = netManager.SyncVarManager;
+            var sv = new SyncVar<int>("connecting_auth_test", 50, syncVarManager);
+
+            try
+            {
+                var writerTask = Task.Run(async () =>
+                {
+                    sv.Value = 999;
+                    await Task.Yield();
+                });
+
+                var handshakeTask = Task.Run(async () =>
+                {
+                    transport.LocalClientId = 1;
+                    transport.TriggerLocalClientConnected(1);
+                    await Task.Yield();
+                });
+
+                await Task.WhenAll(writerTask, handshakeTask);
+
+                Specification.Assert(!sv.HasAuthority,
+                    $"Connecting client with unassigned ID must not have authority! HasAuthority={sv.HasAuthority}, localId={netManager.localID}");
+                Specification.Assert(sv.Value == 50,
+                    $"SyncVar value was modified without authority! Expected 50, got {sv.Value}");
+                Specification.Assert(!sv.IsDirty,
+                    $"SyncVar was marked dirty without authority! IsDirty={sv.IsDirty}");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
         }
     }
 }
