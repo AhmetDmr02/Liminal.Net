@@ -27,7 +27,7 @@ namespace Liminal.Net.SyncVar
         void SetAuthIds(params ushort[] clientIds);
         void AddAuthority(ushort clientId);
         void RemoveAuthority(ushort clientId);
-        void ApplyAuthUpdateFromRemote(ushort[] newAuthIds);
+        void ApplyAuthUpdateFromRemote(ushort[] newAuthIds, bool deferEvent = false);
 
         void SetExclusionIds(params ushort[] clientIds);
         void SetExclusions(params ushort[] clientIds);
@@ -43,7 +43,8 @@ namespace Liminal.Net.SyncVar
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
         bool TryExtractSnapshotData(out byte[] data, out uint version);
-        void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false);
+        void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false);
+        void FirePendingEvents();
     }
 
     public class SyncVar<T> : ISyncVarInternal, IDisposable
@@ -75,6 +76,12 @@ namespace Liminal.Net.SyncVar
         private ushort[] _authIds = Array.Empty<ushort>();
         private ushort[] _exclusionIds = Array.Empty<ushort>();
         private readonly byte[] _tokenBytes;
+
+        private T _pendingOldValue;
+        private T _pendingNewValue;
+        private bool _hasPendingValueChanged;
+        private bool _pendingAuthValue;
+        private bool _hasPendingAuthChanged;
 
         public event Action<bool> OnAuthorityChanged;
 
@@ -324,7 +331,7 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void ApplyAuthUpdateFromRemote(ushort[] newAuthIds)
+        public void ApplyAuthUpdateFromRemote(ushort[] newAuthIds, bool deferEvent = false)
         {
             bool fireEvent = false;
             bool currentAuth = false;
@@ -341,7 +348,17 @@ namespace Liminal.Net.SyncVar
                     {
                         ClearDirty();
                     }
-                    fireEvent = true;
+
+                    if (deferEvent)
+                    {
+                        _pendingAuthValue = currentAuth;
+                        _hasPendingAuthChanged = true;
+                    }
+                    else
+                    {
+                        _hasPendingAuthChanged = false;
+                        fireEvent = true;
+                    }
                 }
             }
 
@@ -371,6 +388,10 @@ namespace Liminal.Net.SyncVar
 
             currentAuth = HasAuthority;
             fireEvent = previousAuth != currentAuth;
+            if (fireEvent)
+            {
+                _hasPendingAuthChanged = false;
+            }
         }
 
         private void BroadcastAuthIfServer(ushort[] newAuthIds)
@@ -564,7 +585,17 @@ namespace Liminal.Net.SyncVar
                 uint newVersion = _version + 1;
                 _slotLengths[backIndex] = writtenLength;
                 _slotVersions[backIndex] = newVersion;
-                old = _values[currentFront];
+                if (_hasPendingValueChanged)
+                {
+                    old = _pendingOldValue;
+                    _hasPendingValueChanged = false;
+                    _pendingOldValue = default;
+                    _pendingNewValue = default;
+                }
+                else
+                {
+                    old = _values[currentFront];
+                }
                 _values[backIndex] = newValue;
                 Volatile.Write(ref _version, newVersion);
 
@@ -652,12 +683,13 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false)
+        public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false)
         {
             if (!force && newVersion <= _version && _version != 0) return;
 
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
             T old;
+            bool fireEvent = false;
 
             lock (_writeLock)
             {
@@ -679,7 +711,15 @@ namespace Liminal.Net.SyncVar
                 _slotLengths[backIndex] = length;
                 _slotVersions[backIndex] = newVersion;
 
-                old = _values[currentFront];
+                if (_hasPendingValueChanged)
+                {
+                    old = _pendingOldValue;
+                }
+                else
+                {
+                    old = _values[currentFront];
+                }
+
                 _values[backIndex] = deserialized;
                 Volatile.Write(ref _version, newVersion);
 
@@ -704,9 +744,72 @@ namespace Liminal.Net.SyncVar
                 {
                     ClearDirty();
                 }
+
+                if (deferEvent)
+                {
+                    _pendingOldValue = old;
+                    _pendingNewValue = deserialized;
+                    _hasPendingValueChanged = true;
+                }
+                else
+                {
+                    _hasPendingValueChanged = false;
+                    _pendingOldValue = default;
+                    _pendingNewValue = default;
+                    fireEvent = true;
+                }
             }
 
-            OnValueChanged?.Invoke(old, deserialized);
+            if (fireEvent)
+            {
+                OnValueChanged?.Invoke(old, deserialized);
+            }
+        }
+
+        public void FirePendingEvents()
+        {
+            bool fireAuth = false;
+            bool authValue = false;
+            lock (_authLock)
+            {
+                if (_hasPendingAuthChanged)
+                {
+                    fireAuth = true;
+                    authValue = _pendingAuthValue;
+                    _hasPendingAuthChanged = false;
+                }
+            }
+
+            bool fireValue = false;
+            T oldVal = default;
+            T newVal = default;
+            lock (_writeLock)
+            {
+                if (_hasPendingValueChanged)
+                {
+                    fireValue = true;
+                    oldVal = _pendingOldValue;
+                    newVal = _pendingNewValue;
+                    _hasPendingValueChanged = false;
+                    _pendingOldValue = default;
+                    _pendingNewValue = default;
+                }
+            }
+
+            try
+            {
+                if (fireAuth)
+                {
+                    OnAuthorityChanged?.Invoke(authValue);
+                }
+            }
+            finally
+            {
+                if (fireValue)
+                {
+                    OnValueChanged?.Invoke(oldVal, newVal);
+                }
+            }
         }
 
         public void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options)
@@ -722,6 +825,16 @@ namespace Liminal.Net.SyncVar
         public void Dispose()
         {
             Unregister();
+            lock (_authLock)
+            {
+                _hasPendingAuthChanged = false;
+            }
+            lock (_writeLock)
+            {
+                _hasPendingValueChanged = false;
+                _pendingOldValue = default;
+                _pendingNewValue = default;
+            }
         }
     }
 }

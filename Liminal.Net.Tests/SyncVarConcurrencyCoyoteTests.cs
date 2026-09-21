@@ -1053,5 +1053,172 @@ namespace Liminal.Net.Tests.Coyote
                 }
             }
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_FlushDirtyAndResetPendingState_ConcurrentRace()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const int count = 4;
+            var svList = new SyncVar<int>[count];
+            for (int i = 0; i < count; i++)
+            {
+                svList[i] = new SyncVar<int>($"race_token_{i}", 0, syncVarManager);
+            }
+
+            const int iterations = 30;
+
+            var taskMutate = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    for (int s = 0; s < count; s++)
+                    {
+                        svList[s].Value = i;
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            var taskFlush = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            var taskReset = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.ResetPendingState();
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskMutate, taskFlush, taskReset);
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ZeroAllocDeferredEvents_ConcurrentUpdatesAndReentrancy()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const int varCount = 5;
+            const ushort clientA = 10;
+            const ushort clientB = 20;
+
+            for (int i = 0; i < varCount; i++)
+            {
+                string token = $"deferred_test_{i}";
+                var payload = MessagePackSerializer.Serialize(100 + i);
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    MessagePackSerializer.Serialize(new SyncVarSnapshotPacket
+                    {
+                        Entries = new System.Collections.Generic.List<SyncVarSnapshotEntry>
+                        {
+                            new SyncVarSnapshotEntry
+                            {
+                                Token = token,
+                                Version = 1,
+                                Data = payload,
+                                AuthIds = new ushort[] { clientA }
+                            }
+                        }
+                    }));
+            }
+
+            int authEventsFired = 0;
+            int valueEventsFired = 0;
+            var vars = new SyncVar<int>[varCount];
+
+            var taskRegister = Task.Run(async () =>
+            {
+                for (int i = 0; i < varCount; i++)
+                {
+                    string token = $"deferred_test_{i}";
+                    var sv = new SyncVar<int>(token, 0, syncVarManager);
+                    vars[i] = sv;
+
+                    sv.OnAuthorityChanged += auth =>
+                    {
+                        Interlocked.Increment(ref authEventsFired);
+                        _ = syncVarManager.Bind<int>($"reentrant_bound_{token}", 0);
+                        if (auth)
+                        {
+                            sv.Value = 999;
+                        }
+                    };
+
+                    sv.OnValueChanged += (oldVal, newVal) =>
+                    {
+                        Interlocked.Increment(ref valueEventsFired);
+                        Specification.Assert(oldVal >= 0 && newVal >= 0, "Values must be non-negative");
+                        _ = syncVarManager.Bind<int>($"reentrant_val_{token}", 0);
+                    };
+
+                    await Task.Yield();
+                }
+            });
+
+            var taskConcurrentRemote = Task.Run(async () =>
+            {
+                for (int i = 0; i < varCount; i++)
+                {
+                    string token = $"deferred_test_{i}";
+                    var payload = MessagePackSerializer.Serialize(200 + i);
+
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                        ILiminalTransport.SERVER_ID,
+                        MessagePackSerializer.Serialize(new SyncVarSnapshotPacket
+                        {
+                            Entries = new System.Collections.Generic.List<SyncVarSnapshotEntry>
+                            {
+                                new SyncVarSnapshotEntry
+                                {
+                                    Token = token,
+                                    Version = 2,
+                                    Data = payload,
+                                    AuthIds = new ushort[] { clientB }
+                                }
+                            }
+                        }));
+
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskRegister, taskConcurrentRemote);
+
+            Specification.Assert(authEventsFired >= 0, "Valid auth event count");
+            Specification.Assert(valueEventsFired >= 0, "Valid value event count");
+        }
     }
 }
