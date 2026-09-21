@@ -1,4 +1,4 @@
-﻿using Liminal.Net.ClientIdResolvers;
+using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Test;
 using MessagePack;
@@ -524,6 +524,7 @@ namespace Liminal.Net.Tests
 
             var transport = new MockTransport();
             var netManager = new LiminalNetworkManager(transport, config);
+            netManager.SyncVarManager?.DetachFromManager();
             var manager = netManager.SessionManager;
 
             manager.InitializeConfig(new LiminalTelemetryConfig
