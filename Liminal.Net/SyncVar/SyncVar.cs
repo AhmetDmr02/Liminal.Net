@@ -87,7 +87,34 @@ namespace Liminal.Net.SyncVar
 
         public string Token { get; }
         public byte[] TokenBytes => _tokenBytes;
-        public uint Version => Volatile.Read(ref _version);
+        public uint Version
+        {
+            get
+            {
+                var spinner = new SpinWait();
+                while (true)
+                {
+                    int seq1 = Volatile.Read(ref _valueSeq);
+                    if ((seq1 & 1) != 0)
+                    {
+                        spinner.SpinOnce();
+                        continue;
+                    }
+
+                    uint ver = Volatile.Read(ref _version);
+
+                    Thread.MemoryBarrier();
+
+                    int seq2 = Volatile.Read(ref _valueSeq);
+                    if (seq1 == seq2)
+                    {
+                        return ver;
+                    }
+
+                    spinner.SpinOnce();
+                }
+            }
+        }
         public int ActivePageIndex => _slots[Volatile.Read(ref _frontIndex)].PageIndex;
         public int ActivePageOffset => _slots[Volatile.Read(ref _frontIndex)].PageOffset;
         public int Length => _slotLengths[Volatile.Read(ref _frontIndex)];
@@ -597,7 +624,6 @@ namespace Liminal.Net.SyncVar
                     old = _values[currentFront];
                 }
                 _values[backIndex] = newValue;
-                Volatile.Write(ref _version, newVersion);
 
                 var spinner = new SpinWait();
                 while (Interlocked.CompareExchange(ref _gate, STATE_SWAPPING, STATE_IDLE) != STATE_IDLE)
@@ -608,6 +634,7 @@ namespace Liminal.Net.SyncVar
                 try
                 {
                     Interlocked.Increment(ref _valueSeq);
+                    Volatile.Write(ref _version, newVersion);
                     Volatile.Write(ref _frontIndex, backIndex);
                     Interlocked.Increment(ref _valueSeq);
                 }
@@ -723,7 +750,6 @@ namespace Liminal.Net.SyncVar
                 }
 
                 _values[backIndex] = deserialized;
-                Volatile.Write(ref _version, newVersion);
 
                 var spinner = new SpinWait();
                 while (Interlocked.CompareExchange(ref _gate, STATE_SWAPPING, STATE_IDLE) != STATE_IDLE)
@@ -734,6 +760,7 @@ namespace Liminal.Net.SyncVar
                 try
                 {
                     Interlocked.Increment(ref _valueSeq);
+                    Volatile.Write(ref _version, newVersion);
                     Volatile.Write(ref _frontIndex, backIndex);
                     Interlocked.Increment(ref _valueSeq);
                 }

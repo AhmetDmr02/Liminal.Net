@@ -1398,5 +1398,43 @@ namespace Liminal.Net.Tests.Coyote
                 }
             }
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_VersionAndValue_AtomicPublication_NoVersionValueDesync()
+        {
+            var sv = new SyncVar<int>("desync_test", 0);
+
+            const int iterations = 30;
+            int desyncObserved = 0;
+
+            var writer = Task.Run(async () =>
+            {
+                for (int i = 1; i <= iterations; i++)
+                {
+                    sv.Value = i;
+                    await Task.Yield();
+                }
+            });
+
+            var reader = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations * 2; i++)
+                {
+                    uint ver = sv.Version;
+                    int val = sv.Value;
+
+                    if (ver > 0 && val < (int)ver)
+                    {
+                        Interlocked.Increment(ref desyncObserved);
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(writer, reader);
+
+            Specification.Assert(desyncObserved == 0,
+                $"Version and Value publication desynchronized! Reader observed Version ahead of Value {desyncObserved} times.");
+        }
     }
 }
