@@ -167,6 +167,15 @@ namespace Liminal.Net.Tests.Coyote
                     await Task.Delay(5);
                 }
 
+                if (!clientConnectedGate.Task.IsCompleted)
+                {
+                    var deadline = DateTime.UtcNow.AddSeconds(5);
+                    while (!clientConnectedGate.Task.IsCompleted && DateTime.UtcNow < deadline)
+                    {
+                        await Task.Delay(10);
+                    }
+                }
+
                 Specification.Assert(clientConnectedGate.Task.IsCompleted, "Client connection handshake timed out.");
                 ushort id = clientConnectedGate.Task.Result;
 

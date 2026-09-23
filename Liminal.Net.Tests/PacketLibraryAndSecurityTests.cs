@@ -1,6 +1,7 @@
 using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Handshakes;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
@@ -177,17 +178,19 @@ namespace Liminal.Net.Tests
             };
 
             byte[] body = MessagePackSerializer.Serialize(maliciousHandshake);
-            byte[] frame = new byte[8 + body.Length];
-            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), body.Length);
-            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
-            body.CopyTo(frame.AsSpan(8));
+            byte[] frame = new byte[TcpHandshakePipeline.HeaderSize + body.Length];
+            BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), TcpHandshakePipeline.HandshakeMagic);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(4, 4), body.Length);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(8, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+            body.CopyTo(frame.AsSpan(TcpHandshakePipeline.HeaderSize));
 
             stream.Write(frame, 0, frame.Length);
 
-            byte[] header = new byte[8];
+            byte[] header = new byte[TcpHandshakePipeline.HeaderSize];
             rogueClient.ReceiveTimeout = 2000;
-            stream.ReadExactly(header, 0, 8);
-            int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+            stream.ReadExactly(header, 0, TcpHandshakePipeline.HeaderSize);
+            uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
+            int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
             byte[] payload = new byte[length];
             stream.ReadExactly(payload, 0, length);
@@ -195,6 +198,7 @@ namespace Liminal.Net.Tests
 
             Assert.Multiple(() =>
             {
+                Assert.That(magic, Is.EqualTo(TcpHandshakePipeline.HandshakeMagic));
                 Assert.That(response.AssignedClientID, Is.EqualTo(0), "Server should not assign an ID to a registry-mismatched client.");
                 Assert.That(response.RejectReason, Is.EqualTo(DisconnectReason.ProtocolViolation));
                 Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
@@ -220,17 +224,19 @@ namespace Liminal.Net.Tests
             };
 
             byte[] body = MessagePackSerializer.Serialize(outdatedHandshake);
-            byte[] frame = new byte[8 + body.Length];
-            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), body.Length);
-            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
-            body.CopyTo(frame.AsSpan(8));
+            byte[] frame = new byte[TcpHandshakePipeline.HeaderSize + body.Length];
+            BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), TcpHandshakePipeline.HandshakeMagic);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(4, 4), body.Length);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(8, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+            body.CopyTo(frame.AsSpan(TcpHandshakePipeline.HeaderSize));
 
             stream.Write(frame, 0, frame.Length);
 
-            byte[] header = new byte[8];
+            byte[] header = new byte[TcpHandshakePipeline.HeaderSize];
             outdatedClient.ReceiveTimeout = 2000;
-            stream.ReadExactly(header, 0, 8);
-            int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+            stream.ReadExactly(header, 0, TcpHandshakePipeline.HeaderSize);
+            uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
+            int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
 
             byte[] payload = new byte[length];
             stream.ReadExactly(payload, 0, length);
@@ -238,6 +244,7 @@ namespace Liminal.Net.Tests
 
             Assert.Multiple(() =>
             {
+                Assert.That(magic, Is.EqualTo(TcpHandshakePipeline.HandshakeMagic));
                 Assert.That(response.AssignedClientID, Is.EqualTo(0));
                 Assert.That(response.RejectReason, Is.EqualTo(DisconnectReason.VersionMismatch));
                 Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
@@ -256,9 +263,10 @@ namespace Liminal.Net.Tests
             var stream = attackerClient.GetStream();
 
             // Handshake pipeline caps frames at maxHandshakeSize (256 bytes default)
-            byte[] maliciousHeader = new byte[8];
-            BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(0, 4), 1024 * 1024); // Claiming 1 MB
-            BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+            byte[] maliciousHeader = new byte[TcpHandshakePipeline.HeaderSize];
+            BinaryPrimitives.WriteUInt32LittleEndian(maliciousHeader.AsSpan(0, 4), TcpHandshakePipeline.HandshakeMagic);
+            BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(4, 4), 1024 * 1024); // Claiming 1 MB
+            BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(8, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
 
             stream.Write(maliciousHeader, 0, maliciousHeader.Length);
 
@@ -289,10 +297,11 @@ namespace Liminal.Net.Tests
             // Client skips Step 1 and immediately transmits Step 3 (Ack)
             var ack = new ConnectionHandshakeClientAck { Ack = true, ClientID = 1 };
             byte[] body = MessagePackSerializer.Serialize(ack);
-            byte[] frame = new byte[8 + body.Length];
-            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(0, 4), body.Length);
-            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>());
-            body.CopyTo(frame.AsSpan(8));
+            byte[] frame = new byte[TcpHandshakePipeline.HeaderSize + body.Length];
+            BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(0, 4), TcpHandshakePipeline.HandshakeMagic);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(4, 4), body.Length);
+            BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(8, 4), LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>());
+            body.CopyTo(frame.AsSpan(TcpHandshakePipeline.HeaderSize));
 
             stream.Write(frame, 0, frame.Length);
 
@@ -306,6 +315,50 @@ namespace Liminal.Net.Tests
             catch { bytesRead = 0; }
 
             Assert.That(bytesRead, Is.EqualTo(0), "Server accepted out-of-order handshake packet instead of disconnecting.");
+            Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test_Handshake_ZeroBytesProbe_DroppedSilently()
+        {
+            LiminalPacketLibrary.Initialize();
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            using var pingClient = new TcpClient();
+            pingClient.Connect("127.0.0.1", _currentTestPort);
+			
+            pingClient.Close();
+
+            Thread.Sleep(100);
+
+            Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test_Handshake_NonMatchingMagicProbe_DroppedSilently()
+        {
+            LiminalPacketLibrary.Initialize();
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
+
+            using var pingClient = new TcpClient();
+            pingClient.Connect("127.0.0.1", _currentTestPort);
+            var stream = pingClient.GetStream();
+
+            byte[] pingBytes = new byte[] { 0x08, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00 };
+            stream.Write(pingBytes, 0, pingBytes.Length);
+
+            byte[] readBuffer = new byte[8];
+            int bytesRead = 0;
+            try
+            {
+                pingClient.ReceiveTimeout = 2000;
+                bytesRead = stream.Read(readBuffer, 0, 8);
+            }
+            catch { bytesRead = 0; }
+
+            Assert.That(bytesRead, Is.EqualTo(0), "Server should immediately drop non-matching magic probe.");
             Assert.That(_serverManager.Transport.ConnectedClientCount, Is.EqualTo(0));
         }
 

@@ -14,6 +14,9 @@ namespace Liminal.Net.Handshakes
 {
     internal class TcpHandshakePipeline
     {
+        public const uint HandshakeMagic = 0x4E4D494C; // ASCII "LIMN" in little-endian
+        public const int HeaderSize = 12; // Magic (4B) + Length (4B) + PacketId (4B)
+
         private readonly ILiminalClientIdResolver _resolver;
         private readonly float _timeoutSeconds;
         private readonly int _maxHandshakeSize;
@@ -29,22 +32,51 @@ namespace Liminal.Net.Handshakes
 
         public virtual async Task<HandshakeResult> TryVerifyClientAsync(TcpClient client, ushort serverVersion, Func<bool> canAcceptConnection, Action<ushort> onClientValidated = null, Func<ushort, object> onClientPreValidated = null, Action<ushort, object> onClientPostValidated = null)
         {
+            bool magicMatched = false;
             try
             {
                 var stream = client.GetStream();
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_timeoutSeconds));
 
-                byte[] header = new byte[8];
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
+                byte[] header = new byte[HeaderSize];
+                int totalRead = 0;
+                while (totalRead < HeaderSize)
+                {
+                    int read = await stream.ReadAsync(header.AsMemory(totalRead, HeaderSize - totalRead), cts.Token).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        bool hadMagic = totalRead >= 4 && BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4)) == HandshakeMagic;
+                        if (!hadMagic)
+                        {
+                            Drop(client, $"Probe disconnected before handshake (read {totalRead} bytes)", forceRst: false, silent: true);
+                            return HandshakeResult.Fail(DisconnectReason.ConnectionLost, "Probe disconnected", silent: true);
+                        }
+                        else
+                        {
+                            Drop(client, $"Fatal Handshake Error: Incomplete handshake header (read {totalRead}/{HeaderSize} bytes)", forceRst: true, silent: false);
+                            return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Incomplete handshake header", silent: false);
+                        }
+                    }
+                    totalRead += read;
+                }
 
-                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
-                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
+                if (magic != HandshakeMagic)
+                {
+                    Drop(client, $"Non-Liminal connection (Magic mismatch: 0x{magic:X8})", forceRst: true, silent: true);
+                    return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Magic mismatch", silent: true);
+                }
+
+                magicMatched = true;
+
+                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
                 ushort firstPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>();
 
                 if (length <= 0 || length > _maxHandshakeSize || packetId != firstPacketId)
                 {
-                    Drop(client, $"Security Violation: ID {packetId}, Length {length}", forceRst: true);
-                    return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Malformed handshake header");
+                    Drop(client, $"Security Violation: ID {packetId}, Length {length}", forceRst: true, silent: false);
+                    return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Malformed handshake header", silent: false);
                 }
 
                 byte[] payload = new byte[length];
@@ -100,12 +132,13 @@ namespace Liminal.Net.Handshakes
                 await SendPacketAsync(stream, secondPacketId, serverResponse, cts.Token).ConfigureAwait(false);
                 await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
-                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
-                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                await stream.LiminalReadExactlyAsync(header, 0, HeaderSize, cts.Token).ConfigureAwait(false);
+                uint ackMagic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
+                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
 
                 ushort thirdPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeClientAck>();
-                if (packetId != thirdPacketId || length > _maxHandshakeSize || length <= 0)
+                if (ackMagic != HandshakeMagic || packetId != thirdPacketId || length > _maxHandshakeSize || length <= 0)
                 {
                     Drop(client, $"Protocol Violation: Expected ACK (ID {thirdPacketId}, Length {length})", forceRst: true);
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "ACK violation");
@@ -144,18 +177,21 @@ namespace Liminal.Net.Handshakes
             }
             catch (OperationCanceledException)
             {
-                Drop(client, "Handshake Timeout");
-                return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out");
+                bool silent = !magicMatched;
+                Drop(client, "Handshake Timeout", forceRst: false, silent: silent);
+                return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out", silent: silent);
             }
             catch (ObjectDisposedException)
             {
-                Drop(client, "Handshake Timeout (CTS teardown race)");
-                return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out");
+                bool silent = !magicMatched;
+                Drop(client, "Handshake Timeout (CTS teardown race)", forceRst: false, silent: silent);
+                return HandshakeResult.Fail(DisconnectReason.Timeout, "Handshake timed out", silent: silent);
             }
             catch (Exception ex)
             {
-                Drop(client, $"Fatal Handshake Error: {ex}");
-                return HandshakeResult.Fail(DisconnectReason.Custom, ex.Message);
+                bool silent = !magicMatched;
+                Drop(client, $"Fatal Handshake Error: {ex}", forceRst: false, silent: silent);
+                return HandshakeResult.Fail(DisconnectReason.Custom, ex.Message, silent: silent);
             }
         }
 
@@ -176,14 +212,15 @@ namespace Liminal.Net.Handshakes
                 await SendPacketAsync(stream, firstPacketId, clientInfo, cts.Token).ConfigureAwait(false);
                 await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
-                byte[] header = new byte[8];
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
+                byte[] header = new byte[HeaderSize];
+                await stream.LiminalReadExactlyAsync(header, 0, HeaderSize, cts.Token).ConfigureAwait(false);
 
-                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
-                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                uint magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
+                int length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                int packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
 
                 ushort secondPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakePacketServer>();
-                if (packetId != secondPacketId || length <= 0 || length > _maxHandshakeSize)
+                if (magic != HandshakeMagic || packetId != secondPacketId || length <= 0 || length > _maxHandshakeSize)
                 {
                     Drop(client, $"Unexpected Server Response. ID: {packetId}, Len: {length}", forceRst: true);
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Invalid server packet");
@@ -223,12 +260,13 @@ namespace Liminal.Net.Handshakes
                 await SendPacketAsync(stream, thirdPacketId, ack, cts.Token).ConfigureAwait(false);
                 await stream.FlushAsync(cts.Token).ConfigureAwait(false);
 
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token).ConfigureAwait(false);
-                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
-                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                await stream.LiminalReadExactlyAsync(header, 0, HeaderSize, cts.Token).ConfigureAwait(false);
+                magic = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(0, 4));
+                length = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
+                packetId = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(8, 4));
 
                 ushort fourthPacketId = LiminalPacketLibrary.GetId<ConnectionHandshakeReadyConfirmed>();
-                if (packetId != fourthPacketId || length < 0 || length > _maxHandshakeSize)
+                if (magic != HandshakeMagic || packetId != fourthPacketId || length < 0 || length > _maxHandshakeSize)
                 {
                     Drop(client, $"Protocol Violation: Expected ReadyConfirmed (ID {fourthPacketId}, Length {length})", forceRst: true);
                     return HandshakeResult.Fail(DisconnectReason.ProtocolViolation, "Ready violation");
@@ -259,12 +297,16 @@ namespace Liminal.Net.Handshakes
             }
         }
 
-        private ushort Drop(TcpClient client, string reason, bool forceRst = false)
+        private ushort Drop(TcpClient client, string reason, bool forceRst = false, bool silent = false)
         {
-            string remoteEp = "Unknown";
-            try { remoteEp = client.Client?.RemoteEndPoint?.ToString() ?? "Disconnected"; } catch { }
+            if (!silent)
+            {
+                string remoteEp = "Unknown";
+                try { remoteEp = client.Client?.RemoteEndPoint?.ToString() ?? "Disconnected"; } catch { }
 
-            LiminalLogger.LogWarning($"[Handshake] Dropping {remoteEp}: {reason}{(forceRst ? " (Forced RST)" : "")}");
+                string rstSuffix = forceRst ? " (Forced RST)" : string.Empty;
+                LiminalLogger.LogWarning($"[Handshake] Dropping {remoteEp}: {reason}{rstSuffix}");
+            }
 
             try
             {
@@ -338,11 +380,12 @@ namespace Liminal.Net.Handshakes
         private async Task SendPacketAsync<T>(NetworkStream stream, int id, T packet, CancellationToken token)
         {
             byte[] body = MessagePackSerializer.Serialize(packet);
-            byte[] full = new byte[8 + body.Length];
+            byte[] full = new byte[HeaderSize + body.Length];
 
-            BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(0, 4), body.Length);
-            BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(4, 4), id);
-            body.CopyTo(full.AsSpan(8));
+            BinaryPrimitives.WriteUInt32LittleEndian(full.AsSpan(0, 4), HandshakeMagic);
+            BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(4, 4), body.Length);
+            BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(8, 4), id);
+            body.CopyTo(full.AsSpan(HeaderSize));
 
             await stream.WriteAsync(full.AsMemory(), token).ConfigureAwait(false);
         }

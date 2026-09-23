@@ -37,18 +37,20 @@ namespace Liminal.Net.Core
         public bool Success => ClientId != 0;
         public DisconnectReason FailureReason { get; }
         public string FailureMessage { get; }
+        public bool Silent { get; }
 
-        private HandshakeResult(ushort id, DisconnectReason reason, string message)
+        private HandshakeResult(ushort id, DisconnectReason reason, string message, bool silent = false)
         {
             ClientId = id;
             FailureReason = reason;
             FailureMessage = message;
+            Silent = silent;
         }
 
         public static HandshakeResult Ok(ushort id)
-            => new(id, DisconnectReason.Unknown, null);
+            => new(id, DisconnectReason.Unknown, null, false);
 
-        public static HandshakeResult Fail(DisconnectReason reason, string message = null)
-            => new(0, reason, message);
+        public static HandshakeResult Fail(DisconnectReason reason, string message = null, bool silent = false)
+            => new(0, reason, message, silent);
     }
 }

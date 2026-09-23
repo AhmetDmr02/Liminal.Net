@@ -750,7 +750,10 @@ namespace Liminal.Net.Transports
 
                             if (!result.Success)
                             {
-                                LiminalLogger.LogWarning($"[Transport] Handshake rejected client: {result.FailureReason} - {result.FailureMessage}");
+                                if (!result.Silent)
+                                {
+                                    LiminalLogger.LogWarning($"[Transport] Handshake rejected client: {result.FailureReason} - {result.FailureMessage}");
+                                }
                                 if (promoted && assignedClientId != 0)
                                 {
                                     if (_sockets.TryGetValue(assignedClientId, out var cur) && ReferenceEquals(cur, acceptedClient))

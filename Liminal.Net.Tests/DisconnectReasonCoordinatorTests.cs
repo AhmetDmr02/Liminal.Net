@@ -1,6 +1,7 @@
 using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Handshakes;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
@@ -522,15 +523,16 @@ namespace Liminal.Net.Tests
                 };
 
                 byte[] body = MessagePackSerializer.Serialize(clientInfo);
-                byte[] full = new byte[8 + body.Length];
-                BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(0, 4), body.Length);
-                BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
-                body.CopyTo(full.AsSpan(8));
+                byte[] full = new byte[TcpHandshakePipeline.HeaderSize + body.Length];
+                BinaryPrimitives.WriteUInt32LittleEndian(full.AsSpan(0, 4), TcpHandshakePipeline.HandshakeMagic);
+                BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(4, 4), body.Length);
+                BinaryPrimitives.WriteInt32LittleEndian(full.AsSpan(8, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+                body.CopyTo(full.AsSpan(TcpHandshakePipeline.HeaderSize));
                 await stream.WriteAsync(full, cts.Token);
 
-                byte[] header = new byte[8];
-                await stream.LiminalReadExactlyAsync(header, 0, 8, cts.Token);
-                int len = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(0, 4));
+                byte[] header = new byte[TcpHandshakePipeline.HeaderSize];
+                await stream.LiminalReadExactlyAsync(header, 0, TcpHandshakePipeline.HeaderSize, cts.Token);
+                int len = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(4, 4));
                 byte[] respPayload = new byte[len];
                 await stream.LiminalReadExactlyAsync(respPayload, 0, len, cts.Token);
 
@@ -578,9 +580,10 @@ namespace Liminal.Net.Tests
             clientTransport.ClientHandshaker = async (tcpClient, cfg) =>
             {
                 var stream = tcpClient.GetStream();
-                byte[] maliciousHeader = new byte[8];
-                BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(0, 4), 1024 * 1024);
-                BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(4, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
+                byte[] maliciousHeader = new byte[TcpHandshakePipeline.HeaderSize];
+                BinaryPrimitives.WriteUInt32LittleEndian(maliciousHeader.AsSpan(0, 4), TcpHandshakePipeline.HandshakeMagic);
+                BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(4, 4), 1024 * 1024);
+                BinaryPrimitives.WriteInt32LittleEndian(maliciousHeader.AsSpan(8, 4), LiminalPacketLibrary.GetId<ConnectionHandshakePacketClient>());
 
                 await stream.WriteAsync(maliciousHeader);
 
