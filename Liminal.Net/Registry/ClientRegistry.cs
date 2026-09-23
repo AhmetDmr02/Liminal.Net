@@ -122,7 +122,6 @@ namespace Liminal.Net.Registry
                 if (isHost) LocalClient = client;
 
                 LiminalAtomicHelpers.SafeInvoke(_onClientJoined, client);
-                if (isHost) LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, client);
             }
 
             if (!isHost)

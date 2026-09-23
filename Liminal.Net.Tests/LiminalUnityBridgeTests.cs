@@ -106,5 +106,55 @@ namespace Liminal.Net.Tests
             bridge.Dispose();
             server.Shutdown();
         }
+
+        [Test]
+        public void UnityBridge_OnLocalClientReady_CanSendInHostMode()
+        {
+            int port = Interlocked.Increment(ref _portCounter);
+            var hostConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var hostManager = new LiminalNetworkManager(new TcpTransport(), hostConfig);
+            LiminalNetworkManager.Instance = hostManager;
+            var bridge = new LiminalUnityBridge();
+            bridge.Attach(hostManager);
+
+            int readyCount = 0;
+            var canSendHistory = new List<bool>();
+
+            bridge.OnLocalClientReady += client =>
+            {
+                readyCount++;
+                canSendHistory.Add(hostManager.CanSend);
+                Broadcaster.Send(SendTo.Server, new Liminal.Net.Test.ChatPacket { Message = "hello" });
+            };
+
+            hostManager.StartHost("127.0.0.1", port);
+
+            for (int i = 0; i < 200; i++)
+            {
+                bridge.Update();
+                if (readyCount > 0 && hostManager.LifecycleState == NetworkLifecycleState.HostActive)
+                    break;
+                Thread.Sleep(10);
+            }
+
+            try
+            {
+                Assert.That(canSendHistory[0], Is.True, "CanSend MUST be true on first invocation of OnLocalClientReady.");
+                Assert.That(readyCount, Is.EqualTo(1), "OnLocalClientReady should fire exactly once for local client.");
+                Assert.That(canSendHistory, Has.Count.EqualTo(1));
+            }
+            finally
+            {
+                bridge.Dispose();
+                hostManager.Shutdown();
+                LiminalNetworkManager.Instance = null;
+            }
+        }
     }
 }
