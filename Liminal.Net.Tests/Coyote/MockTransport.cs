@@ -14,40 +14,21 @@ namespace Liminal.Net.Tests
             public TransportFlags Flags;
         }
 
-        public class ThreadSafeSet<T> : IEnumerable<T>
+        public class ThreadSafeSet<T> : IEnumerable<T> where T : notnull
         {
-            private readonly HashSet<T> _set = new();
-            private readonly object _lock = new();
+            private readonly System.Collections.Concurrent.ConcurrentDictionary<T, byte> _set = new();
 
-            public bool Add(T item)
-            {
-                lock (_lock) return _set.Add(item);
-            }
+            public bool Add(T item) => _set.TryAdd(item, 0);
 
-            public bool Remove(T item)
-            {
-                lock (_lock) return _set.Remove(item);
-            }
+            public bool Remove(T item) => _set.TryRemove(item, out _);
 
-            public bool Contains(T item)
-            {
-                lock (_lock) return _set.Contains(item);
-            }
+            public bool Contains(T item) => _set.ContainsKey(item);
 
-            public void Clear()
-            {
-                lock (_lock) _set.Clear();
-            }
+            public void Clear() => _set.Clear();
 
-            public int Count
-            {
-                get { lock (_lock) return _set.Count; }
-            }
+            public int Count => _set.Count;
 
-            public IEnumerator<T> GetEnumerator()
-            {
-                lock (_lock) return new List<T>(_set).GetEnumerator();
-            }
+            public IEnumerator<T> GetEnumerator() => _set.Keys.GetEnumerator();
 
             System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
         }
@@ -147,8 +128,7 @@ namespace Liminal.Net.Tests
         public bool IsClientConnected(ushort clientId)
         {
             if (IsClientConnectedFunc != null) return IsClientConnectedFunc(clientId);
-            if (ConnectedClients.Count > 0) return ConnectedClients.Contains(clientId);
-            return true;
+            return ConnectedClients.Contains(clientId);
         }
 
         #region Test Injection Triggers

@@ -18,6 +18,7 @@ namespace Liminal.Net.Core
     public class LiminalSessionManager : IDisposable, ISessionTelemetryProvider
     {
         private readonly ConcurrentDictionary<ushort, LiminalSession> _sessions = new();
+        private LiminalSession[] _activeSessions = Array.Empty<LiminalSession>();
 
         private readonly ConcurrentQueue<(ushort SenderId, InboundPacket Packet)> _loopbackQueue = new();
 
@@ -629,8 +630,10 @@ namespace Liminal.Net.Core
 
             long now = Stopwatch.GetTimestamp();
 
-            foreach (var session in _sessions.Values)
+            LiminalSession[] activeSessions = Volatile.Read(ref _activeSessions);
+            for (int i = 0; i < activeSessions.Length; i++)
             {
+                var session = activeSessions[i];
                 if (_disconnectingSessions.ContainsKey(session.Id))
                     continue;
 
@@ -813,8 +816,10 @@ namespace Liminal.Net.Core
 
             long now = Stopwatch.GetTimestamp();
 
-            foreach (var session in _sessions.Values)
+            LiminalSession[] activeSessions = Volatile.Read(ref _activeSessions);
+            for (int i = 0; i < activeSessions.Length; i++)
             {
+                var session = activeSessions[i];
                 if (session.IsDisposed())
                     continue;
 
@@ -907,6 +912,8 @@ namespace Liminal.Net.Core
                     ILiminalTransport.SERVER_ID,
                     _config.MaxPacketSizePerBatch);
 
+                UpdateActiveSessionsArrayLocked();
+
                 LiminalLogger.Log(
                     $"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
             }
@@ -930,6 +937,8 @@ namespace Liminal.Net.Core
                 _sessions[id] = new LiminalSession(
                     id,
                     _config.MaxPacketSizePerBatch);
+
+                UpdateActiveSessionsArrayLocked();
             }
         }
 
@@ -943,11 +952,24 @@ namespace Liminal.Net.Core
                 if (!_sessions.TryRemove(id, out var session))
                     return;
 
+                UpdateActiveSessionsArrayLocked();
+
                 if (!_disconnectingSessions.TryAdd(id, session))
                     return;
 
                 _pendingDisconnects.Enqueue((id, session));
             }
+        }
+
+        private void UpdateActiveSessionsArrayLocked()
+        {
+            var array = new LiminalSession[_sessions.Count];
+            int index = 0;
+            foreach (var kvp in _sessions)
+            {
+                array[index++] = kvp.Value;
+            }
+            Volatile.Write(ref _activeSessions, array);
         }
 
         internal void ProcessPendingDisconnects()
@@ -1015,8 +1037,12 @@ namespace Liminal.Net.Core
                 DisposeDisconnectedSession(session);
             }
 
-            _sessions.Clear();
-            _disconnectingSessions.Clear();
+            lock (_lifecycleLock)
+            {
+                _sessions.Clear();
+                Volatile.Write(ref _activeSessions, Array.Empty<LiminalSession>());
+                _disconnectingSessions.Clear();
+            }
 
             _hiccup.Dispose();
         }
@@ -1054,7 +1080,8 @@ namespace Liminal.Net.Core
             int written = 0;
             int maxCapacity = destination.Length;
 
-            foreach (var session in _sessions.Values)
+            LiminalSession[] activeSessions = Volatile.Read(ref _activeSessions);
+            for (int i = 0; i < activeSessions.Length; i++)
             {
                 if (written >= maxCapacity)
                 {
@@ -1064,7 +1091,7 @@ namespace Liminal.Net.Core
                     break;
                 }
 
-                destination[written++] = session.Id;
+                destination[written++] = activeSessions[i].Id;
             }
 
             return written;

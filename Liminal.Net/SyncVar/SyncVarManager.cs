@@ -268,6 +268,8 @@ namespace Liminal.Net.SyncVar
 
             writer.WrittenSpan.CopyTo(Slab.GetSpan(syncVar.ActivePageIndex, syncVar.ActivePageOffset, size));
 
+            UnboundEntry entry = null;
+
             lock (_unboundLock)
             {
                 if (_unboundAuth.Remove(syncVar.Token, out var cachedAuth))
@@ -275,14 +277,19 @@ namespace Liminal.Net.SyncVar
                     syncVar.ApplyAuthUpdateFromRemote(cachedAuth, deferEvent: true);
                 }
 
-                if (_unboundCache.Remove(syncVar.Token, out var entry))
+                if (_unboundCache.Remove(syncVar.Token, out var e))
                 {
-                    _unboundOrder.Remove(entry.Node);
-                    bool force = !syncVar.HasAuthority;
-                    syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force, deferEvent: true);
+                    _unboundOrder.Remove(e.Node);
+                    entry = e;
                 }
 
                 _tokenRegistry.TryAdd(syncVar);
+            }
+
+            if (entry != null)
+            {
+                bool force = !syncVar.HasAuthority;
+                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force, deferEvent: true);
             }
 
             syncVar.FirePendingEvents();

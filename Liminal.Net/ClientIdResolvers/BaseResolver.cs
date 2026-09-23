@@ -1,4 +1,4 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
 using System.Buffers.Binary;
@@ -11,7 +11,7 @@ namespace Liminal.Net.ClientIdResolvers
     {
         protected ILiminalTransport _transport;
 
-        private readonly ConcurrentDictionary<ushort, DateTime> _reservedIds = new();
+        private readonly Dictionary<ushort, DateTime> _reservedIds = new();
         private readonly TimeSpan _reservationTimeout = TimeSpan.FromSeconds(10);
 
         protected volatile int _nextClientId = 1;
@@ -29,6 +29,9 @@ namespace Liminal.Net.ClientIdResolvers
         /// </summary>
         public ushort GenerateClientId()
         {
+            ushort reservedId = 0;
+            bool didWrap = false;
+
             lock (_idLock)
             {
                 CleanupExpiredReservations();
@@ -40,7 +43,7 @@ namespace Liminal.Net.ClientIdResolvers
                 {
                     if (_nextClientId >= ushort.MaxValue)
                     {
-                        LiminalLogger.LogWarning("[Resolver] ID Counter wrapped. Searching for recycled IDs... this can result in unexpected behavior.");
+                        didWrap = true;
                         _nextClientId = 1;
                     }
 
@@ -51,16 +54,29 @@ namespace Liminal.Net.ClientIdResolvers
 
                     if (candidate != 0 && !isAliveInTransport && _reservedIds.TryAdd(candidate, DateTime.UtcNow))
                     {
-                        LiminalLogger.Log($"[Resolver] Reserved ID {candidate}");
-                        return candidate;
+                        reservedId = candidate;
+                        break;
                     }
 
                     attempts++;
                 }
-
-                LiminalLogger.LogError("[Resolver] CRITICAL: Server is full! No free Client IDs available.");
-                return 0;
             }
+
+            if (didWrap)
+            {
+                LiminalLogger.LogWarning("[Resolver] ID Counter wrapped. Searching for recycled IDs... this can result in unexpected behavior.");
+            }
+
+            if (reservedId != 0)
+            {
+                LiminalLogger.Log($"[Resolver] Reserved ID {reservedId}");
+            }
+            else
+            {
+                LiminalLogger.LogError("[Resolver] CRITICAL: Server is full! No free Client IDs available.");
+            }
+
+            return reservedId;
         }
 
 
@@ -72,7 +88,7 @@ namespace Liminal.Net.ClientIdResolvers
         {
             lock (_idLock)
             {
-                _reservedIds.TryRemove(clientId, out _);
+                _reservedIds.Remove(clientId);
             }
         }
 
@@ -83,7 +99,6 @@ namespace Liminal.Net.ClientIdResolvers
                 _reservedIds.Clear();
                 _nextClientId = 1;
             }
-            LiminalLogger.Log("[Resolver] Resolver reset complete.");
         }
 
         //if you wanna do for ip swapping logic etc you can do it here
@@ -104,31 +119,29 @@ namespace Liminal.Net.ClientIdResolvers
         /// </summary>
         private void CleanupExpiredReservations()
         {
-            lock (_idLock) 
+            var now = DateTime.UtcNow;
+            var expiredIds = new List<ushort>();
+
+            foreach (var kvp in _reservedIds)
             {
-                var now = DateTime.UtcNow;
-                var expiredIds = new List<ushort>();
-
-                foreach (var kvp in _reservedIds)
+                if (now - kvp.Value > _reservationTimeout)
                 {
-                    if (now - kvp.Value > _reservationTimeout)
-                    {
-                        expiredIds.Add(kvp.Key);
-                    }
+                    expiredIds.Add(kvp.Key);
                 }
+            }
 
-                foreach (var id in expiredIds)
+            int cleanedCount = 0;
+            foreach (var id in expiredIds)
+            {
+                if (_reservedIds.Remove(id))
                 {
-                    if (_reservedIds.TryRemove(id, out _))
-                    {
-                        LiminalLogger.LogWarning($"[Resolver] Reservation for ID {id} expired and was cleaned up.");
-                    }
+                    cleanedCount++;
                 }
+            }
 
-                if (expiredIds.Count > 0)
-                {
-                    LiminalLogger.Log($"[Resolver] Cleaned up {expiredIds.Count} expired reservation(s).");
-                }
+            if (cleanedCount > 0)
+            {
+                LiminalLogger.LogWarning($"[Resolver] Cleaned up {cleanedCount} expired reservation(s).");
             }
         }
     }

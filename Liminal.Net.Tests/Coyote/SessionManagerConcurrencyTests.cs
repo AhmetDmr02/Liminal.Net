@@ -1,5 +1,7 @@
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Core.Telemetry;
+using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using MessagePack;
 using Microsoft.Coyote.Specifications;
@@ -349,15 +351,23 @@ namespace Liminal.Net.Tests
         [Test]
         public static async Task TestResolverConcurrentAllocation()
         {
-            var transport = new MockTransport();
-            var resolver = new BaseResolver();
-            resolver.Initialize(transport);
+            LiminalLogger.SetLogLevel((LiminalLogger.LogLevel)999);
+            try
+            {
+                var transport = new MockTransport();
+                var resolver = new BaseResolver();
+                resolver.Initialize(transport);
 
-            var t1 = Task.Run(() => resolver.GenerateClientId());
-            var t2 = Task.Run(() => resolver.GenerateClientId());
-            var t3 = Task.Run(() => resolver.ResetResolver());
+                var t1 = Task.Run(() => resolver.GenerateClientId());
+                var t2 = Task.Run(() => resolver.GenerateClientId());
+                var t3 = Task.Run(() => resolver.ResetResolver());
 
-            await Task.WhenAll(t1, t2, t3);
+                await Task.WhenAll(t1, t2, t3);
+            }
+            finally
+            {
+                LiminalLogger.SetLogLevel(LiminalLogger.LogLevel.Default);
+            }
         }
 
         [Microsoft.Coyote.SystematicTesting.Test]
@@ -809,6 +819,135 @@ namespace Liminal.Net.Tests
             Specification.Assert(
                 Volatile.Read(ref totalDynamicProcessed) == finalCountDynamic,
                 "Dynamic subscriber continued receiving packets after terminal ClearAllHandlers.");
+        }
+
+        [Test]
+        public static async Task Coyote_SessionManager_ConcurrentConnectDisconnectAndPollFlush_ZeroRaces()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                MaxPacketSizePerBatch = 256,
+                MaxPacketCount = 50,
+                MaxConnectionCount = 10,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var sessionManager = netManager.SessionManager;
+
+            var clientWorker1 = Task.Run(async () =>
+            {
+                for (ushort id = 1; id <= 5; id++)
+                {
+                    transport.TriggerClientConnected(id);
+                    await Task.Yield();
+                    transport.TriggerClientDisconnected(id);
+                    await Task.Yield();
+                }
+            });
+
+            var clientWorker2 = Task.Run(async () =>
+            {
+                for (ushort id = 6; id <= 10; id++)
+                {
+                    transport.TriggerClientConnected(id);
+                    await Task.Yield();
+                    transport.TriggerClientDisconnected(id);
+                    await Task.Yield();
+                }
+            });
+
+            var tickWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    sessionManager.Poll();
+                    sessionManager.Flush();
+                    await Task.Yield();
+                }
+            });
+
+            var inspectWorker = Task.Run(async () =>
+            {
+                ushort[] buffer = new ushort[16];
+                for (int i = 0; i < 20; i++)
+                {
+                    int count = sessionManager.GetSessionIds(buffer);
+                    Specification.Assert(count >= 0 && count <= 16, "GetSessionIds returned invalid count.");
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(clientWorker1, clientWorker2, tickWorker, inspectWorker);
+
+            // Terminal drain & assertions
+            sessionManager.Poll();
+            sessionManager.Flush();
+            Specification.Assert(sessionManager.GetActiveSessionCount() >= 0, "Active session count negative.");
+        }
+
+        [Test]
+        public static async Task Coyote_TickPayloadSizeDiagnostics_ConcurrentBufferAndTick_ZeroRaces()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                MaxPacketSizePerBatch = 256,
+                MaxPacketCount = 50,
+                MaxConnectionCount = 4,
+                ClientIdResolver = new BaseResolver()
+            };
+            var telemetryConfig = new LiminalTelemetryConfig { Flags = TelemetryFlags.All };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config, telemetryConfig);
+            var sessionManager = netManager.SessionManager;
+            transport.TriggerClientConnected(1);
+
+            using var diagnostics = new TickPayloadSizeDiagnostics(5, netManager.Ticker, sessionManager);
+
+            byte[] payload = new byte[32];
+
+            var sender1 = Task.Run(async () =>
+            {
+                for (int i = 0; i < 15; i++)
+                {
+                    sessionManager.BufferPacket(ILiminalTransport.SERVER_ID, 1, 10, payload);
+                    await Task.Yield();
+                }
+            });
+
+            var sender2 = Task.Run(async () =>
+            {
+                for (int i = 0; i < 15; i++)
+                {
+                    sessionManager.BufferPacket(ILiminalTransport.SERVER_ID, 1, 11, payload);
+                    await Task.Yield();
+                }
+            });
+
+            var tickerWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < 15; i++)
+                {
+                    netManager.Ticker.TickOnce();
+                    await Task.Yield();
+                }
+            });
+
+            var queryWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < 10; i++)
+                {
+                    var latest = diagnostics.GetLatestTickSnapshot();
+                    Specification.Assert(latest.TelemetryData != null, "Latest snapshot telemetry data is null.");
+                    var avg = diagnostics.GetAverageTickSnapshot();
+                    Specification.Assert(avg.TelemetryData != null, "Average snapshot telemetry data is null.");
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(sender1, sender2, tickerWorker, queryWorker);
         }
     }
 }

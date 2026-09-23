@@ -1,6 +1,7 @@
 using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Core.Telemetry;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Test;
 using Liminal.Net.Transports;
@@ -539,6 +540,56 @@ namespace Liminal.Net.Tests
                 "Mismatched sequence number was processed and poisoned the wire RTT state.");
             Assert.That(currentWireRtt, Is.LessThan(1000.0),
                 "Spoofed ancient timestamp inflated the wire RTT metric.");
+        }
+
+        [Test]
+        public void Test67_HostTick_PollFlushAndDiagnostics_ZeroAllocationsPerTick()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig { Flags = TelemetryFlags.All };
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+
+            // Warm up pipeline and JIT
+            for (int i = 0; i < 50; i++)
+            {
+                _serverManager.SessionManager.Poll();
+                _serverManager.SessionManager.Flush();
+                _serverManager.Ticker.TickOnce();
+            }
+
+            // Measure steady-state allocations across 100 ticks of Poll and Flush
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 100; i++)
+            {
+                _serverManager.SessionManager.Poll();
+                _serverManager.SessionManager.Flush();
+            }
+            long afterSession = GC.GetAllocatedBytesForCurrentThread();
+            long sessionAlloc = afterSession - before;
+
+            Assert.That(sessionAlloc, Is.EqualTo(0), $"SessionManager Poll/Flush allocated {sessionAlloc} bytes over 100 ticks!");
+
+            // Test TickPayloadSizeDiagnostics directly
+            var diag = new TickPayloadSizeDiagnostics(60, _serverManager.Ticker, _serverManager.SessionManager);
+            // Warm up
+            for (int i = 0; i < 20; i++)
+            {
+                _serverManager.Ticker.TickOnce();
+            }
+
+            long diagBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 100; i++)
+            {
+                _serverManager.Ticker.TickOnce();
+            }
+            long diagAfter = GC.GetAllocatedBytesForCurrentThread();
+            long diagAlloc = diagAfter - diagBefore;
+
+            Assert.That(diagAlloc, Is.EqualTo(0), $"TickPayloadSizeDiagnostics allocated {diagAlloc} bytes over 100 ticks!");
+            diag.Dispose();
         }
 
         #endregion

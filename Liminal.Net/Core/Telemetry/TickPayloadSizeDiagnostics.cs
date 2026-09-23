@@ -1,33 +1,46 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace Liminal.Net.Core.Telemetry
 {
     public class TickPayloadSizeDiagnostics : IDisposable
     {
-        private ConcurrentDictionary<ushort, int> _payloadSizeMap = new ConcurrentDictionary<ushort, int>();
+        private readonly object _bufferLock = new();
+        private PacketPayloadSizeEntry[] _activeEntries = new PacketPayloadSizeEntry[32];
+        private int _activeCount = 0;
 
+        private PacketPayloadSizeEntry[] _drainEntries = new PacketPayloadSizeEntry[32];
+        private int _drainCount = 0;
+
+        private readonly object _snapshotLock = new();
         private LiminalSessionManager _sessionManager;
         private LiminalTicker _ticker;
 
         private int currentIndex = 0;
         private TickPayloadSizeSnapshot[] _snapshots;
+
         public TickPayloadSizeDiagnostics(uint avgTickWindow, LiminalTicker ticker, LiminalSessionManager sessionManager)
         {
             _sessionManager = sessionManager;
-
             _ticker = ticker;
 
-            _snapshots = new TickPayloadSizeSnapshot[avgTickWindow];
+            uint window = Math.Max(1u, avgTickWindow);
+            _snapshots = new TickPayloadSizeSnapshot[window];
+            for (int i = 0; i < _snapshots.Length; i++)
+            {
+                _snapshots[i] = new TickPayloadSizeSnapshot();
+            }
 
-            _ticker.OnTick += HandleTick;
+            if (_ticker != null)
+            {
+                _ticker.OnTick += HandleTick;
+            }
 
-            sessionManager.OnPacketBuffered += HandlePacketBuffered;
+            if (_sessionManager != null)
+            {
+                _sessionManager.OnPacketBuffered += HandlePacketBuffered;
+            }
         }
 
         public void Dispose()
@@ -45,39 +58,73 @@ namespace Liminal.Net.Core.Telemetry
 
         private void HandleTick()
         {
-            var currentSnapshot = new TickPayloadSizeSnapshot();
+            PacketPayloadSizeEntry[] toDrain;
+            int toDrainCount;
 
-            foreach (var kvp in _payloadSizeMap)
+            lock (_bufferLock)
             {
-                if (_payloadSizeMap.TryRemove(kvp.Key, out int size))
-                {
-                    currentSnapshot.AddSnapshot((kvp.Key, size));
-                }
+                toDrain = _activeEntries;
+                toDrainCount = _activeCount;
+
+                _activeEntries = _drainEntries;
+                _activeCount = 0;
+
+                _drainEntries = toDrain;
+                _drainCount = toDrainCount;
             }
 
-            _snapshots[currentIndex] = currentSnapshot;
-            currentIndex = (currentIndex + 1) % _snapshots.Length;
+            lock (_snapshotLock)
+            {
+                var currentSnapshot = _snapshots[currentIndex];
+                currentSnapshot.CopyFrom(toDrain, toDrainCount);
+                currentIndex = (currentIndex + 1) % _snapshots.Length;
+            }
+
+            lock (_bufferLock)
+            {
+                _drainCount = 0;
+            }
         }
 
         private void HandlePacketBuffered(ushort packetId, Memory<byte> memory)
         {
-             _payloadSizeMap.AddOrUpdate(packetId, memory.Length, (k, v) => memory.Length + v);
+            int length = memory.Length;
+            lock (_bufferLock)
+            {
+                for (int i = 0; i < _activeCount; i++)
+                {
+                    if (_activeEntries[i].packetId == packetId)
+                    {
+                        _activeEntries[i].size += length;
+                        return;
+                    }
+                }
+
+                if (_activeCount == _activeEntries.Length)
+                {
+                    Array.Resize(ref _activeEntries, _activeEntries.Length * 2);
+                }
+
+                _activeEntries[_activeCount++] = new PacketPayloadSizeEntry(packetId, length);
+            }
         }
 
         public TickPacketSizeTelemetrySnapshot GetLatestTickSnapshot()
         {
-            int previousTickIndex = (currentIndex + _snapshots.Length - 1) % _snapshots.Length;
-
-            return new TickPacketSizeTelemetrySnapshot(FetchSnapshotTelemetryString(_snapshots[previousTickIndex]));
+            lock (_snapshotLock)
+            {
+                int previousTickIndex = (currentIndex + _snapshots.Length - 1) % _snapshots.Length;
+                return new TickPacketSizeTelemetrySnapshot(FetchSnapshotTelemetryString(_snapshots[previousTickIndex]));
+            }
         }
 
         public TickPacketSizeTelemetrySnapshot GetAverageTickSnapshot()
         {
-            Span<int> indices = stackalloc int[_snapshots.Length];
-
-            TickPayloadSizeSnapshot snapshot = GetMergedSnapshot(_snapshots);
-
-            return new TickPacketSizeTelemetrySnapshot(FetchSnapshotTelemetryString(snapshot));
+            lock (_snapshotLock)
+            {
+                TickPayloadSizeSnapshot snapshot = GetMergedSnapshot(_snapshots);
+                return new TickPacketSizeTelemetrySnapshot(FetchSnapshotTelemetryString(snapshot));
+            }
         }
 
         public string FetchSnapshotTelemetryString(TickPayloadSizeSnapshot snapshot)
@@ -87,15 +134,23 @@ namespace Liminal.Net.Core.Telemetry
             if (snapshot == null) return sb.ToString();
 
             var snapshots = snapshot.GetSnapshots();
-            if (snapshots.Count == 0) return sb.ToString();
+            if (snapshots.Length == 0) return sb.ToString();
 
-            long totalSize = snapshots.Sum(x => x.size);
-            var sortedItems = snapshots.OrderByDescending(x => x.size);
+            long totalSize = 0;
+            for (int i = 0; i < snapshots.Length; i++)
+            {
+                totalSize += snapshots[i].size;
+            }
+
+            var items = new PacketPayloadSizeEntry[snapshots.Length];
+            snapshots.CopyTo(items);
+            Array.Sort(items, (a, b) => b.size.CompareTo(a.size));
 
             sb.AppendLine($"Total Bytes: {totalSize}");
 
-            foreach (var item in sortedItems)
+            for (int i = 0; i < items.Length; i++)
             {
+                var item = items[i];
                 double percentage = totalSize > 0 ? (double)item.size / totalSize * 100.0 : 0.0;
                 bool success = LiminalPacketLibrary.TryGetType(item.packetId, out Type packetType);
 
@@ -118,40 +173,105 @@ namespace Liminal.Net.Core.Telemetry
 
             var totals = new Dictionary<ushort, (long totalSize, int count)>();
 
-            foreach (var snapshot in snapshots)
+            for (int s = 0; s < snapshots.Length; s++)
             {
+                var snapshot = snapshots[s];
                 if (snapshot == null) continue;
-                foreach (var item in snapshot.GetSnapshots())
+                var entries = snapshot.GetSnapshots();
+                for (int i = 0; i < entries.Length; i++)
                 {
-                    if (!totals.ContainsKey(item.packetId))
+                    var item = entries[i];
+                    if (!totals.TryGetValue(item.packetId, out var current))
                     {
-                        totals[item.packetId] = (0, 0);
+                        totals[item.packetId] = (item.size, 1);
                     }
-                    var current = totals[item.packetId];
-                    totals[item.packetId] = (current.totalSize + item.size, current.count + 1);
+                    else
+                    {
+                        totals[item.packetId] = (current.totalSize + item.size, current.count + 1);
+                    }
                 }
             }
 
             foreach (var kvp in totals)
             {
                 int avgSize = (int)(kvp.Value.totalSize / kvp.Value.count);
-                mergedSnapshot.AddSnapshot((kvp.Key, avgSize));
+                mergedSnapshot.AddSnapshot(kvp.Key, avgSize);
             }
 
             return mergedSnapshot;
         }
     }
 
+    public struct PacketPayloadSizeEntry
+    {
+        public ushort packetId;
+        public int size;
+
+        public PacketPayloadSizeEntry(ushort packetId, int size)
+        {
+            this.packetId = packetId;
+            this.size = size;
+        }
+
+        public void Deconstruct(out ushort packetId, out int size)
+        {
+            packetId = this.packetId;
+            size = this.size;
+        }
+
+        public static implicit operator (ushort packetId, int size)(PacketPayloadSizeEntry entry) =>
+            (entry.packetId, entry.size);
+
+        public static implicit operator PacketPayloadSizeEntry((ushort packetId, int size) tuple) =>
+            new PacketPayloadSizeEntry(tuple.packetId, tuple.size);
+    }
+
     public class TickPayloadSizeSnapshot
     {
-        private List<(ushort packetId, int size)> _snapshots = new();
+        private PacketPayloadSizeEntry[] _entries;
+        private int _count;
+
+        public TickPayloadSizeSnapshot(int initialCapacity = 32)
+        {
+            _entries = new PacketPayloadSizeEntry[initialCapacity];
+            _count = 0;
+        }
+
+        public int Count => _count;
+
+        public ReadOnlySpan<PacketPayloadSizeEntry> Entries => _entries.AsSpan(0, _count);
+
+        public void CopyFrom(PacketPayloadSizeEntry[] source, int count)
+        {
+            if (_entries.Length < count)
+            {
+                Array.Resize(ref _entries, Math.Max(count, _entries.Length * 2));
+            }
+
+            Array.Copy(source, _entries, count);
+            _count = count;
+        }
 
         public void AddSnapshot((ushort packetId, int size) snapshot)
         {
-            _snapshots.Add(snapshot);
+            AddSnapshot(snapshot.packetId, snapshot.size);
         }
 
-        public IReadOnlyList<(ushort packetId, int size)> GetSnapshots() => _snapshots;
+        public void AddSnapshot(ushort packetId, int size)
+        {
+            if (_count == _entries.Length)
+            {
+                Array.Resize(ref _entries, _entries.Length * 2);
+            }
+            _entries[_count++] = new PacketPayloadSizeEntry(packetId, size);
+        }
+
+        public void Clear()
+        {
+            _count = 0;
+        }
+
+        public ReadOnlySpan<PacketPayloadSizeEntry> GetSnapshots() => Entries;
     }
 
     public struct TickPacketSizeTelemetrySnapshot

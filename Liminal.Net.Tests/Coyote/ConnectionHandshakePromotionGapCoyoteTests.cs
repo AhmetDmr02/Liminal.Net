@@ -162,7 +162,13 @@ namespace Liminal.Net.Tests.Coyote
             {
                 client.StartClient("127.0.0.1", port);
 
-                ushort id = await clientConnectedGate.Task;
+                for (int i = 0; i < 200 && !clientConnectedGate.Task.IsCompleted; i++)
+                {
+                    await Task.Delay(5);
+                }
+
+                Specification.Assert(clientConnectedGate.Task.IsCompleted, "Client connection handshake timed out.");
+                ushort id = clientConnectedGate.Task.Result;
 
                 bool serverHasSession = server.SessionManager.HasSession(id);
 
