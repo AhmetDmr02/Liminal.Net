@@ -244,7 +244,6 @@ namespace Liminal.Net.Core
                     return;
                 }
 
-                // 1. Invoke standard typed subscribers
                 for (int i = 0; i < callbacks.Length; i++)
                 {
                     try
@@ -257,7 +256,6 @@ namespace Liminal.Net.Core
                     }
                 }
 
-                // 2. If a bitstream is attached, invoke bitstream subscribers
                 if (hasBitStream)
                 {
                     for (int i = 0; i < bitStreamHandlers.Length; i++)
@@ -1344,6 +1342,6 @@ namespace Liminal.Net.Core
         #endregion
 
         private readonly MessagePackSerializerOptions _options =
-            MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
+            MessagePackSerializer.DefaultOptions.WithSecurity(MessagePackSecurity.UntrustedData);
     }
 }

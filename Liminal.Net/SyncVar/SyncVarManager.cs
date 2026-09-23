@@ -85,7 +85,7 @@ namespace Liminal.Net.SyncVar
         private int _hasReceivedInitialSnapshot = 0;
 
         public readonly MessagePackSerializerOptions SerializerOptions =
-            MessagePackSerializerOptions.Standard.WithSecurity(MessagePackSecurity.UntrustedData);
+            MessagePackSerializer.DefaultOptions.WithSecurity(MessagePackSecurity.UntrustedData);
 
         public SyncVarManager(LiminalNetworkManager manager, LiminalNetworkConfig config)
         {
