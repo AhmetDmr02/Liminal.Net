@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -10,6 +10,8 @@ namespace Liminal.Net.Core
     {
         private static readonly Dictionary<ushort, Type> IdToType = new();
         private static readonly Dictionary<Type, ushort> TypeToId = new();
+        private static readonly HashSet<ushort> StickyIds = new();
+        private static readonly HashSet<Type> StickyTypes = new();
         public static uint RegistryHash { get; private set; }
 
         static LiminalPacketLibrary() => Initialize();
@@ -34,7 +36,7 @@ namespace Liminal.Net.Core
 
             ForceLoadAllReferencedAssemblies();
 
-            var discovered = new List<(Type Type, ushort Reserved)>();
+            var discovered = new List<(Type Type, ushort Reserved, bool IsSticky)>();
 
             // Dont forget to add references to link.xml for unity or otherwise it might get deleted by the stripper
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
@@ -77,17 +79,36 @@ namespace Liminal.Net.Core
                     }
 
                     var attr = type.GetCustomAttribute<LiminalPacketAttribute>(false);
-                    if (attr != null && (type.IsGenericTypeDefinition))
+                    var stickyAttr = type.GetCustomAttribute<StickyPacketAttribute>(false);
+                    if (attr == null && stickyAttr == null)
+                    {
+                        continue;
+                    }
+
+                    if (type.IsGenericTypeDefinition)
                     {
                         LiminalLogger.LogWarning($"[PacketLibrary] Generic packet type '{type.FullName}' is not supported.");
                         continue;
                     }
 
-                    if (attr != null) discovered.Add((type, attr.ReservedId));
+                    ushort reservedId = attr?.ReservedId ?? 0;
+                    if (attr != null && stickyAttr != null && attr.ReservedId != 0 && stickyAttr.ReservedId != 0 && attr.ReservedId != stickyAttr.ReservedId)
+                    {
+                        throw new InvalidOperationException(
+                            $"[Liminal] Conflicting reserved IDs on '{type.FullName}': " +
+                            $"[LiminalPacket] reserved {attr.ReservedId} while [StickyPacket] reserved {stickyAttr.ReservedId}.");
+                    }
+
+                    if (reservedId == 0 && stickyAttr != null)
+                    {
+                        reservedId = stickyAttr.ReservedId;
+                    }
+
+                    discovered.Add((type, reservedId, stickyAttr != null));
                 }
             }
 
-            foreach (var (type, reserved) in discovered.Where(d => d.Reserved != 0))
+            foreach (var (type, reserved, isSticky) in discovered.Where(d => d.Reserved != 0))
             {
                 if (!IdToType.TryAdd(reserved, type))
                     throw new InvalidOperationException(
@@ -97,11 +118,15 @@ namespace Liminal.Net.Core
                 LiminalLogger.Log($"[PacketLibrary] Reserved packet ID {reserved} for '{type.FullName}'.", LiminalLogger.LogLevel.Detailed);
 
                 TypeToId.Add(type, reserved);
+                if (isSticky)
+                {
+                    StickyIds.Add(reserved);
+                    StickyTypes.Add(type);
+                }
             }
 
             var auto = discovered.Where(d => d.Reserved == 0)
-                                 .Select(d => d.Type)
-                                 .OrderBy(t => t.FullName, StringComparer.Ordinal)
+                                 .OrderBy(t => t.Type.FullName, StringComparer.Ordinal)
                                  .ToArray();
 
             ushort next = 1;
@@ -109,11 +134,12 @@ namespace Liminal.Net.Core
 
             // Include reserved packets in the hash input too, in a fixed order,
             // so a reserved-id collision or removal also changes the hash.
-            foreach (var (type, reserved) in discovered.Where(d => d.Reserved != 0).OrderBy(d => d.Reserved))
+            foreach (var (type, reserved, isSticky) in discovered.Where(d => d.Reserved != 0).OrderBy(d => d.Reserved))
                 hashInput.Append(reserved).Append(':').Append(type.FullName).Append('|');
 
-            foreach (var type in auto)
+            foreach (var item in auto)
             {
+                var type = item.Type;
                 while (IdToType.ContainsKey(next))
                 {
                     if (next == ushort.MaxValue)
@@ -123,6 +149,11 @@ namespace Liminal.Net.Core
 
                 IdToType.Add(next, type);
                 TypeToId.Add(type, next);
+                if (item.IsSticky)
+                {
+                    StickyIds.Add(next);
+                    StickyTypes.Add(type);
+                }
                 hashInput.Append(next).Append(':').Append(type.FullName).Append('|');
 
                 LiminalLogger.Log($"[PacketLibrary] Registered packet ID {next} for '{type.FullName}'.", LiminalLogger.LogLevel.Detailed);
@@ -187,5 +218,16 @@ namespace Liminal.Net.Core
         /// <returns>0 if T is not a registered packet 0 is never a valid packet id.</returns>
         public static ushort GetId<T>() => TypeToId.TryGetValue(typeof(T), out var id) ? id : (ushort)0;
         public static bool TryGetType(ushort id, out Type type) => IdToType.TryGetValue(id, out type);
+        public static bool IsSticky(ushort id) => StickyIds.Contains(id);
+        public static bool IsSticky<T>() => StickyTypes.Contains(typeof(T));
+        public static bool IsSticky(Type type) => StickyTypes.Contains(type);
+        internal static void RegisterStickyForTest(ushort id, Type type)
+        {
+            lock (InitLock)
+            {
+                StickyIds.Add(id);
+                StickyTypes.Add(type);
+            }
+        }
     }
 }

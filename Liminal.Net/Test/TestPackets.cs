@@ -34,4 +34,19 @@ namespace Liminal.Net.Test
     public struct TestTagBitPacket
     {
     }
+
+    [StickyPacket]
+    [MessagePackObject]
+    public struct TestStickyStatePacket
+    {
+        [Key(0)] public int StateId;
+        [Key(1)] public string StateName;
+    }
+
+    [StickyPacket]
+    [MessagePackObject]
+    public struct TestStickyCounterPacket
+    {
+        [Key(0)] public int Counter;
+    }
 }

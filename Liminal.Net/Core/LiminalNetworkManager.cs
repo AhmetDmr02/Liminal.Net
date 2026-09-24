@@ -360,6 +360,7 @@ namespace Liminal.Net.Core
 
             //We actually wanna keep subscriptions around
             //Interpreter?.ClearAllHandlers();
+            Interpreter?.ClearAllSticky();
 
             //_ticker = null;
             //SessionManager = null;

@@ -99,6 +99,36 @@ namespace Liminal.Net.Core
         }
         #endregion
 
+        #region Sticky Packets
+        public static bool TryGetSticky<T>(out T packet, out ushort sender) where T : struct
+        {
+            var manager = LiminalNetworkManager.Instance;
+            if (manager == null)
+            {
+                packet = default;
+                sender = 0;
+                return false;
+            }
+
+            return manager.Interpreter.TryGetSticky<T>(out packet, out sender);
+        }
+
+        public static bool TryGetSticky<T>(out T packet) where T : struct
+        {
+            return TryGetSticky<T>(out packet, out _);
+        }
+
+        public static void ClearSticky<T>() where T : struct
+        {
+            LiminalNetworkManager.Instance?.Interpreter.ClearSticky<T>();
+        }
+
+        public static void ClearAllSticky()
+        {
+            LiminalNetworkManager.Instance?.Interpreter.ClearAllSticky();
+        }
+        #endregion
+
         #region Send Path
         public static void Send<T>(SendTo target, T packet, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where T : struct
         {
