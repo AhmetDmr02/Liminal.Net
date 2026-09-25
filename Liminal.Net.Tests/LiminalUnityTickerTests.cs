@@ -113,5 +113,76 @@ namespace Liminal.Net.Tests
 
             manager.Shutdown();
         }
+
+        [Test]
+        public void NetworkManager_With_LatencySimulatorTransport_ZeroDelay_OperatesAsNormalTransport()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = 9989,
+                TickRate = 60,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var unityTicker = new LiminalUnityTicker(config);
+            var transport = new LatencySimulatorTransport(); // Default 0.0ms delay
+
+            Assert.That(transport.OneWayDelayMs, Is.EqualTo(0.0));
+
+            var manager = new LiminalNetworkManager(transport, config, customTicker: unityTicker);
+            Assert.That(manager.Ticker, Is.SameAs(unityTicker));
+            Assert.That(manager.Transport, Is.SameAs(transport));
+
+            manager.Shutdown();
+        }
+
+        [Test]
+        public void NetworkManager_With_LatencySimulatorTransport_And_UnityTicker_ExchangesPackets()
+        {
+            int port = 9991;
+            var serverConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port,
+                TickRate = 60,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var clientConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = port,
+                TickRate = 60,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var serverTicker = new LiminalUnityTicker(serverConfig);
+            var clientTicker = new LiminalUnityTicker(clientConfig);
+
+            var serverTransport = new LatencySimulatorTransport { OneWayDelayMs = 0.0 };
+            var clientTransport = new LatencySimulatorTransport { OneWayDelayMs = 0.0 };
+
+            var server = new LiminalNetworkManager(serverTransport, serverConfig, customTicker: serverTicker);
+            var client = new LiminalNetworkManager(clientTransport, clientConfig, customTicker: clientTicker);
+
+            try
+            {
+                server.StartServer();
+                client.StartClient("127.0.0.1", port);
+
+                Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+                Assert.That(SpinWait.SpinUntil(() => server.ClientRegistry.Count == 1, 3000), Is.True);
+
+                // Both tickers can be updated by Unity update loop
+                serverTicker.TickUpdate();
+                clientTicker.TickUpdate();
+            }
+            finally
+            {
+                client.Shutdown();
+                server.Shutdown();
+            }
+        }
     }
 }
