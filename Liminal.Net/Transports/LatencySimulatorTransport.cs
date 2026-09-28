@@ -13,8 +13,9 @@ namespace Liminal.Net.Transports
 
         private readonly LiminalPriorityQueue<DelayedPacket, long> _sendQueue = new();
         private readonly object _sendLock = new();
-        private readonly CancellationTokenSource _cts = new();
-        private readonly Thread _drainThread;
+        private readonly object _threadLifecycleLock = new();
+        private CancellationTokenSource _cts;
+        private Thread _drainThread;
         private readonly ArrayPool<byte> _pool = ArrayPool<byte>.Shared;
 
         private static readonly ThreadLocal<Random> _random = new(() => new Random(Guid.NewGuid().GetHashCode()));
@@ -29,12 +30,59 @@ namespace Liminal.Net.Transports
 
         public LatencySimulatorTransport()
         {
-            _drainThread = new Thread(DrainLoop)
+            EnsureDrainThreadRunning();
+        }
+
+        private void EnsureDrainThreadRunning()
+        {
+            var cts = _cts;
+            var thread = _drainThread;
+            if (cts != null && !cts.IsCancellationRequested && thread != null && thread.IsAlive)
             {
-                IsBackground = true,
-                Name = "LatencySimulator-Drain"
-            };
-            _drainThread.Start();
+                return;
+            }
+
+            lock (_threadLifecycleLock)
+            {
+                if (_cts != null && !_cts.IsCancellationRequested && _drainThread != null && _drainThread.IsAlive)
+                {
+                    return;
+                }
+
+                if (_drainThread != null && _drainThread.IsAlive)
+                {
+                    _cts?.Cancel();
+                    lock (_sendLock)
+                    {
+                        Monitor.PulseAll(_sendLock);
+                    }
+                    _drainThread.Join(500);
+                }
+
+                _cts?.Dispose();
+                var newCts = new CancellationTokenSource();
+                _cts = newCts;
+
+                var newThread = new Thread(DrainLoop)
+                {
+                    IsBackground = true,
+                    Name = "LatencySimulator-Drain"
+                };
+                _drainThread = newThread;
+                newThread.Start(newCts);
+            }
+        }
+
+        public override void StartServer(string ip, int port)
+        {
+            EnsureDrainThreadRunning();
+            base.StartServer(ip, port);
+        }
+
+        public override void StartClient(string ip, int port)
+        {
+            EnsureDrainThreadRunning();
+            base.StartClient(ip, port);
         }
 
         protected override void SendInternal(Span<byte> data, ushort targetId, TransportFlags flags)
@@ -45,6 +93,8 @@ namespace Liminal.Net.Transports
                 return;
             }
 
+            EnsureDrainThreadRunning();
+
             byte[] rented = _pool.Rent(data.Length);
             data.CopyTo(rented);
 
@@ -54,6 +104,12 @@ namespace Liminal.Net.Transports
 
             lock (_sendLock)
             {
+                if (_cts == null || _cts.IsCancellationRequested)
+                {
+                    _pool.Return(rented);
+                    return;
+                }
+
                 _sendQueue.Enqueue(new DelayedPacket
                 {
                     Buffer = rented,
@@ -66,21 +122,24 @@ namespace Liminal.Net.Transports
             }
         }
 
-        private void DrainLoop()
+        private void DrainLoop(object state)
         {
-            while (!_cts.IsCancellationRequested)
+            var cts = (CancellationTokenSource)state;
+            var token = cts.Token;
+
+            while (!token.IsCancellationRequested)
             {
                 DelayedPacket packet = default;
                 bool hasPacket = false;
 
                 lock (_sendLock)
                 {
-                    while (_sendQueue.Count == 0 && !_cts.IsCancellationRequested)
+                    while (_sendQueue.Count == 0 && !token.IsCancellationRequested)
                     {
                         Monitor.Wait(_sendLock);
                     }
 
-                    if (_cts.IsCancellationRequested) break;
+                    if (token.IsCancellationRequested) break;
 
                     long now = Stopwatch.GetTimestamp();
                     if (_sendQueue.TryPeek(out _, out long deliverAt))
@@ -143,15 +202,26 @@ namespace Liminal.Net.Transports
 
         public override void Shutdown()
         {
-            _cts.Cancel();
-            lock (_sendLock)
+            lock (_threadLifecycleLock)
             {
-                while (_sendQueue.Count > 0)
+                _cts?.Cancel();
+                lock (_sendLock)
                 {
-                    var pkt = _sendQueue.Dequeue();
-                    _pool.Return(pkt.Buffer);
+                    while (_sendQueue.Count > 0)
+                    {
+                        var pkt = _sendQueue.Dequeue();
+                        _pool.Return(pkt.Buffer);
+                    }
+                    Monitor.PulseAll(_sendLock);
                 }
-                Monitor.PulseAll(_sendLock);
+
+                if (_drainThread != null && _drainThread.IsAlive)
+                {
+                    _drainThread.Join(500);
+                }
+                _drainThread = null;
+                _cts?.Dispose();
+                _cts = null;
             }
 
             base.Shutdown();

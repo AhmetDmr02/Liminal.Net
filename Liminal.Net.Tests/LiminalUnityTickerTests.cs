@@ -1,5 +1,6 @@
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
+using Liminal.Net.Test;
 using Liminal.Net.Transports;
 using Liminal.Net.Unity;
 using NUnit.Framework;
@@ -182,6 +183,84 @@ namespace Liminal.Net.Tests
             {
                 client.Shutdown();
                 server.Shutdown();
+            }
+        }
+
+        private static int _portCounter = 19600;
+
+        [Test]
+        public void LatencySimulatorTransport_WhenStartHostFailsDueToPortConflict_AndThenConnectsAsClient_SendPathWorks()
+        {
+            LiminalPacketLibrary.Initialize();
+            int testPort = Interlocked.Increment(ref _portCounter);
+
+            var hostAConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = testPort,
+                TickRate = 60,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var hostATransport = new LatencySimulatorTransport { OneWayDelayMs = 15.0 };
+            var hostA = new LiminalNetworkManager(hostATransport, hostAConfig);
+
+            var hostBConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = testPort,
+                TickRate = 60,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var hostBTransport = new LatencySimulatorTransport { OneWayDelayMs = 15.0 };
+            var clientB = new LiminalNetworkManager(hostBTransport, hostBConfig);
+
+            try
+            {
+                bool hostAStarted = hostA.StartHost("127.0.0.1", testPort);
+                Assert.That(hostAStarted, Is.True);
+                Assert.That(SpinWait.SpinUntil(() => hostA.IsConnected && hostA.LifecycleState == NetworkLifecycleState.HostActive, 3000), Is.True);
+
+                Assert.Throws<System.Net.Sockets.SocketException>(() => clientB.StartHost("127.0.0.1", testPort));
+                Assert.That(clientB.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
+
+                bool clientStarted = clientB.StartClient("127.0.0.1", testPort);
+                Assert.That(clientStarted, Is.True);
+                Assert.That(SpinWait.SpinUntil(() => clientB.IsConnected && clientB.CanSend, 4000), Is.True);
+                Assert.That(SpinWait.SpinUntil(() => hostA.ClientRegistry.Count == 2, 4000), Is.True);
+
+                string receivedMessageAtA = null;
+                hostA.Interpreter.Subscribe<ChatPacket>((pkt, sender) =>
+                {
+                    receivedMessageAtA = pkt.Message;
+                }, this);
+
+                LiminalNetworkManager.Instance = clientB;
+                Broadcaster.Send(SendTo.Server, new ChatPacket { Message = "HelloFromClientB" });
+                clientB.SessionManager.Flush();
+
+                Assert.That(SpinWait.SpinUntil(() => receivedMessageAtA != null, 4000), Is.True, "Host A never received packet from Client B. Send path is broken!");
+                Assert.That(receivedMessageAtA, Is.EqualTo("HelloFromClientB"));
+
+                string receivedMessageAtB = null;
+                clientB.Interpreter.Subscribe<ChatPacket>((pkt, sender) =>
+                {
+                    receivedMessageAtB = pkt.Message;
+                }, this);
+
+                LiminalNetworkManager.Instance = hostA;
+                Broadcaster.SendToClient(clientB.localID, new ChatPacket { Message = "HelloFromHostA" });
+                hostA.SessionManager.Flush();
+
+                Assert.That(SpinWait.SpinUntil(() => receivedMessageAtB != null, 4000), Is.True, "Client B never received packet from Host A. Receive path is broken!");
+                Assert.That(receivedMessageAtB, Is.EqualTo("HelloFromHostA"));
+            }
+            finally
+            {
+                clientB.Shutdown();
+                hostA.Shutdown();
+                LiminalNetworkManager.Instance = null;
             }
         }
     }
