@@ -179,7 +179,7 @@ namespace Liminal.Net.Core
         /// <summary>
         /// Reads raw bytes into the destination span. Automatically aligns to the next byte boundary first.
         /// </summary>
-        public void ReadBytes(scoped Span<byte> destination)
+        public void ReadBytes(Span<byte> destination)
         {
             if (destination.IsEmpty)
                 return;

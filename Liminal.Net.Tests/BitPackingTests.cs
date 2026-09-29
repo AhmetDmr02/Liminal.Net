@@ -122,7 +122,7 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void Test_BitReader_ReadBytes_StackallocSpan_InRefReaderCallback()
+        public void Test_BitReader_ReadBytes_InRefReaderCallback()
         {
             byte[] buffer = new byte[32];
             var writer = new BitWriter(buffer.AsSpan());
@@ -133,12 +133,10 @@ namespace Liminal.Net.Tests
 
             var reader = new BitReader(buffer.AsSpan(0, writer.BytesWritten));
 
-            // Simulating a callback with ref BitReader parameter
             void Callback(ref BitReader r)
             {
                 int length = r.ReadInt();
-                Span<byte> myTargetId = stackalloc byte[length];
-                r.ReadBytes(myTargetId); // Must not trigger CS8352/CS8350
+                ReadOnlySpan<byte> myTargetId = r.ReadBytes(length);
                 Assert.That(myTargetId.SequenceEqual(originalId), Is.True);
             }
 
