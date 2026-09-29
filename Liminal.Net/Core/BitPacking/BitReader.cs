@@ -179,7 +179,7 @@ namespace Liminal.Net.Core
         /// <summary>
         /// Reads raw bytes into the destination span. Automatically aligns to the next byte boundary first.
         /// </summary>
-        public void ReadBytes(Span<byte> destination)
+        public void ReadBytes(scoped Span<byte> destination)
         {
             if (destination.IsEmpty)
                 return;
@@ -205,6 +205,28 @@ namespace Liminal.Net.Core
             }
 
             _totalBitsRead += destination.Length * 8;
+        }
+
+        /// <summary>
+        /// Reads a contiguous slice of bytes from the stream directly without copying.
+        /// Automatically aligns to the next byte boundary first.
+        /// </summary>
+        public ReadOnlySpan<byte> ReadBytes(int count)
+        {
+            if (count < 0)
+                throw new ArgumentOutOfRangeException(nameof(count), "Count cannot be negative.");
+            if (count == 0)
+                return ReadOnlySpan<byte>.Empty;
+
+            Align();
+
+            if (count > _data.Length - _bytePosition)
+                throw new InvalidOperationException($"BitReader underflow: Requested {count} bytes, but only {_data.Length - _bytePosition} bytes remain.");
+
+            ReadOnlySpan<byte> slice = _data.Slice(_bytePosition, count);
+            _bytePosition += count;
+            _totalBitsRead += count * 8;
+            return slice;
         }
 
         /// <summary>

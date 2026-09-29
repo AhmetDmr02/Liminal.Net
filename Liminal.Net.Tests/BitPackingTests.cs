@@ -122,6 +122,48 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
+        public void Test_BitReader_ReadBytes_StackallocSpan_InRefReaderCallback()
+        {
+            byte[] buffer = new byte[32];
+            var writer = new BitWriter(buffer.AsSpan());
+            byte[] originalId = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+            writer.WriteInt(originalId.Length);
+            writer.WriteBytes(originalId);
+            writer.Flush();
+
+            var reader = new BitReader(buffer.AsSpan(0, writer.BytesWritten));
+
+            // Simulating a callback with ref BitReader parameter
+            void Callback(ref BitReader r)
+            {
+                int length = r.ReadInt();
+                Span<byte> myTargetId = stackalloc byte[length];
+                r.ReadBytes(myTargetId); // Must not trigger CS8352/CS8350
+                Assert.That(myTargetId.SequenceEqual(originalId), Is.True);
+            }
+
+            Callback(ref reader);
+        }
+
+        [Test]
+        public void Test_BitReader_ReadBytes_ZeroCopySlice()
+        {
+            byte[] buffer = new byte[32];
+            var writer = new BitWriter(buffer.AsSpan());
+            byte[] originalId = new byte[] { 0xAA, 0xBB, 0xCC, 0xDD };
+            writer.WriteInt(originalId.Length);
+            writer.WriteBytes(originalId);
+            writer.Flush();
+
+            var reader = new BitReader(buffer.AsSpan(0, writer.BytesWritten));
+            int length = reader.ReadInt();
+            ReadOnlySpan<byte> slice = reader.ReadBytes(length);
+
+            Assert.That(slice.SequenceEqual(originalId), Is.True);
+            Assert.That(reader.BitsRemaining, Is.EqualTo(0));
+        }
+
+        [Test]
         public void Test_BitReader_Underflow_Throws()
         {
             byte[] buffer = new byte[2] { 0xAA, 0xBB };
