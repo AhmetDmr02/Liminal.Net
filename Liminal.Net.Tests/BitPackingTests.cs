@@ -164,6 +164,37 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
+        public void Test_BitWriter_ReserveAndStamp_Roundtrip()
+        {
+            byte[] buffer = new byte[64];
+            var writer = new BitWriter(buffer.AsSpan());
+
+            var countPlaceholder = writer.ReserveInt32();
+
+            int syncedBirds = 0;
+            for (int i = 0; i < 5; i++)
+            {
+                if (i % 2 == 0) // only sync even birds
+                {
+                    writer.WriteInt(100 + i);
+                    syncedBirds++;
+                }
+            }
+
+            countPlaceholder.Stamp(syncedBirds);
+            writer.Flush();
+
+            var reader = new BitReader(buffer.AsSpan(0, writer.BytesWritten));
+            int readCount = reader.ReadInt();
+            Assert.That(readCount, Is.EqualTo(3));
+
+            Assert.That(reader.ReadInt(), Is.EqualTo(100));
+            Assert.That(reader.ReadInt(), Is.EqualTo(102));
+            Assert.That(reader.ReadInt(), Is.EqualTo(104));
+            Assert.That(reader.BitsRemaining, Is.EqualTo(0));
+        }
+
+        [Test]
         public void Test_BitReader_Underflow_Throws()
         {
             byte[] buffer = new byte[2] { 0xAA, 0xBB };

@@ -220,6 +220,48 @@ namespace Liminal.Net.Core
         }
 
         /// <summary>
+        /// Aligns to byte boundary and reserves 4 bytes in the stream to be stamped retroactively.
+        /// </summary>
+        public BitPlaceholder32 ReserveInt32()
+        {
+            Align();
+            EnsureSpan(4);
+            Span<byte> slot = _currentSpan.Slice(_spanIndex, 4);
+            slot.Clear();
+            _spanIndex += 4;
+            _totalBitsWritten += 32;
+            return new BitPlaceholder32(slot);
+        }
+
+        /// <summary>
+        /// Aligns to byte boundary and reserves 2 bytes in the stream to be stamped retroactively.
+        /// </summary>
+        public BitPlaceholder16 ReserveInt16()
+        {
+            Align();
+            EnsureSpan(2);
+            Span<byte> slot = _currentSpan.Slice(_spanIndex, 2);
+            slot.Clear();
+            _spanIndex += 2;
+            _totalBitsWritten += 16;
+            return new BitPlaceholder16(slot);
+        }
+
+        /// <summary>
+        /// Aligns to byte boundary and reserves 1 byte in the stream to be stamped retroactively.
+        /// </summary>
+        public BitPlaceholder8 ReserveByte()
+        {
+            Align();
+            EnsureSpan(1);
+            Span<byte> slot = _currentSpan.Slice(_spanIndex, 1);
+            slot.Clear();
+            _spanIndex += 1;
+            _totalBitsWritten += 8;
+            return new BitPlaceholder8(slot);
+        }
+
+        /// <summary>
         /// Flushes any pending bits and commits written bytes to the underlying buffer writer.
         /// </summary>
         public void Flush()
@@ -233,5 +275,38 @@ namespace Liminal.Net.Core
                 _spanIndex = 0;
             }
         }
+    }
+
+    /// <summary>
+    /// A 32-bit placeholder in a bitstream that can be stamped retroactively.
+    /// </summary>
+    public readonly ref struct BitPlaceholder32
+    {
+        private readonly Span<byte> _slot;
+        internal BitPlaceholder32(Span<byte> slot) => _slot = slot;
+        public void Stamp(int value) => System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(_slot, value);
+        public void Stamp(uint value) => System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(_slot, value);
+    }
+
+    /// <summary>
+    /// A 16-bit placeholder in a bitstream that can be stamped retroactively.
+    /// </summary>
+    public readonly ref struct BitPlaceholder16
+    {
+        private readonly Span<byte> _slot;
+        internal BitPlaceholder16(Span<byte> slot) => _slot = slot;
+        public void Stamp(short value) => System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(_slot, value);
+        public void Stamp(ushort value) => System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(_slot, value);
+    }
+
+    /// <summary>
+    /// An 8-bit placeholder in a bitstream that can be stamped retroactively.
+    /// </summary>
+    public readonly ref struct BitPlaceholder8
+    {
+        private readonly Span<byte> _slot;
+        internal BitPlaceholder8(Span<byte> slot) => _slot = slot;
+        public void Stamp(byte value) => _slot[0] = value;
+        public void Stamp(sbyte value) => _slot[0] = (byte)value;
     }
 }
