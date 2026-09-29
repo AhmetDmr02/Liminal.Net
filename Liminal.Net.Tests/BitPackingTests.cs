@@ -195,6 +195,70 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
+        public void Test_BitWriter_MultiplePlaceholders_OutOfOrderStamping()
+        {
+            byte[] buffer = new byte[128];
+            var writer = new BitWriter(buffer.AsSpan());
+
+            var slotA = writer.ReserveInt32();
+            var slotB = writer.ReserveInt16();
+            var slotC = writer.ReserveByte();
+            var slotD = writer.ReserveInt32();
+
+            writer.WriteFloat(12.34f);
+            writer.WriteBits(5, 3);
+            writer.WriteBool(true);
+
+            slotC.Stamp((byte)42);
+            slotA.Stamp(100_000);
+            slotD.Stamp(-555);
+            slotB.Stamp((short)1234);
+
+            writer.Flush();
+
+            var reader = new BitReader(buffer.AsSpan(0, writer.BytesWritten));
+            Assert.That(reader.ReadInt(), Is.EqualTo(100_000));
+            Assert.That(reader.ReadShort(), Is.EqualTo((short)1234));
+            Assert.That(reader.ReadByte(), Is.EqualTo((byte)42));
+            Assert.That(reader.ReadInt(), Is.EqualTo(-555));
+            Assert.That(reader.ReadFloat(), Is.EqualTo(12.34f).Within(0.001f));
+            Assert.That(reader.ReadBits(3), Is.EqualTo(5u));
+            Assert.That(reader.ReadBool(), Is.True);
+            reader.Align();
+            Assert.That(reader.BitsRemaining, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test_BitWriter_MultiplePlaceholders_NativeBufferWriter()
+        {
+            var nativeWriter = new LiminalNativeBufferWriter(256);
+            var writer = new BitWriter(nativeWriter);
+
+            var slotCount = writer.ReserveInt32();
+            var slotHeader = writer.ReserveInt16();
+
+            for (int i = 0; i < 10; i++)
+            {
+                writer.WriteInt(i * 10);
+            }
+
+            slotHeader.Stamp((short)0x1234);
+            slotCount.Stamp(10);
+
+            writer.Flush();
+
+            var reader = new BitReader(nativeWriter.WrittenSpan);
+            Assert.That(reader.ReadInt(), Is.EqualTo(10));
+            Assert.That(reader.ReadShort(), Is.EqualTo((short)0x1234));
+
+            for (int i = 0; i < 10; i++)
+            {
+                Assert.That(reader.ReadInt(), Is.EqualTo(i * 10));
+            }
+            Assert.That(reader.BitsRemaining, Is.EqualTo(0));
+        }
+
+        [Test]
         public void Test_BitReader_Underflow_Throws()
         {
             byte[] buffer = new byte[2] { 0xAA, 0xBB };
