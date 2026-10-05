@@ -194,6 +194,7 @@ namespace Liminal.Net.Unity
 
         private void Update()
         {
+            PollPackets();
             TickUnityTicker();
             DrainEvents();
         }
@@ -214,6 +215,7 @@ namespace Liminal.Net.Unity
 
         public void Update()
         {
+            PollPackets();
             TickUnityTicker();
             DrainEvents();
         }
