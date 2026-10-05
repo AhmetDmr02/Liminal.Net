@@ -1,6 +1,7 @@
 using Liminal.Net.Core;
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 
@@ -12,6 +13,7 @@ namespace Liminal.Net.Transports
         public double JitterMs { get; set; } = 0.0;
 
         private readonly LiminalPriorityQueue<DelayedPacket, long> _sendQueue = new();
+        private readonly Dictionary<ushort, long> _lastDeliverTimestampByTarget = new();
         private readonly object _sendLock = new();
         private readonly object _threadLifecycleLock = new();
         private CancellationTokenSource _cts;
@@ -110,6 +112,12 @@ namespace Liminal.Net.Transports
                     return;
                 }
 
+                if (_lastDeliverTimestampByTarget.TryGetValue(targetId, out long lastTimestamp) && deliverTimestamp <= lastTimestamp)
+                {
+                    deliverTimestamp = lastTimestamp + 1;
+                }
+                _lastDeliverTimestampByTarget[targetId] = deliverTimestamp;
+
                 _sendQueue.Enqueue(new DelayedPacket
                 {
                     Buffer = rented,
@@ -207,6 +215,7 @@ namespace Liminal.Net.Transports
                 _cts?.Cancel();
                 lock (_sendLock)
                 {
+                    _lastDeliverTimestampByTarget.Clear();
                     while (_sendQueue.Count > 0)
                     {
                         var pkt = _sendQueue.Dequeue();
