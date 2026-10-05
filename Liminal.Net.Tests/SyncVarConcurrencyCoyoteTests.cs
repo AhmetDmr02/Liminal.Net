@@ -246,6 +246,123 @@ namespace Liminal.Net.Tests.Coyote
         }
 
         [Test]
+        public static async Task Coyote_SyncVar_VisibilityAndObservers_ConcurrentRace()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+            var syncVar = new SyncVar<int>("token_vis_obs_race", 0, SyncVarVisibility.ManualObservers, syncVarManager);
+
+            const ushort clientA = 10;
+            const ushort clientB = 20;
+            const ushort clientC = 30;
+            const int iterations = 30;
+
+            var obsWorker1 = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVar.AddObserver(clientA);
+                    await Task.Yield();
+                    syncVar.RemoveObserver(clientA);
+                    await Task.Yield();
+                }
+            });
+
+            var obsWorker2 = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVar.SetObservers(clientB, clientC);
+                    await Task.Yield();
+                    syncVar.SetObservers(clientA, clientB, clientC);
+                    await Task.Yield();
+                }
+            });
+
+            var visWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVar.SetVisibility(SyncVarVisibility.Public);
+                    await Task.Yield();
+                    syncVar.SetVisibility(SyncVarVisibility.ManualObservers);
+                    await Task.Yield();
+                    syncVar.SetVisibility(SyncVarVisibility.OwnerOnly);
+                    await Task.Yield();
+                }
+            });
+
+            var authExclWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVar.AddAuthority(clientA);
+                    syncVar.AddExclusion(clientB);
+                    await Task.Yield();
+                    syncVar.RemoveAuthority(clientA);
+                    syncVar.RemoveExclusion(clientB);
+                    await Task.Yield();
+                }
+            });
+
+            var readerWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    _ = syncVar.IsVisibleTo(clientA);
+                    _ = syncVar.IsVisibleTo(clientB);
+                    _ = syncVar.IsVisibleTo(clientC);
+                    _ = syncVar.ContainsObserver(clientA);
+                    _ = syncVar.Visibility;
+                    await Task.Yield();
+                }
+            });
+
+            var writerWorker = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    if (syncVar.HasAuthority)
+                    {
+                        syncVar.Value = i;
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            var flusherTask = Task.Run(async () =>
+            {
+                for (int i = 0; i < iterations; i++)
+                {
+                    syncVarManager.FlushDirty();
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(obsWorker1, obsWorker2, visWorker, authExclWorker, readerWorker, writerWorker, flusherTask);
+
+            syncVar.SetVisibility(SyncVarVisibility.ManualObservers);
+            syncVar.SetObservers(clientA, clientB);
+            syncVar.RemoveExclusion(clientA);
+
+            Specification.Assert(syncVar.Visibility == SyncVarVisibility.ManualObservers, "Visibility mismatch.");
+            Specification.Assert(syncVar.ObserverIds.Length == 2, "ObserverIds length mismatch.");
+            Specification.Assert(syncVar.IsVisibleTo(clientA), "Expected client A to be visible.");
+            Specification.Assert(syncVar.IsVisibleTo(clientB), "Expected client B to be visible.");
+            Specification.Assert(!syncVar.IsVisibleTo(clientC), "Expected client C to not be visible.");
+        }
+
+        [Test]
         public static async Task Coyote_SyncVar_ClientRequestAndBatchEcho_PipelineConvergence()
         {
             var config = new LiminalNetworkConfig
@@ -1597,6 +1714,133 @@ namespace Liminal.Net.Tests.Coyote
                     $"SyncVar value was modified without authority! Expected 50, got {sv.Value}");
                 Specification.Assert(!sv.IsDirty,
                     $"SyncVar was marked dirty without authority! IsDirty={sv.IsDirty}");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_EvictionAndCatchUp_ConcurrentRace()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const ushort client1 = 10;
+            const ushort client2 = 20;
+            const ushort client3 = 30;
+            transport.TriggerClientConnected(client1);
+            transport.TriggerClientConnected(client2);
+            transport.TriggerClientConnected(client3);
+
+            var sv = new SyncVar<int>("coyote_edge_cases", 100, SyncVarVisibility.ManualObservers, syncVarManager);
+            const int iterations = 20;
+
+            try
+            {
+                var taskExclusion = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        sv.AddExclusion(client1);
+                        await Task.Yield();
+                        sv.RemoveExclusion(client1);
+                        await Task.Yield();
+                        sv.SetExclusionIds(client1, client2);
+                        await Task.Yield();
+                        sv.SetExclusionIds(Array.Empty<ushort>());
+                        await Task.Yield();
+                    }
+                });
+
+                var taskVisibility = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        sv.SetVisibility(SyncVarVisibility.Public);
+                        await Task.Yield();
+                        sv.SetVisibility(SyncVarVisibility.ManualObservers);
+                        await Task.Yield();
+                        sv.SetVisibility(SyncVarVisibility.OwnerOnly);
+                        await Task.Yield();
+                    }
+                });
+
+                var taskObservers = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        sv.AddObserver(client2);
+                        sv.AddAuthority(client3);
+                        await Task.Yield();
+                        sv.RemoveObserver(client2);
+                        sv.RemoveAuthority(client3);
+                        await Task.Yield();
+                        sv.SetObserverIds(client1, client2, client3);
+                        await Task.Yield();
+                        sv.SetObserverIds(Array.Empty<ushort>());
+                        await Task.Yield();
+                    }
+                });
+
+                var taskFlush = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        sv.Value = 200 + i;
+                        syncVarManager.FlushDirty();
+                        await Task.Yield();
+                    }
+                });
+
+                var taskReader = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        bool vis = sv.IsVisible;
+                        var state = sv.VisibilityState;
+                        bool see1 = state.IsVisibleTo(client1, netManager);
+                        bool see2 = state.IsVisibleTo(client2, netManager);
+                        sv.SetLocallyVisible(i % 2 == 0);
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskExclusion, taskVisibility, taskObservers, taskFlush, taskReader);
+
+                for (int p = 0; p < transport.SentPackets.Count; p++)
+                {
+                    var record = transport.SentPackets[p];
+                    if (record.Data.Length > 2)
+                    {
+                        ushort packetId = BitConverter.ToUInt16(record.Data, 0);
+                        if (packetId == LiminalPacketLibrary.GetId<SyncVarEvictPacket>())
+                        {
+                            var evictPacket = MessagePackSerializer.Deserialize<SyncVarEvictPacket>(
+                                new ReadOnlyMemory<byte>(record.Data, 2, record.Data.Length - 2),
+                                syncVarManager.SerializerOptions);
+                            Specification.Assert(!string.IsNullOrEmpty(evictPacket.Token), "Evict packet token must not be empty.");
+                        }
+                        else if (packetId == LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>())
+                        {
+                            var snapshotPacket = MessagePackSerializer.Deserialize<SyncVarSnapshotPacket>(
+                                new ReadOnlyMemory<byte>(record.Data, 2, record.Data.Length - 2),
+                                syncVarManager.SerializerOptions);
+                            Specification.Assert(snapshotPacket.Entries != null, "Snapshot packet entries must not be null.");
+                        }
+                    }
+                }
             }
             finally
             {

@@ -59,6 +59,7 @@ namespace Liminal.Net.SyncVar
         private readonly Dictionary<string, ushort[]> _unboundAuth = new();
         private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
+        private readonly List<SyncVarVisibilityState> _reusableStateList = new(64);
         private readonly List<ISyncVarInternal> _clientAuthorizedList = new(64);
         private readonly List<ISyncVarInternal> _tailoredVarsList = new(64);
         private readonly int _maxUnboundCapacity;
@@ -115,6 +116,7 @@ namespace Liminal.Net.SyncVar
             _attachedManager.Interpreter.Subscribe<SyncVarSlabBatchPacket>(HandleBatchDelta, this);
             _attachedManager.Interpreter.Subscribe<SyncVarSlabClientRequestPacket>(HandleClientRequest, this);
             _attachedManager.Interpreter.Subscribe<SyncVarAuthUpdatePacket>(HandleAuthUpdate, this);
+            _attachedManager.Interpreter.Subscribe<SyncVarEvictPacket>(HandleEviction, this);
 
             _attachedManager.Events.OnClientConnected += HandleClientConnected;
             _attachedManager.Events.OnLocalClientDisconnected += HandleLocalClientDisconnected;
@@ -160,6 +162,13 @@ namespace Liminal.Net.SyncVar
                 _unboundAuth.Clear();
             }
             DirtyBitset.Clear();
+
+            var allVars = new List<ISyncVarInternal>();
+            _tokenRegistry.GetAll(allVars);
+            for (int i = 0; i < allVars.Count; i++)
+            {
+                allVars[i].SetLocallyVisible(false);
+            }
         }
 
         public bool UnregisterSyncVar(ISyncVarInternal syncVar)
@@ -288,6 +297,7 @@ namespace Liminal.Net.SyncVar
 
             if (entry != null)
             {
+                syncVar.SetLocallyVisible(true);
                 bool force = !syncVar.HasAuthority;
                 syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force, deferEvent: true);
             }
@@ -312,6 +322,24 @@ namespace Liminal.Net.SyncVar
             }
 
             return new SyncVar<T>(token, defaultValue, this);
+        }
+
+        public SyncVar<T> Bind<T>(string token, SyncVarVisibility visibility)
+            => Bind<T>(token, default, visibility);
+
+        public SyncVar<T> Bind<T>(string token, T defaultValue, SyncVarVisibility visibility)
+        {
+            if (_tokenRegistry.TryGet(token, out var existing))
+            {
+                var sv = (SyncVar<T>)existing;
+                if (_attachedManager == null || _attachedManager.Role != NetworkRole.Client)
+                {
+                    sv.SetVisibility(visibility);
+                }
+                return sv;
+            }
+
+            return new SyncVar<T>(token, defaultValue, visibility, this);
         }
 
         public bool TryGetSyncVar(ReadOnlySpan<byte> tokenSpan, out ISyncVarInternal syncVar)
@@ -343,6 +371,64 @@ namespace Liminal.Net.SyncVar
             });
         }
 
+        internal void SendSyncVarToClient(ISyncVarInternal syncVar, ushort clientId)
+        {
+            var netManager = _attachedManager;
+            if (netManager == null || netManager.Role == NetworkRole.Client || !netManager.CanSend)
+                return;
+
+            if (netManager.SessionManager != null && !netManager.SessionManager.HasSession(clientId))
+            {
+                if (!(netManager.Role == NetworkRole.Host && clientId == netManager.localID))
+                    return;
+            }
+
+            if (!syncVar.TryExtractSnapshotData(out byte[] data, out uint version))
+                return;
+
+            var packet = new SyncVarSnapshotPacket
+            {
+                Entries = new List<SyncVarSnapshotEntry>(1)
+                {
+                    new SyncVarSnapshotEntry
+                    {
+                        Token = syncVar.Token,
+                        Version = version,
+                        AuthIds = syncVar.AuthIds,
+                        Data = data
+                    }
+                }
+            };
+
+            if (netManager.Role == NetworkRole.Host && clientId == netManager.localID)
+                netManager.Interpreter.SendCommandAsClient(clientId, packet);
+            else
+                netManager.Interpreter.SendCommandAsServer(clientId, packet);
+        }
+
+        internal void SendEvictionToClient(ISyncVarInternal syncVar, ushort clientId)
+        {
+            var netManager = _attachedManager;
+            if (netManager == null || netManager.Role == NetworkRole.Client || !netManager.CanSend)
+                return;
+
+            if (netManager.SessionManager != null && !netManager.SessionManager.HasSession(clientId))
+            {
+                if (!(netManager.Role == NetworkRole.Host && clientId == netManager.localID))
+                    return;
+            }
+
+            var packet = new SyncVarEvictPacket
+            {
+                Token = syncVar.Token
+            };
+
+            if (netManager.Role == NetworkRole.Host && clientId == netManager.localID)
+                netManager.Interpreter.SendCommandAsClient(clientId, packet);
+            else
+                netManager.Interpreter.SendCommandAsServer(clientId, packet);
+        }
+
         private readonly ArrayBufferWriter<byte> _sharedFlushWriter = new(4096);
         private readonly ArrayBufferWriter<byte> _tailoredFlushWriter = new(2048);
         private int _isFlushing = 0;
@@ -362,10 +448,12 @@ namespace Liminal.Net.SyncVar
             try
             {
                 _reusableDirtyList.Clear();
+                _reusableStateList.Clear();
                 while (_dirtyQueue.TryDequeue(out var syncVar))
                 {
                     syncVar.ClearDirty();
                     _reusableDirtyList.Add(syncVar);
+                    _reusableStateList.Add(syncVar.VisibilityState);
                 }
 
                 if (_reusableDirtyList.Count == 0) return;
@@ -409,26 +497,26 @@ namespace Liminal.Net.SyncVar
                 var masterWriter = new MessagePackWriter(_sharedFlushWriter);
                 masterWriter.WriteArrayHeader(_reusableDirtyList.Count);
 
-                bool hasAnyExclusions = false;
+                bool requiresTargeting = false;
                 for (int i = 0; i < _reusableDirtyList.Count; i++)
                 {
-                    var syncVar = _reusableDirtyList[i];
-                    if (syncVar.ExclusionIds != null && syncVar.ExclusionIds.Length > 0)
+                    var state = _reusableStateList[i];
+                    if (state.Mode != SyncVarVisibility.Public || state.Exclusions.Length > 0)
                     {
-                        hasAnyExclusions = true;
+                        requiresTargeting = true;
                     }
 
-                    if (!syncVar.TryWriteSlotForWire(ref masterWriter, out _))
+                    if (!_reusableDirtyList[i].TryWriteSlotForWire(ref masterWriter, out _))
                     {
-                        if (syncVar.TryMarkDirty())
-                            _dirtyQueue.Enqueue(syncVar);
+                        if (_reusableDirtyList[i].TryMarkDirty())
+                            _dirtyQueue.Enqueue(_reusableDirtyList[i]);
                     }
                 }
 
                 masterWriter.Flush();
                 var masterPacket = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(_sharedFlushWriter.WrittenMemory));
 
-                if (!hasAnyExclusions)
+                if (!requiresTargeting)
                 {
                     SendViaManager(SendTo.Everyone, masterPacket);
                     return;
@@ -447,17 +535,17 @@ namespace Liminal.Net.SyncVar
                     if (targetId == ILiminalTransport.SERVER_ID && netManager.Role == NetworkRole.Host)
                         continue;
 
-                    bool clientHasExclusions = false;
+                    bool clientSeesAll = true;
                     for (int i = 0; i < _reusableDirtyList.Count; i++)
                     {
-                        if (_reusableDirtyList[i].IsExcluded(targetId))
+                        if (!_reusableStateList[i].IsVisibleTo(targetId, netManager))
                         {
-                            clientHasExclusions = true;
+                            clientSeesAll = false;
                             break;
                         }
                     }
 
-                    if (!clientHasExclusions)
+                    if (clientSeesAll)
                     {
                         unexcludedTargets[unexcludedCount++] = targetId;
                     }
@@ -466,9 +554,8 @@ namespace Liminal.Net.SyncVar
                         _tailoredVarsList.Clear();
                         for (int i = 0; i < _reusableDirtyList.Count; i++)
                         {
-                            var syncVar = _reusableDirtyList[i];
-                            if (!syncVar.IsExcluded(targetId))
-                                _tailoredVarsList.Add(syncVar);
+                            if (_reusableStateList[i].IsVisibleTo(targetId, netManager))
+                                _tailoredVarsList.Add(_reusableDirtyList[i]);
                         }
 
                         if (_tailoredVarsList.Count == 0) continue;
@@ -511,6 +598,7 @@ namespace Liminal.Net.SyncVar
                 _clientAuthorizedList.Clear();
                 _tailoredVarsList.Clear();
                 _reusableDirtyList.Clear();
+                _reusableStateList.Clear();
                 Volatile.Write(ref _isFlushing, 0);
             }
         }
@@ -561,6 +649,9 @@ namespace Liminal.Net.SyncVar
 
         private void HandleBatchDelta(SyncVarSlabBatchPacket packet, ushort senderId)
         {
+            var netManager = _attachedManager;
+            if (netManager != null && netManager.Role == NetworkRole.Client && !netManager.IsConnected) return;
+
             if (packet.Payload.IsEmpty) return;
 
             var reader = new MessagePackReader(packet.Payload);
@@ -588,6 +679,7 @@ namespace Liminal.Net.SyncVar
 
                 if (TryGetSyncVar(tokenSpan, out var syncVar))
                 {
+                    syncVar.SetLocallyVisible(true);
                     syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions);
                 }
                 else
@@ -650,6 +742,9 @@ namespace Liminal.Net.SyncVar
 
         private void HandleAuthUpdate(SyncVarAuthUpdatePacket packet, ushort senderId)
         {
+            var netManager = _attachedManager;
+            if (netManager != null && netManager.Role == NetworkRole.Client && !netManager.IsConnected) return;
+
             if (TryGetSyncVar(packet.Token, out var syncVar))
             {
                 syncVar.ApplyAuthUpdateFromRemote(packet.AuthIds);
@@ -672,7 +767,7 @@ namespace Liminal.Net.SyncVar
             for (int i = 0; i < allVars.Count; i++)
             {
                 var syncVar = allVars[i];
-                if (syncVar.IsExcluded(clientId)) continue;
+                if (!syncVar.IsVisibleTo(clientId)) continue;
 
                 if (!syncVar.TryExtractSnapshotData(out byte[] data, out uint version))
                     continue;
@@ -694,6 +789,9 @@ namespace Liminal.Net.SyncVar
 
         private void HandleSnapshot(SyncVarSnapshotPacket packet, ushort senderId)
         {
+            var netManager = _attachedManager;
+            if (netManager != null && netManager.Role == NetworkRole.Client && !netManager.IsConnected) return;
+
             Volatile.Write(ref _hasReceivedInitialSnapshot, 1);
             if (packet.Entries == null || packet.Entries.Count == 0) return;
 
@@ -702,6 +800,7 @@ namespace Liminal.Net.SyncVar
                 var entry = packet.Entries[i];
                 if (TryGetSyncVar(entry.Token, out var syncVar))
                 {
+                    syncVar.SetLocallyVisible(true);
                     syncVar.ApplyAuthUpdateFromRemote(entry.AuthIds);
                     if (entry.Data != null && entry.Data.Length > 0)
                     {
@@ -727,6 +826,29 @@ namespace Liminal.Net.SyncVar
                     {
                         StoreUnboundData(entry.Token, entry.Version, entry.Data);
                     }
+                }
+            }
+        }
+
+        private void HandleEviction(SyncVarEvictPacket packet, ushort senderId)
+        {
+            var netManager = _attachedManager;
+            if (netManager != null && netManager.Role == NetworkRole.Client && (!netManager.IsConnected || senderId != ILiminalTransport.SERVER_ID))
+                return;
+
+            if (TryGetSyncVar(packet.Token, out var syncVar))
+            {
+                syncVar.SetLocallyVisible(false);
+            }
+            else
+            {
+                lock (_unboundLock)
+                {
+                    if (_unboundCache.Remove(packet.Token, out var entry))
+                    {
+                        _unboundOrder.Remove(entry.Node);
+                    }
+                    _unboundAuth.Remove(packet.Token);
                 }
             }
         }

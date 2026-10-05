@@ -18,12 +18,19 @@ namespace Liminal.Net.SyncVar
         int Length { get; }
         ushort[] AuthIds { get; }
         ushort[] ExclusionIds { get; }
+        ushort[] ObserverIds { get; }
+        SyncVarVisibility Visibility { get; set; }
+        SyncVarVisibilityState VisibilityState { get; }
+        bool IsVisible { get; }
 
         bool IsAuthorized(ushort clientId);
         bool IsExcluded(ushort clientId);
         bool ContainsExclusion(ushort clientId);
+        bool ContainsObserver(ushort clientId);
+        bool IsVisibleTo(ushort clientId);
         bool HasAuthority { get; }
 
+        void SetLocallyVisible(bool isVisible);
         void SetAuthIds(params ushort[] clientIds);
         void AddAuthority(ushort clientId);
         void RemoveAuthority(ushort clientId);
@@ -33,6 +40,12 @@ namespace Liminal.Net.SyncVar
         void SetExclusions(params ushort[] clientIds);
         void AddExclusion(ushort clientId);
         void RemoveExclusion(ushort clientId);
+
+        void SetVisibility(SyncVarVisibility visibility);
+        void SetObserverIds(params ushort[] clientIds);
+        void SetObservers(params ushort[] clientIds);
+        void AddObserver(ushort clientId);
+        void RemoveObserver(ushort clientId);
 
         void SetDirty();
         bool TryMarkDirty();
@@ -53,8 +66,7 @@ namespace Liminal.Net.SyncVar
         private const int STATE_READING = 1;
         private const int STATE_SWAPPING = 2;
 
-        private readonly object _authLock = new();
-        private readonly object _exclusionLock = new();
+        private readonly object _stateLock = new();
         private readonly object _writeLock = new();
         private readonly SyncVarManager _manager;
 
@@ -69,12 +81,12 @@ namespace Liminal.Net.SyncVar
         private int _frontIndex = 0;
         private int _gate = STATE_IDLE;
         private int _isDirty = 0;
+        private int _isLocallyVisible = 0;
 
         private readonly T[] _values = new T[2];
         private int _valueSeq = 0;
         private uint _version;
-        private ushort[] _authIds = Array.Empty<ushort>();
-        private ushort[] _exclusionIds = Array.Empty<ushort>();
+        private SyncVarVisibilityState _visibilityState;
         private readonly byte[] _tokenBytes;
 
         private T _pendingOldValue;
@@ -84,6 +96,7 @@ namespace Liminal.Net.SyncVar
         private bool _hasPendingAuthChanged;
 
         public event Action<bool> OnAuthorityChanged;
+        public event Action<bool> OnVisibilityScopeChanged;
 
         public string Token { get; }
         public byte[] TokenBytes => _tokenBytes;
@@ -118,8 +131,37 @@ namespace Liminal.Net.SyncVar
         public int ActivePageIndex => _slots[Volatile.Read(ref _frontIndex)].PageIndex;
         public int ActivePageOffset => _slots[Volatile.Read(ref _frontIndex)].PageOffset;
         public int Length => _slotLengths[Volatile.Read(ref _frontIndex)];
-        public ushort[] AuthIds => Volatile.Read(ref _authIds);
-        public ushort[] ExclusionIds => Volatile.Read(ref _exclusionIds);
+        public SyncVarVisibilityState VisibilityState => Volatile.Read(ref _visibilityState);
+        public ushort[] AuthIds => VisibilityState.Authorities;
+        public ushort[] ExclusionIds => VisibilityState.Exclusions;
+        public ushort[] ObserverIds => VisibilityState.Observers;
+        public SyncVarVisibility Visibility
+        {
+            get => VisibilityState.Mode;
+            set => SetVisibility(value);
+        }
+        public bool IsVisible
+        {
+            get
+            {
+                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                if (netManager != null && (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
+                {
+                    return true;
+                }
+                return Volatile.Read(ref _isLocallyVisible) != 0;
+            }
+        }
+
+        public void SetLocallyVisible(bool isVisible)
+        {
+            int newVal = isVisible ? 1 : 0;
+            int oldVal = Interlocked.Exchange(ref _isLocallyVisible, newVal);
+            if (oldVal != newVal)
+            {
+                OnVisibilityScopeChanged?.Invoke(isVisible);
+            }
+        }
         public SyncVarManager Manager => _manager;
         public bool IsDirty => Volatile.Read(ref _isDirty) != 0;
 
@@ -195,6 +237,16 @@ namespace Liminal.Net.SyncVar
         }
 
         public SyncVar(string token, T initialValue = default, SyncVarManager manager = null)
+            : this(token, initialValue, SyncVarVisibility.Public, manager)
+        {
+        }
+
+        public SyncVar(string token, SyncVarVisibility visibility, SyncVarManager manager = null)
+            : this(token, default, visibility, manager)
+        {
+        }
+
+        public SyncVar(string token, T initialValue, SyncVarVisibility visibility, SyncVarManager manager = null)
         {
             Token = token ?? throw new ArgumentNullException(nameof(token));
             _tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
@@ -203,9 +255,24 @@ namespace Liminal.Net.SyncVar
                 throw new ArgumentException($"[SyncVar] Token '{token}' UTF-8 length exceeds 255 bytes.");
             }
 
+            _manager = manager ?? SyncVarManager.GetManagerForRegistration();
+
+            var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+            SyncVarVisibility initialMode = (netManager != null && netManager.Role == NetworkRole.Client)
+                ? SyncVarVisibility.Public
+                : visibility;
+
+            _visibilityState = initialMode switch
+            {
+                SyncVarVisibility.ManualObservers => SyncVarVisibilityState.DefaultManualObservers,
+                SyncVarVisibility.OwnerOnly => SyncVarVisibilityState.DefaultOwnerOnly,
+                _ => SyncVarVisibilityState.DefaultPublic
+            };
+
+            _isLocallyVisible = (netManager != null && netManager.Role == NetworkRole.Client) ? 0 : 1;
+
             _values[0] = initialValue;
             _values[1] = initialValue;
-            _manager = manager ?? SyncVarManager.GetManagerForRegistration();
             _manager.RegisterSyncVar(this);
         }
 
@@ -241,9 +308,11 @@ namespace Liminal.Net.SyncVar
             ushort[] next;
             bool fireEvent;
             bool currentAuth;
+            ushort[] previousAuthorities;
 
-            lock (_authLock)
+            lock (_stateLock)
             {
+                previousAuthorities = Volatile.Read(ref _visibilityState).Authorities;
                 if (clientIds == null || clientIds.Length == 0)
                 {
                     next = Array.Empty<ushort>();
@@ -273,6 +342,27 @@ namespace Liminal.Net.SyncVar
             }
 
             BroadcastAuthIfServer(next);
+
+            if (Visibility == SyncVarVisibility.OwnerOnly && _manager != null)
+            {
+                for (int i = 0; i < next.Length; i++)
+                {
+                    ushort id = next[i];
+                    if (IsVisibleTo(id))
+                    {
+                        _manager.SendSyncVarToClient(this, id);
+                    }
+                }
+
+                for (int i = 0; i < previousAuthorities.Length; i++)
+                {
+                    ushort id = previousAuthorities[i];
+                    if (!IsVisibleTo(id))
+                    {
+                        _manager.SendEvictionToClient(this, id);
+                    }
+                }
+            }
         }
 
         public void AddAuthority(ushort clientId)
@@ -283,9 +373,9 @@ namespace Liminal.Net.SyncVar
             bool fireEvent = false;
             bool currentAuth = false;
 
-            lock (_authLock)
+            lock (_stateLock)
             {
-                var current = Volatile.Read(ref _authIds);
+                var current = Volatile.Read(ref _visibilityState).Authorities;
                 for (int i = 0; i < current.Length; i++)
                 {
                     if (current[i] == clientId)
@@ -311,6 +401,11 @@ namespace Liminal.Net.SyncVar
             {
                 BroadcastAuthIfServer(next);
             }
+
+            if (Visibility == SyncVarVisibility.OwnerOnly && IsVisibleTo(clientId))
+            {
+                _manager?.SendSyncVarToClient(this, clientId);
+            }
         }
 
         public void RemoveAuthority(ushort clientId)
@@ -321,9 +416,9 @@ namespace Liminal.Net.SyncVar
             bool fireEvent = false;
             bool currentAuth = false;
 
-            lock (_authLock)
+            lock (_stateLock)
             {
-                var current = Volatile.Read(ref _authIds);
+                var current = Volatile.Read(ref _visibilityState).Authorities;
                 int targetIndex = -1;
 
                 for (int i = 0; i < current.Length; i++)
@@ -363,6 +458,11 @@ namespace Liminal.Net.SyncVar
             {
                 BroadcastAuthIfServer(next);
             }
+
+            if (Visibility == SyncVarVisibility.OwnerOnly && !IsVisibleTo(clientId))
+            {
+                _manager?.SendEvictionToClient(this, clientId);
+            }
         }
 
         public void ApplyAuthUpdateFromRemote(ushort[] newAuthIds, bool deferEvent = false)
@@ -370,12 +470,13 @@ namespace Liminal.Net.SyncVar
             bool fireEvent = false;
             bool currentAuth = false;
 
-            lock (_authLock)
+            lock (_stateLock)
             {
                 lock (_writeLock)
                 {
                     bool previousAuth = HasAuthority;
-                    Volatile.Write(ref _authIds, newAuthIds ?? Array.Empty<ushort>());
+                    var current = Volatile.Read(ref _visibilityState);
+                    Volatile.Write(ref _visibilityState, current.WithAuthorities(newAuthIds ?? Array.Empty<ushort>()));
 
                     currentAuth = HasAuthority;
                     if (previousAuth != currentAuth)
@@ -409,7 +510,7 @@ namespace Liminal.Net.SyncVar
         {
             if (clientId == ILiminalTransport.SERVER_ID) return true;
 
-            var auth = Volatile.Read(ref _authIds);
+            var auth = VisibilityState.Authorities;
             if (auth == null || auth.Length == 0) return false;
             for (int i = 0; i < auth.Length; i++)
             {
@@ -423,7 +524,8 @@ namespace Liminal.Net.SyncVar
             lock (_writeLock)
             {
                 bool previousAuth = HasAuthority;
-                Volatile.Write(ref _authIds, newAuthIds);
+                var current = Volatile.Read(ref _visibilityState);
+                Volatile.Write(ref _visibilityState, current.WithAuthorities(newAuthIds));
 
                 currentAuth = HasAuthority;
                 if (previousAuth != currentAuth && !currentAuth)
@@ -454,7 +556,7 @@ namespace Liminal.Net.SyncVar
 
         public bool IsExcluded(ushort clientId)
         {
-            var excluded = Volatile.Read(ref _exclusionIds);
+            var excluded = VisibilityState.Exclusions;
             if (excluded == null || excluded.Length == 0) return false;
             for (int i = 0; i < excluded.Length; i++)
             {
@@ -469,27 +571,89 @@ namespace Liminal.Net.SyncVar
         {
             if (!IsServerAuthority("SetExclusionIds")) return;
 
-            lock (_exclusionLock)
+            List<ushort> newlyExcluded = null;
+            List<ushort> newlyUnexcluded = null;
+
+            lock (_stateLock)
             {
+                var current = Volatile.Read(ref _visibilityState).Exclusions;
+                ushort[] next;
+
                 if (clientIds == null || clientIds.Length == 0)
                 {
-                    CommitExclusionUpdate(Array.Empty<ushort>());
-                    return;
+                    next = Array.Empty<ushort>();
                 }
-
-                var cleanList = new List<ushort>(clientIds.Length);
-                for (int i = 0; i < clientIds.Length; i++)
+                else
                 {
-                    ushort id = clientIds[i];
-                    if (cleanList.Contains(id))
+                    var cleanList = new List<ushort>(clientIds.Length);
+                    for (int i = 0; i < clientIds.Length; i++)
                     {
-                        LiminalLogger.LogWarning($"[SyncVar] Duplicate exclusion ID {id} passed into '{Token}'. Overwriting duplicate entry.");
-                        continue;
+                        ushort id = clientIds[i];
+                        if (cleanList.Contains(id))
+                        {
+                            LiminalLogger.LogWarning($"[SyncVar] Duplicate exclusion ID {id} passed into '{Token}'. Overwriting duplicate entry.");
+                            continue;
+                        }
+                        cleanList.Add(id);
                     }
-                    cleanList.Add(id);
+                    next = cleanList.ToArray();
                 }
 
-                CommitExclusionUpdate(cleanList.ToArray());
+                for (int i = 0; i < next.Length; i++)
+                {
+                    ushort id = next[i];
+                    bool wasInCurrent = false;
+                    for (int j = 0; j < current.Length; j++)
+                    {
+                        if (current[j] == id) { wasInCurrent = true; break; }
+                    }
+                    if (!wasInCurrent)
+                    {
+                        newlyExcluded ??= new List<ushort>();
+                        newlyExcluded.Add(id);
+                    }
+                }
+
+                for (int i = 0; i < current.Length; i++)
+                {
+                    ushort id = current[i];
+                    bool isInNext = false;
+                    for (int j = 0; j < next.Length; j++)
+                    {
+                        if (next[j] == id) { isInNext = true; break; }
+                    }
+                    if (!isInNext)
+                    {
+                        newlyUnexcluded ??= new List<ushort>();
+                        newlyUnexcluded.Add(id);
+                    }
+                }
+
+                CommitExclusionUpdate(next);
+            }
+
+            if (newlyExcluded != null && _manager != null)
+            {
+                for (int i = 0; i < newlyExcluded.Count; i++)
+                {
+                    ushort id = newlyExcluded[i];
+                    if (!IsVisibleTo(id))
+                    {
+                        _manager.SendEvictionToClient(this, id);
+                    }
+                }
+            }
+
+            if (newlyUnexcluded != null && _manager != null)
+            {
+                for (int i = 0; i < newlyUnexcluded.Count; i++)
+                {
+                    ushort id = newlyUnexcluded[i];
+                    if (IsVisibleTo(id))
+                    {
+                        _manager.SendSyncVarToClient(this, id);
+                    }
+                }
             }
         }
 
@@ -499,9 +663,10 @@ namespace Liminal.Net.SyncVar
         {
             if (!IsServerAuthority("AddExclusion")) return;
 
-            lock (_exclusionLock)
+            bool added = false;
+            lock (_stateLock)
             {
-                var current = Volatile.Read(ref _exclusionIds);
+                var current = Volatile.Read(ref _visibilityState).Exclusions;
                 for (int i = 0; i < current.Length; i++)
                 {
                     if (current[i] == clientId)
@@ -516,6 +681,12 @@ namespace Liminal.Net.SyncVar
                 next[current.Length] = clientId;
 
                 CommitExclusionUpdate(next);
+                added = true;
+            }
+
+            if (added && !IsVisibleTo(clientId))
+            {
+                _manager?.SendEvictionToClient(this, clientId);
             }
         }
 
@@ -523,9 +694,10 @@ namespace Liminal.Net.SyncVar
         {
             if (!IsServerAuthority("RemoveExclusion")) return;
 
-            lock (_exclusionLock)
+            bool removed = false;
+            lock (_stateLock)
             {
-                var current = Volatile.Read(ref _exclusionIds);
+                var current = Volatile.Read(ref _visibilityState).Exclusions;
                 int targetIndex = -1;
 
                 for (int i = 0; i < current.Length; i++)
@@ -554,17 +726,265 @@ namespace Liminal.Net.SyncVar
                 }
 
                 CommitExclusionUpdate(next);
+                removed = true;
+            }
+
+            if (removed && IsVisibleTo(clientId))
+            {
+                _manager?.SendSyncVarToClient(this, clientId);
             }
         }
 
         private void CommitExclusionUpdate(ushort[] newExclusionIds)
         {
-            Volatile.Write(ref _exclusionIds, newExclusionIds);
+            var current = Volatile.Read(ref _visibilityState);
+            Volatile.Write(ref _visibilityState, current.WithExclusions(newExclusionIds));
         }
 
         #endregion
 
-        private bool IsServerAuthority(string actionName)
+        #region Observer Management
+
+        public void SetVisibility(SyncVarVisibility visibility)
+        {
+            if (!IsServerAuthority("SetVisibility", silent: true)) return;
+
+            bool changed = false;
+            SyncVarVisibilityState previousState = null;
+            SyncVarVisibilityState newState = null;
+
+            lock (_stateLock)
+            {
+                var current = Volatile.Read(ref _visibilityState);
+                if (current.Mode != visibility)
+                {
+                    previousState = current;
+                    newState = current.WithMode(visibility);
+                    Volatile.Write(ref _visibilityState, newState);
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                if (TryMarkDirty())
+                {
+                    _manager?.EnqueueDirty(this);
+                }
+
+                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                if (netManager != null && netManager.SessionManager != null &&
+                    (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
+                {
+                    int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+                    Span<ushort> allSessions = stackalloc ushort[maxClients];
+                    int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
+
+                    for (int s = 0; s < totalSessions; s++)
+                    {
+                        ushort sid = allSessions[s];
+                        if (sid == ILiminalTransport.SERVER_ID && netManager.Role == NetworkRole.Host)
+                            continue;
+
+                        bool wasVisible = previousState.IsVisibleTo(sid, netManager);
+                        bool isNowVisible = newState.IsVisibleTo(sid, netManager);
+
+                        if (wasVisible && !isNowVisible)
+                        {
+                            _manager?.SendEvictionToClient(this, sid);
+                        }
+                        else if (!wasVisible && isNowVisible)
+                        {
+                            _manager?.SendSyncVarToClient(this, sid);
+                        }
+                    }
+                }
+            }
+        }
+
+        public bool ContainsObserver(ushort clientId)
+        {
+            var observers = VisibilityState.Observers;
+            if (observers == null || observers.Length == 0) return false;
+            for (int i = 0; i < observers.Length; i++)
+            {
+                if (observers[i] == clientId) return true;
+            }
+            return false;
+        }
+
+        public bool IsVisibleTo(ushort clientId)
+        {
+            return VisibilityState.IsVisibleTo(clientId, _manager?.AttachedManager ?? LiminalNetworkManager.Instance);
+        }
+
+        public void SetObserverIds(params ushort[] clientIds)
+        {
+            if (!IsServerAuthority("SetObserverIds", silent: true)) return;
+
+            List<ushort> newlyAdded = null;
+            List<ushort> newlyRemoved = null;
+
+            lock (_stateLock)
+            {
+                var current = Volatile.Read(ref _visibilityState);
+                var currentObservers = current.Observers;
+                ushort[] next;
+
+                if (clientIds == null || clientIds.Length == 0)
+                {
+                    next = Array.Empty<ushort>();
+                }
+                else
+                {
+                    var cleanList = new List<ushort>(clientIds.Length);
+                    for (int i = 0; i < clientIds.Length; i++)
+                    {
+                        ushort id = clientIds[i];
+                        if (!cleanList.Contains(id))
+                        {
+                            cleanList.Add(id);
+                        }
+                    }
+                    next = cleanList.ToArray();
+                }
+
+                for (int i = 0; i < next.Length; i++)
+                {
+                    ushort id = next[i];
+                    bool exists = false;
+                    for (int j = 0; j < currentObservers.Length; j++)
+                    {
+                        if (currentObservers[j] == id) { exists = true; break; }
+                    }
+                    if (!exists)
+                    {
+                        newlyAdded ??= new List<ushort>();
+                        newlyAdded.Add(id);
+                    }
+                }
+
+                for (int i = 0; i < currentObservers.Length; i++)
+                {
+                    ushort id = currentObservers[i];
+                    bool exists = false;
+                    for (int j = 0; j < next.Length; j++)
+                    {
+                        if (next[j] == id) { exists = true; break; }
+                    }
+                    if (!exists)
+                    {
+                        newlyRemoved ??= new List<ushort>();
+                        newlyRemoved.Add(id);
+                    }
+                }
+
+                Volatile.Write(ref _visibilityState, current.WithObservers(next));
+            }
+
+            if (newlyAdded != null && _manager != null)
+            {
+                for (int i = 0; i < newlyAdded.Count; i++)
+                {
+                    ushort id = newlyAdded[i];
+                    if (IsVisibleTo(id))
+                    {
+                        _manager.SendSyncVarToClient(this, id);
+                    }
+                }
+            }
+
+            if (newlyRemoved != null && _manager != null)
+            {
+                for (int i = 0; i < newlyRemoved.Count; i++)
+                {
+                    ushort id = newlyRemoved[i];
+                    if (!IsVisibleTo(id))
+                    {
+                        _manager.SendEvictionToClient(this, id);
+                    }
+                }
+            }
+        }
+
+        public void SetObservers(params ushort[] clientIds) => SetObserverIds(clientIds);
+
+        public void AddObserver(ushort clientId)
+        {
+            if (!IsServerAuthority("AddObserver", silent: true)) return;
+
+            bool added = false;
+            lock (_stateLock)
+            {
+                var current = Volatile.Read(ref _visibilityState);
+                var currentObservers = current.Observers;
+                for (int i = 0; i < currentObservers.Length; i++)
+                {
+                    if (currentObservers[i] == clientId)
+                    {
+                        return;
+                    }
+                }
+
+                var next = new ushort[currentObservers.Length + 1];
+                Array.Copy(currentObservers, next, currentObservers.Length);
+                next[currentObservers.Length] = clientId;
+
+                Volatile.Write(ref _visibilityState, current.WithObservers(next));
+                added = true;
+            }
+
+            if (added && IsVisibleTo(clientId))
+            {
+                _manager?.SendSyncVarToClient(this, clientId);
+            }
+        }
+
+        public void RemoveObserver(ushort clientId)
+        {
+            if (!IsServerAuthority("RemoveObserver", silent: true)) return;
+
+            bool removed = false;
+            lock (_stateLock)
+            {
+                var current = Volatile.Read(ref _visibilityState);
+                var currentObservers = current.Observers;
+                int targetIndex = -1;
+
+                for (int i = 0; i < currentObservers.Length; i++)
+                {
+                    if (currentObservers[i] == clientId)
+                    {
+                        targetIndex = i;
+                        break;
+                    }
+                }
+
+                if (targetIndex < 0) return;
+
+                var next = new ushort[currentObservers.Length - 1];
+                if (targetIndex > 0)
+                {
+                    Array.Copy(currentObservers, 0, next, 0, targetIndex);
+                }
+                if (targetIndex < currentObservers.Length - 1)
+                {
+                    Array.Copy(currentObservers, targetIndex + 1, next, targetIndex, currentObservers.Length - targetIndex - 1);
+                }
+
+                Volatile.Write(ref _visibilityState, current.WithObservers(next));
+                removed = true;
+            }
+
+            if (removed && !IsVisibleTo(clientId))
+            {
+                _manager?.SendEvictionToClient(this, clientId);
+            }
+        }
+
+        #endregion
+
+        private bool IsServerAuthority(string actionName, bool silent = false)
         {
             var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
             if (netManager == null || netManager.Role == NetworkRole.None)
@@ -575,8 +995,11 @@ namespace Liminal.Net.SyncVar
 
             if (netManager.Role == NetworkRole.Client)
             {
-                ushort myId = netManager.localID;
-                LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {myId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+                if (!silent)
+                {
+                    ushort myId = netManager.localID;
+                    LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {myId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+                }
                 return false;
             }
 
@@ -588,8 +1011,11 @@ namespace Liminal.Net.SyncVar
                 return true;
             }
 
-            ushort otherId = netManager.localID;
-            LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {otherId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+            if (!silent)
+            {
+                ushort otherId = netManager.localID;
+                LiminalLogger.LogError($"[SyncVar] Unauthorized {actionName} blocked! Client {otherId} is not the server. Modifications for '{Token}' can only be performed by the server.");
+            }
             return false;
         }
 
@@ -826,13 +1252,15 @@ namespace Liminal.Net.SyncVar
             {
                 OnValueChanged?.Invoke(old, deserialized);
             }
+
+            SetLocallyVisible(true);
         }
 
         public void FirePendingEvents()
         {
             bool fireAuth = false;
             bool authValue = false;
-            lock (_authLock)
+            lock (_stateLock)
             {
                 if (_hasPendingAuthChanged)
                 {
@@ -887,7 +1315,8 @@ namespace Liminal.Net.SyncVar
         public void Dispose()
         {
             Unregister();
-            lock (_authLock)
+            SetLocallyVisible(false);
+            lock (_stateLock)
             {
                 _hasPendingAuthChanged = false;
             }

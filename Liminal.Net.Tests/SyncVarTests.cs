@@ -1088,5 +1088,410 @@ namespace Liminal.Net.Tests
         }
 
         #endregion
+
+        #region Visibility and Observer System Tests
+
+        [Test]
+        public void Test34_ManualObservers_HiddenByDefault_DoesNotReplicateToUnobservedClient()
+        {
+            string token = $"hidden_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 42, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Thread.Sleep(150);
+            Assert.That(clientVar.Value, Is.EqualTo(0), "Unobserved client received hidden SyncVar on connection.");
+
+            serverVar.Value = 999;
+            _serverManager.SyncVarManager.FlushDirty();
+
+            Thread.Sleep(150);
+            Assert.That(clientVar.Value, Is.EqualTo(0), "Unobserved client received dirty flush update for hidden SyncVar.");
+        }
+
+        [Test]
+        public void Test35_ManualObservers_AddObserver_ReplicatesImmediateSnapshotAndFutureUpdates()
+        {
+            string token = $"add_obs_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 100, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client1 = CreateAndStartClient();
+            var client2 = CreateAndStartClient();
+
+            var c1Var = client1.SyncVarManager.Bind<int>(token, 0);
+            var c2Var = client2.SyncVarManager.Bind<int>(token, 0);
+
+            Thread.Sleep(100);
+            Assert.That(c1Var.Value, Is.EqualTo(0));
+            Assert.That(c2Var.Value, Is.EqualTo(0));
+
+            serverVar.AddObserver(client1.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 100, 2000), Is.True,
+                "Observed client did not receive immediate catch-up snapshot after AddObserver.");
+            Assert.That(c2Var.Value, Is.EqualTo(0), "Non-observed client received snapshot.");
+
+            serverVar.Value = 250;
+            Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 250, 2000), Is.True,
+                "Observed client did not receive updated value.");
+            Assert.That(c2Var.Value, Is.EqualTo(0), "Non-observed client received dirty update.");
+        }
+
+        [Test]
+        public void Test36_ManualObservers_RemoveObserver_StopsReplication()
+        {
+            string token = $"rem_obs_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 50, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            serverVar.AddObserver(client.localID);
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50, 2000), Is.True);
+
+            serverVar.RemoveObserver(client.localID);
+            Assert.That(serverVar.ContainsObserver(client.localID), Is.False);
+
+            serverVar.Value = 999;
+            _serverManager.SyncVarManager.FlushDirty();
+
+            Thread.Sleep(150);
+            Assert.That(clientVar.Value, Is.EqualTo(50), "Client received update after observer removal.");
+        }
+
+        [Test]
+        public void Test37_OwnerOnly_OnlyReplicatesToAuthorizedClient()
+        {
+            string token = $"owner_only_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 777, SyncVarVisibility.OwnerOnly, _serverManager.SyncVarManager);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client1 = CreateAndStartClient();
+            var client2 = CreateAndStartClient();
+
+            var c1Var = client1.SyncVarManager.Bind<int>(token, 0);
+            var c2Var = client2.SyncVarManager.Bind<int>(token, 0);
+
+            Thread.Sleep(100);
+            Assert.That(c1Var.Value, Is.EqualTo(0));
+            Assert.That(c2Var.Value, Is.EqualTo(0));
+
+            serverVar.AddAuthority(client1.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 777 && c1Var.HasAuthority, 2000), Is.True,
+                "Owner client did not receive OwnerOnly variable upon receiving authority.");
+            Assert.That(c2Var.Value, Is.EqualTo(0), "Non-owner client received OwnerOnly variable.");
+
+            serverVar.Value = 888;
+            Assert.That(SpinWait.SpinUntil(() => c1Var.Value == 888, 2000), Is.True);
+            Assert.That(c2Var.Value, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test38_Client_PassesVisibilityOverload_SilentlyDismissed()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token1 = $"client_vis_ctor_{Guid.NewGuid():N}";
+            string token2 = $"client_vis_bind_{Guid.NewGuid():N}";
+
+            SyncVar<int> c1 = null;
+            SyncVar<int> c2 = null;
+
+            Assert.DoesNotThrow(() =>
+            {
+                c1 = new SyncVar<int>(token1, 10, SyncVarVisibility.ManualObservers, client.SyncVarManager);
+                c2 = client.SyncVarManager.Bind<int>(token2, 20, SyncVarVisibility.ManualObservers);
+            }, "Client threw an exception when specifying SyncVarVisibility.");
+
+            Assert.That(c1.Visibility, Is.EqualTo(SyncVarVisibility.Public),
+                "Client visibility was not silently normalized to Public.");
+            Assert.That(c2.Visibility, Is.EqualTo(SyncVarVisibility.Public),
+                "Client visibility was not silently normalized to Public.");
+        }
+
+        [Test]
+        public void Test39_Client_CallsObserverMethods_SilentlyDismissed()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"client_obs_ops_{Guid.NewGuid():N}";
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.DoesNotThrow(() =>
+            {
+                clientVar.SetVisibility(SyncVarVisibility.ManualObservers);
+                clientVar.AddObserver(5);
+                clientVar.SetObservers(1, 2, 3);
+                clientVar.RemoveObserver(1);
+            });
+
+            Assert.That(clientVar.Visibility, Is.EqualTo(SyncVarVisibility.Public));
+            Assert.That(clientVar.ObserverIds, Is.Empty);
+        }
+
+        [Test]
+        public void Test40_ExclusionPrecedenceOverObserversAndOwnerStrictness()
+        {
+            string token = $"precedence_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 10, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+
+            serverVar.AddObserver(1);
+            Assert.That(serverVar.IsVisibleTo(1), Is.True);
+
+            serverVar.AddExclusion(1);
+            Assert.That(serverVar.IsVisibleTo(1), Is.False, "Exclusion should overrule ManualObservers.");
+
+            serverVar.RemoveExclusion(1);
+            Assert.That(serverVar.IsVisibleTo(1), Is.True, "Removing exclusion should restore visibility.");
+
+            serverVar.SetVisibility(SyncVarVisibility.Public);
+            Assert.That(serverVar.IsVisibleTo(1), Is.True);
+            serverVar.AddExclusion(1);
+            Assert.That(serverVar.IsVisibleTo(1), Is.False, "Exclusion should overrule Public.");
+
+            serverVar.SetVisibility(SyncVarVisibility.OwnerOnly);
+            serverVar.AddAuthority(1);
+            Assert.That(serverVar.IsVisibleTo(1), Is.True, "OwnerOnly must be strictly visible to authorized owner regardless of exclusions.");
+
+            serverVar.RemoveAuthority(1);
+            Assert.That(serverVar.IsVisibleTo(1), Is.False, "OwnerOnly must not be visible to non-owners.");
+        }
+
+        [Test]
+        public void Test41_SetObservers_DeDuplicatesAndReplacesList()
+        {
+            string token = $"set_obs_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 0, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+
+            serverVar.SetObservers(10, 10, 20, 30, 20);
+            Assert.That(serverVar.ObserverIds.Length, Is.EqualTo(3));
+            Assert.That(serverVar.ContainsObserver(10), Is.True);
+            Assert.That(serverVar.ContainsObserver(20), Is.True);
+            Assert.That(serverVar.ContainsObserver(30), Is.True);
+            Assert.That(serverVar.ContainsObserver(40), Is.False);
+
+            serverVar.SetObservers(40);
+            Assert.That(serverVar.ObserverIds.Length, Is.EqualTo(1));
+            Assert.That(serverVar.ContainsObserver(40), Is.True);
+            Assert.That(serverVar.ContainsObserver(10), Is.False);
+
+            serverVar.SetObservers();
+            Assert.That(serverVar.ObserverIds, Is.Empty);
+        }
+
+        [Test]
+        public void Test42_FlushDirty_ZeroGC_AllocatesZeroBytes()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            string tokenPub = $"zero_gc_pub_{Guid.NewGuid():N}";
+            string tokenMan = $"zero_gc_man_{Guid.NewGuid():N}";
+            string tokenOwn = $"zero_gc_own_{Guid.NewGuid():N}";
+
+            var pubVar = new SyncVar<int>(tokenPub, 100, SyncVarVisibility.Public, _serverManager.SyncVarManager);
+            var manVar = new SyncVar<int>(tokenMan, 200, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+            var ownVar = new SyncVar<int>(tokenOwn, 300, SyncVarVisibility.OwnerOnly, _serverManager.SyncVarManager);
+
+            manVar.AddObserver(1);
+            ownVar.AddAuthority(1);
+            pubVar.AddExclusion(2);
+
+            // Warm up
+            for (int i = 0; i < 50; i++)
+            {
+                pubVar.Value = 100 + i;
+                manVar.Value = 200 + i;
+                ownVar.Value = 300 + i;
+                _serverManager.SyncVarManager.FlushDirty();
+            }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            const int iterations = 1000;
+            for (int i = 0; i < iterations; i++)
+            {
+                pubVar.Value = 1000 + i;
+                manVar.Value = 2000 + i;
+                ownVar.Value = 3000 + i;
+                _serverManager.SyncVarManager.FlushDirty();
+            }
+
+            long allocatedAfter = GC.GetAllocatedBytesForCurrentThread();
+            long totalAllocated = allocatedAfter - allocatedBefore;
+
+            Assert.That(totalAllocated, Is.EqualTo(0), $"SyncVar FlushDirty allocated {totalAllocated} bytes across {iterations} flushes.");
+        }
+
+        [Test]
+        public void Test43_RemoveExclusion_SendsCatchUpSnapshot()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"edge_a_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 42, SyncVarVisibility.Public, _serverManager.SyncVarManager);
+            serverVar.AddExclusion(client.localID);
+
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            serverVar.Value = 99;
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 99, 500), Is.False,
+                "Excluded client should not receive delta updates.");
+
+            serverVar.RemoveExclusion(client.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 99, 2000), Is.True,
+                "Client did not receive catch-up snapshot after exclusion removal.");
+
+            serverVar.SetExclusionIds(client.localID);
+            serverVar.Value = 101;
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 101, 500), Is.False,
+                "Excluded client should not receive delta updates.");
+
+            serverVar.SetExclusionIds();
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 101, 2000), Is.True,
+                "Client did not receive catch-up snapshot after clearing exclusions.");
+        }
+
+        [Test]
+        public void Test44_SetVisibility_DynamicModes_PropagatesToClients()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"edge_b_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 500, SyncVarVisibility.ManualObservers, _serverManager.SyncVarManager);
+
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 500, 500), Is.False,
+                "Non-observer client should not have received variable value.");
+            Assert.That(clientVar.IsVisible, Is.False);
+
+            serverVar.SetVisibility(SyncVarVisibility.Public);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 500 && clientVar.IsVisible, 2000), Is.True,
+                "Client did not receive catch-up snapshot after visibility changed to Public.");
+
+            serverVar.SetVisibility(SyncVarVisibility.OwnerOnly);
+
+            Assert.That(SpinWait.SpinUntil(() => !clientVar.IsVisible, 2000), Is.True,
+                "Client was not evicted after visibility changed to OwnerOnly.");
+
+            serverVar.Value = 600;
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 600, 500), Is.False,
+                "Evicted client should not receive value changes.");
+
+            serverVar.SetVisibility(SyncVarVisibility.Public);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 600 && clientVar.IsVisible, 2000), Is.True,
+                "Client did not regain visibility and updated value after returning to Public.");
+        }
+
+        [Test]
+        public void Test45_Client_Eviction_ScopeChangedEventAndIsVisible()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"edge_c_{Guid.NewGuid():N}";
+            var clientVar = client.SyncVarManager.Bind<string>(token, "InitialClient");
+
+            var scopeHistory = new List<bool>();
+            clientVar.OnVisibilityScopeChanged += state =>
+            {
+                lock (scopeHistory)
+                {
+                    scopeHistory.Add(state);
+                }
+            };
+
+            Assert.That(clientVar.IsVisible, Is.False);
+
+            var serverVar = new SyncVar<string>(token, "EnemyPos_Active", SyncVarVisibility.Public, _serverManager.SyncVarManager);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.IsVisible && clientVar.Value == "EnemyPos_Active", 2000), Is.True,
+                "Client failed to receive initial snapshot or flip IsVisible to true.");
+
+            serverVar.AddExclusion(client.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => !clientVar.IsVisible, 2000), Is.True,
+                "Client failed to flip IsVisible to false after server eviction.");
+
+            serverVar.Value = "EnemyPos_MovedWhileHidden";
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == "EnemyPos_MovedWhileHidden", 500), Is.False);
+            Assert.That(clientVar.IsVisible, Is.False);
+
+            serverVar.RemoveExclusion(client.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.IsVisible && clientVar.Value == "EnemyPos_MovedWhileHidden", 2000), Is.True,
+                "Client failed to regain visibility and catch up to latest state.");
+
+            serverVar.SetVisibility(SyncVarVisibility.ManualObservers);
+            serverVar.SetObserverIds(client.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.IsVisible, 2000), Is.True);
+
+            serverVar.RemoveObserver(client.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => !clientVar.IsVisible, 2000), Is.True,
+                "Client failed to flip IsVisible to false upon RemoveObserver.");
+
+            lock (scopeHistory)
+            {
+                Assert.That(scopeHistory.Count, Is.GreaterThanOrEqualTo(4));
+                Assert.That(scopeHistory[0], Is.True);
+                Assert.That(scopeHistory[1], Is.False);
+                Assert.That(scopeHistory[2], Is.True);
+                Assert.That(scopeHistory[3], Is.False);
+            }
+        }
+
+        [Test]
+        public void Test46_Client_Disconnect_ResetsIsVisibleToFalseAndFiresScopeEvent()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"disconnect_scope_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 42, SyncVarVisibility.Public, _serverManager.SyncVarManager);
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            var scopeEvents = new List<bool>();
+            clientVar.OnVisibilityScopeChanged += isVis =>
+            {
+                lock (scopeEvents)
+                {
+                    scopeEvents.Add(isVis);
+                }
+            };
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.IsVisible && clientVar.Value == 42, 2000), Is.True);
+
+            client.Shutdown();
+
+            Assert.That(SpinWait.SpinUntil(() => !clientVar.IsVisible, 2000), Is.True,
+                "Client SyncVar was not marked invisible upon disconnect/shutdown.");
+
+            lock (scopeEvents)
+            {
+                Assert.That(scopeEvents.Count, Is.GreaterThanOrEqualTo(2));
+                Assert.That(scopeEvents[0], Is.True);
+                Assert.That(scopeEvents[^1], Is.False);
+            }
+        }
+
+        #endregion
     }
 }

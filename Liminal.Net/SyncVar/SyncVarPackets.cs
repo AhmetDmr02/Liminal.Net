@@ -113,5 +113,12 @@ namespace Liminal.Net.SyncVar
         [Key(1)] public ushort[] AuthIds;
     }
 
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct SyncVarEvictPacket
+    {
+        [Key(0)] public string Token;
+    }
+
     #endregion
 }
