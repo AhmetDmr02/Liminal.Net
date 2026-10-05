@@ -1352,6 +1352,16 @@ namespace Liminal.Net.Core
             SendBitStreamFrom(defaultSender, targetSessionIds, in meta, packAction, deliveryMethod);
         }
 
+        public void SendBitStreamAsServer<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(ILiminalTransport.SERVER_ID, targetSessionIds, in meta, packAction, deliveryMethod);
+        }
+
+        public void SendBitStreamAsClient<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(_manager.localID, targetSessionIds, in meta, packAction, deliveryMethod);
+        }
+
         public void SendBitStreamFrom<TMeta>(ushort senderId, ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
         {
             if (targetSessionIds.IsEmpty)
@@ -1442,6 +1452,41 @@ namespace Liminal.Net.Core
             }
         }
 
+        public void SendBitStream<TMeta, TState>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            if (targetSessionIds.IsEmpty)
+                return;
+
+            ushort defaultSender;
+            var manager = _manager;
+
+            if (manager.Role == NetworkRole.Client)
+            {
+                defaultSender = manager.localID;
+            }
+            else if (manager.Role == NetworkRole.Host)
+            {
+                bool targetsOnlyServer = targetSessionIds.Length == 1 && targetSessionIds[0] == ILiminalTransport.SERVER_ID;
+                defaultSender = targetsOnlyServer ? manager.localID : ILiminalTransport.SERVER_ID;
+            }
+            else
+            {
+                defaultSender = ILiminalTransport.SERVER_ID;
+            }
+
+            SendBitStreamFrom(defaultSender, targetSessionIds, in meta, in state, packAction, deliveryMethod);
+        }
+
+        public void SendBitStreamAsServer<TMeta, TState>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(ILiminalTransport.SERVER_ID, targetSessionIds, in meta, in state, packAction, deliveryMethod);
+        }
+
+        public void SendBitStreamAsClient<TMeta, TState>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            SendBitStreamFrom(_manager.localID, targetSessionIds, in meta, in state, packAction, deliveryMethod);
+        }
+
         public BitStreamScope BeginBitStreamScope<TMeta>(ushort singleTargetId, in TMeta meta, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
         {
             int idInt = LiminalPacketLibrary.GetId<TMeta>();
@@ -1480,6 +1525,29 @@ namespace Liminal.Net.Core
                 int lengthOffset = writer.WrittenSpan.Length;
                 writer.Advance(4);
                 return new BitStreamScope(_manager, writer, sendToTarget, packetId, lengthOffset, deliveryMethod);
+            }
+            catch
+            {
+                ReturnWriter(writer);
+                throw;
+            }
+        }
+
+        public BitStreamScope BeginBitStreamScope<TMeta>(ReadOnlySpan<ushort> targetSessionIds, in TMeta meta, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable) where TMeta : struct
+        {
+            int idInt = LiminalPacketLibrary.GetId<TMeta>();
+            if (idInt == 0)
+                throw new InvalidOperationException($"Cannot send bitstream {typeof(TMeta).Name}. Missing [LiminalPacket] attribute?");
+
+            ushort packetId = checked((ushort)idInt);
+            var writer = RentWriter();
+
+            try
+            {
+                MessagePackSerializer.Serialize(writer, meta);
+                int lengthOffset = writer.WrittenSpan.Length;
+                writer.Advance(4);
+                return new BitStreamScope(_manager, writer, targetSessionIds, packetId, lengthOffset, deliveryMethod);
             }
             catch
             {

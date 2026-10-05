@@ -8,6 +8,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Liminal.Net.Tests
 {
@@ -694,6 +695,345 @@ namespace Liminal.Net.Tests
 
             Thread.Sleep(150);
             Assert.That(client2ReceivedCount, Is.EqualTo(0), "Standalone client was able to invoke SendToClient.");
+        }
+
+        #endregion
+
+        #region Targeted Span Multicast Tests
+
+        [Test]
+        public void Test20_Send_TargetedSpan_DeliveredOnlyToSpecifiedClients()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+            var c3 = CreateAndStartClient();
+
+            int c1Count = 0, c2Count = 0, c3Count = 0;
+            string c1Msg = null, c3Msg = null;
+
+            c1.Interpreter.Subscribe<ChatPacket>((pkt, s) => { Interlocked.Increment(ref c1Count); c1Msg = pkt.Message; }, this);
+            c2.Interpreter.Subscribe<ChatPacket>((pkt, s) => { Interlocked.Increment(ref c2Count); }, this);
+            c3.Interpreter.Subscribe<ChatPacket>((pkt, s) => { Interlocked.Increment(ref c3Count); c3Msg = pkt.Message; }, this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID, c3.localID };
+            Broadcaster.Send(targetSpan, new ChatPacket { Message = "Only1And3" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1 && c3Count == 1, 2000), Is.True);
+            Assert.Multiple(() =>
+            {
+                Assert.That(c1Msg, Is.EqualTo("Only1And3"));
+                Assert.That(c3Msg, Is.EqualTo("Only1And3"));
+            });
+
+            Thread.Sleep(100);
+            Assert.That(c2Count, Is.EqualTo(0), "Untargeted client 2 received the packet.");
+        }
+
+        [Test]
+        public void Test21_Send_TargetedSpan_DeduplicatesSameClient()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+
+            int c1Count = 0;
+            c1.Interpreter.Subscribe<ChatPacket>((pkt, s) => Interlocked.Increment(ref c1Count), this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID, c1.localID, c1.localID };
+            Broadcaster.Send(targetSpan, new ChatPacket { Message = "DedupTest" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1, 2000), Is.True);
+            Thread.Sleep(100);
+            Assert.That(c1Count, Is.EqualTo(1), "Duplicate IDs in target span caused duplicate packet delivery.");
+        }
+
+        [Test]
+        public void Test22_Send_TargetedSpan_PartiallyInvalidIds_DeliversToValidAndDropsInvalid()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+
+            int c1Count = 0;
+            c1.Interpreter.Subscribe<ChatPacket>((pkt, s) => Interlocked.Increment(ref c1Count), this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID, 9998, 9999 };
+            Broadcaster.Send(targetSpan, new ChatPacket { Message = "PartialValid" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1, 2000), Is.True);
+        }
+
+        [Test]
+        public void Test23_Send_TargetedSpan_InvokedByStandaloneClient_LogsAndDrops()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client1 = CreateAndStartClient();
+            var client2 = CreateAndStartClient();
+
+            int client2Count = 0;
+            client2.Interpreter.Subscribe<ChatPacket>((pkt, s) => Interlocked.Increment(ref client2Count), this);
+
+            LiminalNetworkManager.Instance = client1;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { client2.localID };
+            Broadcaster.Send(targetSpan, new ChatPacket { Message = "ClientSpanSend" });
+            client1.SessionManager.Flush();
+
+            Thread.Sleep(150);
+            Assert.That(client2Count, Is.EqualTo(0), "Standalone client was able to invoke Send with target client IDs.");
+        }
+
+        [Test]
+        public unsafe void Test24_Send_TargetedSpan_SerializedOnceDispatchedToMany()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+            var c3 = CreateAndStartClient();
+
+            var payloadPointers = new List<IntPtr>();
+            var lockObj = new object();
+
+            _serverManager.Interpreter.OnSendRequest += (sender, target, pid, payload, method) =>
+            {
+                fixed (byte* ptr = payload)
+                {
+                    lock (lockObj)
+                    {
+                        payloadPointers.Add((IntPtr)ptr);
+                    }
+                }
+            };
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID, c2.localID, c3.localID };
+            Broadcaster.Send(targetSpan, new ChatPacket { Message = "SerializedOnceCheck" });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(payloadPointers.Count, Is.EqualTo(3), "Expected 3 OnSendRequest invocations.");
+            Assert.Multiple(() =>
+            {
+                Assert.That(payloadPointers[0], Is.EqualTo(payloadPointers[1]), "Payload buffer pointer differed between target 1 and target 2.");
+                Assert.That(payloadPointers[1], Is.EqualTo(payloadPointers[2]), "Payload buffer pointer differed between target 2 and target 3.");
+            });
+        }
+
+        [Test]
+        public void Test25_SendBitStream_TargetedSpan_DeliveredOnlyToSpecifiedClients()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+
+            int c1Count = 0, c2Count = 0;
+            uint c1ReceivedTick = 0;
+
+            c1.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c1Count);
+                c1ReceivedTick = meta.Tick;
+            }, this);
+
+            c2.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c2Count);
+            }, this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            byte[] bitstream = new byte[] { 0xAA, 0xBB };
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID };
+            Broadcaster.SendBitStream(targetSpan, new TestSnapshotMeta { Tick = 777, Count = 2 }, bitstream.AsSpan());
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1, 2000), Is.True);
+            Assert.That(c1ReceivedTick, Is.EqualTo(777));
+
+            Thread.Sleep(100);
+            Assert.That(c2Count, Is.EqualTo(0), "Client 2 received untargeted bitstream.");
+        }
+
+        [Test]
+        public void Test26_SendBitStream_BitStreamAction_TargetedSpan_DeliveredOnlyToSpecifiedClients()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+
+            int c1Count = 0, c2Count = 0;
+            uint c1Value = 0;
+
+            c1.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c1Count);
+                c1Value = reader.ReadUInt(16);
+            }, this);
+
+            c2.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c2Count);
+            }, this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID };
+            Broadcaster.SendBitStream(targetSpan, new TestSnapshotMeta { Tick = 1, Count = 1 }, (ref BitWriter writer) =>
+            {
+                writer.WriteUInt(12345, 16);
+            });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1, 2000), Is.True);
+            Assert.That(c1Value, Is.EqualTo(12345));
+
+            Thread.Sleep(100);
+            Assert.That(c2Count, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test27_SendBitStream_StatefulAction_TargetedSpan_DeliveredOnlyToSpecifiedClients()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+
+            int c1Count = 0;
+            uint c1Value = 0;
+
+            c1.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c1Count);
+                c1Value = reader.ReadUInt(16);
+            }, this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID };
+            int customState = 4321;
+            Broadcaster.SendBitStream(targetSpan, new TestSnapshotMeta { Tick = 2, Count = 1 }, customState, (ref BitWriter writer, in int state) =>
+            {
+                writer.WriteUInt((uint)state, 16);
+            });
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1, 2000), Is.True);
+            Assert.That(c1Value, Is.EqualTo(4321));
+        }
+
+        [Test]
+        public void Test28_BeginBitStream_TargetedSpan_DeliveredOnlyToSpecifiedClients()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+
+            int c1Count = 0, c2Count = 0;
+            uint c1Value = 0;
+
+            c1.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c1Count);
+                c1Value = reader.ReadUInt(16);
+            }, this);
+
+            c2.Interpreter.SubscribeBitStream<TestSnapshotMeta>((in TestSnapshotMeta meta, ref BitReader reader, ushort sender) =>
+            {
+                Interlocked.Increment(ref c2Count);
+            }, this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            ReadOnlySpan<ushort> targetSpan = stackalloc ushort[] { c1.localID };
+            var scope = Broadcaster.BeginBitStream(targetSpan, new TestSnapshotMeta { Tick = 3, Count = 1 });
+            try
+            {
+                scope.Writer.WriteUInt(9876, 16);
+            }
+            finally
+            {
+                scope.Dispose();
+            }
+            _serverManager.SessionManager.Flush();
+
+            Assert.That(SpinWait.SpinUntil(() => c1Count == 1, 2000), Is.True);
+            Assert.That(c1Value, Is.EqualTo(9876));
+
+            Thread.Sleep(100);
+            Assert.That(c2Count, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test29_Send_TargetedSpan_ConcurrentSends_ZeroRaceConditions()
+        {
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var c1 = CreateAndStartClient();
+            var c2 = CreateAndStartClient();
+
+            int c1ReceivedCount = 0;
+            int c2ReceivedCount = 0;
+
+            c1.Interpreter.Subscribe<ChatPacket>((pkt, s) => Interlocked.Increment(ref c1ReceivedCount), this);
+            c2.Interpreter.Subscribe<ChatPacket>((pkt, s) => Interlocked.Increment(ref c2ReceivedCount), this);
+
+            LiminalNetworkManager.Instance = _serverManager;
+
+            const int messagesPerThread = 5;
+            ushort c1Id = c1.localID;
+            ushort c2Id = c2.localID;
+
+            var t1 = Task.Run(() =>
+            {
+                ReadOnlySpan<ushort> targets = stackalloc ushort[] { c1Id, c2Id };
+                for (int i = 0; i < messagesPerThread; i++)
+                {
+                    Broadcaster.Send(targets, new ChatPacket { Message = $"T1_{i}" });
+                }
+            });
+
+            var t2 = Task.Run(() =>
+            {
+                ReadOnlySpan<ushort> targets = stackalloc ushort[] { c1Id, c2Id };
+                for (int i = 0; i < messagesPerThread; i++)
+                {
+                    Broadcaster.Send(targets, new ChatPacket { Message = $"T2_{i}" });
+                }
+            });
+
+            Task.WaitAll(t1, t2);
+
+            _serverManager.SessionManager.Flush();
+
+            const int expectedTotal = messagesPerThread * 2;
+            Assert.That(SpinWait.SpinUntil(() => c1ReceivedCount == expectedTotal && c2ReceivedCount == expectedTotal, 5000), Is.True,
+                $"Expected {expectedTotal} messages on each client. C1={c1ReceivedCount}, C2={c2ReceivedCount}");
         }
 
         #endregion
