@@ -592,6 +592,58 @@ namespace Liminal.Net.Tests
             diag.Dispose();
         }
 
+        [Test]
+        public void Test68_SendWirePing_ZeroAllocationsDuringSampling()
+        {
+            var telemetryConfig = new LiminalTelemetryConfig { Flags = TelemetryFlags.WireRTT };
+            _serverManager?.Shutdown();
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig, telemetryConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+
+            var client = CreateAndStartClient(telemetryConfig);
+            var clientTransport = (TcpTransport)client.Transport;
+
+            clientTransport.SendWirePing(ILiminalTransport.SERVER_ID);
+            Assert.That(SpinWait.SpinUntil(() => clientTransport.TryGetWireRTT(ILiminalTransport.SERVER_ID, out _), 2000), Is.True);
+
+            for (int i = 0; i < 20; i++)
+            {
+                clientTransport.TryGetWireRTT(ILiminalTransport.SERVER_ID, out _);
+                client.TelemetryManager.TryGetClientWireRTT(ILiminalTransport.SERVER_ID, out _);
+                client.TelemetryManager.TryGetClientEnd2EndRTT(ILiminalTransport.SERVER_ID, out _);
+            }
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 100; i++)
+            {
+                clientTransport.TryGetWireRTT(ILiminalTransport.SERVER_ID, out _);
+                client.TelemetryManager.TryGetClientWireRTT(ILiminalTransport.SERVER_ID, out _);
+                client.TelemetryManager.TryGetClientEnd2EndRTT(ILiminalTransport.SERVER_ID, out _);
+            }
+            long after = GC.GetAllocatedBytesForCurrentThread();
+            long clientAlloc = after - before;
+
+            Assert.That(clientAlloc, Is.EqualTo(0), $"Client telemetry queries allocated {clientAlloc} bytes over 100 iterations!");
+
+            ushort clientId = client.localID;
+            for (int i = 0; i < 20; i++)
+            {
+                _serverManager.TelemetryManager.TryGetClientWireRTT(clientId, out _);
+                _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out _);
+            }
+
+            long sBefore = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 100; i++)
+            {
+                _serverManager.TelemetryManager.TryGetClientWireRTT(clientId, out _);
+                _serverManager.TelemetryManager.TryGetClientEnd2EndRTT(clientId, out _);
+            }
+            long sAfter = GC.GetAllocatedBytesForCurrentThread();
+            long serverAlloc = sAfter - sBefore;
+
+            Assert.That(serverAlloc, Is.EqualTo(0), $"Server telemetry queries allocated {serverAlloc} bytes over 100 iterations!");
+        }
+
         #endregion
     }
 }

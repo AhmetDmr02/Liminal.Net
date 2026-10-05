@@ -393,11 +393,22 @@ namespace Liminal.Net.Transports
                 Interlocked.Exchange(ref _isShuttingDown, 0);
                 Volatile.Write(ref _totalConnections, 0);
                 _finalizedConnections.Clear();
+                lock (_wireLock)
+                {
+                    _wireInFlight.Clear();
+                    _wireRttMap.Clear();
+                }
             }
         }
 
         private void TeardownSendQueue(ushort clientId, ClientSendState ownedState = null)
         {
+            lock (_wireLock)
+            {
+                _wireInFlight.Remove(clientId);
+                _wireRttMap.Remove(clientId);
+            }
+
             ClientSendState state;
 
             if (ownedState != null)
@@ -1192,13 +1203,17 @@ namespace Liminal.Net.Transports
             _telemetryConfig = config;
         }
 
-        private readonly ConcurrentDictionary<ushort, double> _wireRttMap = new();
-        private readonly ConcurrentDictionary<ushort, (uint Seq, long SentTicks)> _wireInFlight = new();
+        private readonly object _wireLock = new();
+        private readonly Dictionary<ushort, double> _wireRttMap = new();
+        private readonly Dictionary<ushort, (uint Seq, long SentTicks)> _wireInFlight = new();
         private uint _wireSeqCounter;
 
         public bool TryGetWireRTT(ushort clientId, out double rttMs)
         {
-            return _wireRttMap.TryGetValue(clientId, out rttMs);
+            lock (_wireLock)
+            {
+                return _wireRttMap.TryGetValue(clientId, out rttMs);
+            }
         }
 
         private static readonly long WirePingTimeoutTicks = Stopwatch.Frequency * 3;
@@ -1208,22 +1223,26 @@ namespace Liminal.Net.Transports
             if (!_sockets.ContainsKey(targetId)) return;
 
             long now = Stopwatch.GetTimestamp();
+            uint seq;
 
-            if (_wireInFlight.TryGetValue(targetId, out var existing))
+            lock (_wireLock)
             {
-                if (existing.SentTicks != 0)
+                if (_wireInFlight.TryGetValue(targetId, out var existing))
                 {
-                    if ((now - existing.SentTicks) < WirePingTimeoutTicks)
+                    if (existing.SentTicks != 0)
                     {
-                        return;
+                        if ((now - existing.SentTicks) < WirePingTimeoutTicks)
+                        {
+                            return;
+                        }
+
+                        _wireRttMap[targetId] = 999.0;
                     }
-
-                    _wireRttMap[targetId] = 999.0;
                 }
-            }
 
-            uint seq = unchecked(++_wireSeqCounter);
-            _wireInFlight[targetId] = (seq, now);
+                seq = unchecked(++_wireSeqCounter);
+                _wireInFlight[targetId] = (seq, now);
+            }
 
             Span<byte> pingPayload = stackalloc byte[16];
             BinaryPrimitives.WriteUInt32LittleEndian(pingPayload.Slice(0, 4), seq);
@@ -1263,23 +1282,29 @@ namespace Liminal.Net.Transports
             long sentTicks = BinaryPrimitives.ReadInt64LittleEndian(payload.Slice(4, 8));
             float serverRemainingMs = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(12, 4)));
 
-            if (_wireInFlight.TryGetValue(peerId, out var state) && state.Seq == seq)
+            long now = Stopwatch.GetTimestamp();
+            double rttMs;
+
+            lock (_wireLock)
             {
-                long now = Stopwatch.GetTimestamp();
-                double rttMs = Math.Max(0, (now - sentTicks) * 1000.0 / Stopwatch.Frequency);
+                if (!_wireInFlight.TryGetValue(peerId, out var state) || state.Seq != seq || state.SentTicks == 0)
+                {
+                    return;
+                }
 
+                rttMs = Math.Max(0, (now - sentTicks) * 1000.0 / Stopwatch.Frequency);
                 _wireRttMap[peerId] = rttMs;
-                _wireInFlight.TryRemove(peerId, out _);
-
-                double tickIntervalMs = 1000.0 / (_config?.TickRate ?? 20);
-                double owtMs = rttMs / 2.0;
-
-                double adjustedCountdown = (serverRemainingMs - owtMs) % tickIntervalMs;
-                if (adjustedCountdown < 0) adjustedCountdown += tickIntervalMs;
-
-                Volatile.Write(ref _serverCountdownSnapshotMs, adjustedCountdown);
-                Volatile.Write(ref _serverCountdownReceivedTicks, now);
+                _wireInFlight[peerId] = (seq, 0);
             }
+
+            double tickIntervalMs = 1000.0 / (_config?.TickRate ?? 20);
+            double owtMs = rttMs / 2.0;
+
+            double adjustedCountdown = (serverRemainingMs - owtMs) % tickIntervalMs;
+            if (adjustedCountdown < 0) adjustedCountdown += tickIntervalMs;
+
+            Volatile.Write(ref _serverCountdownSnapshotMs, adjustedCountdown);
+            Volatile.Write(ref _serverCountdownReceivedTicks, now);
         }
         #endregion
 

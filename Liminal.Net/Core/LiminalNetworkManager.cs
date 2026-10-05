@@ -120,6 +120,8 @@ namespace Liminal.Net.Core
         private LiminalPhaseAligner _phaseAligner;
 
         public LiminalTelemetryManager TelemetryManager { get; private set; }
+        public LiminalTelemetryConfig TelemetryConfig => _telemetryConfig;
+
         private readonly LiminalTelemetryConfig _telemetryConfig;
 
         public DisconnectReasonCoordinator DisconnectCoordinator { get; private set; }

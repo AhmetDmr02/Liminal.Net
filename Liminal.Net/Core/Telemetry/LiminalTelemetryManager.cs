@@ -15,6 +15,7 @@ namespace Liminal.Net.Core
         private readonly LiminalNetworkManager _networkManager;
         private readonly LiminalTicker _ticker;
         private readonly LiminalTelemetryConfig _config;
+        public LiminalTelemetryConfig Config => _config;
 
         private readonly TickPayloadSizeDiagnostics _tickPayloadSizeDiagnostics;
 
@@ -58,8 +59,9 @@ namespace Liminal.Net.Core
         private long _clientPingInFlightTimestamp;
 
         // Server-side State (Per-Client)
-        private readonly ConcurrentDictionary<ushort, double> _clientE2ERttMap = new();
-        private readonly ConcurrentDictionary<ushort, (uint SequenceId, long Timestamp)> _serverInFlightPings = new();
+        private readonly object _rttLock = new();
+        private readonly Dictionary<ushort, double> _clientE2ERttMap = new();
+        private readonly Dictionary<ushort, (uint SequenceId, long Timestamp)> _serverInFlightPings = new();
         private uint _serverSequenceGenerator;
 
         // Safety timeout to re-ping if a packet is lost or peer hangs
@@ -110,7 +112,10 @@ namespace Liminal.Net.Core
                 return rttMs > 0.0;
             }
 
-            return _clientE2ERttMap.TryGetValue(clientId, out rttMs);
+            lock (_rttLock)
+            {
+                return _clientE2ERttMap.TryGetValue(clientId, out rttMs);
+            }
         }
 
         public bool TryGetClientWireRTT(ushort clientId, out double rttMs)
@@ -130,8 +135,11 @@ namespace Liminal.Net.Core
 
         private void HandleClientDisconnected(ushort clientId)
         {
-            _serverInFlightPings.TryRemove(clientId, out _);
-            _clientE2ERttMap.TryRemove(clientId, out _);
+            lock (_rttLock)
+            {
+                _serverInFlightPings.Remove(clientId);
+                _clientE2ERttMap.Remove(clientId);
+            }
         }
 
         private void HandleLocalClientDisconnected(ushort localId)
@@ -155,8 +163,11 @@ namespace Liminal.Net.Core
             Volatile.Write(ref _currentE2ERttMs, 0);
             Volatile.Write(ref _clientPingSequence, 0);
 
-            _serverInFlightPings.Clear();
-            _clientE2ERttMap.Clear();
+            lock (_rttLock)
+            {
+                _serverInFlightPings.Clear();
+                _clientE2ERttMap.Clear();
+            }
         }
 
         private void HandleTick()
@@ -260,18 +271,21 @@ namespace Liminal.Net.Core
                     if (targetId == ILiminalTransport.SERVER_ID) continue;
                     if (_networkManager.Role == NetworkRole.Host && targetId == _networkManager.localID) continue;
 
-                    if (_serverInFlightPings.TryGetValue(targetId, out var state) && state.Timestamp != 0)
+                    uint nextSeq;
+                    lock (_rttLock)
                     {
-                        if ((now - state.Timestamp) < PingTimeoutTicks)
+                        if (_serverInFlightPings.TryGetValue(targetId, out var state) && state.Timestamp != 0)
                         {
-                            continue;
+                            if ((now - state.Timestamp) < PingTimeoutTicks)
+                            {
+                                continue;
+                            }
                         }
+
+                        nextSeq = unchecked(++_serverSequenceGenerator);
+                        _serverInFlightPings[targetId] = (nextSeq, now);
+                        _clientE2ERttMap[targetId] = 999.0;
                     }
-
-                    uint nextSeq = unchecked(++_serverSequenceGenerator);
-                    _serverInFlightPings[targetId] = (nextSeq, now);
-
-                    _clientE2ERttMap[targetId] = 999f;
 
                     _networkManager.Interpreter.SendCommand(targetId, new PingPacket
                     {
@@ -316,24 +330,30 @@ namespace Liminal.Net.Core
 
                 if (_networkManager.Role == NetworkRole.Host)
                 {
-                    _clientE2ERttMap[_networkManager.localID] = ms;
+                    lock (_rttLock)
+                    {
+                        _clientE2ERttMap[_networkManager.localID] = ms;
+                    }
                 }
 
                 return;
             }
 
-            if (_serverInFlightPings.TryGetValue(sender, out var state))
+            lock (_rttLock)
             {
-                if (packet.SequenceId != state.SequenceId || state.Timestamp == 0)
+                if (_serverInFlightPings.TryGetValue(sender, out var state))
                 {
-                    return;
+                    if (packet.SequenceId != state.SequenceId || state.Timestamp == 0)
+                    {
+                        return;
+                    }
+
+                    long elapsedTicks = Math.Max(0, stop - packet.TimestampTicks);
+                    double ms = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
+
+                    _clientE2ERttMap[sender] = ms;
+                    _serverInFlightPings[sender] = (state.SequenceId, 0);
                 }
-
-                long elapsedTicks = Math.Max(0, stop - packet.TimestampTicks);
-                double ms = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
-
-                _clientE2ERttMap[sender] = ms;
-                _serverInFlightPings[sender] = (state.SequenceId, 0);
             }
         }
 
