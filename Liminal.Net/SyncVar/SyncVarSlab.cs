@@ -8,7 +8,7 @@ namespace Liminal.Net.SyncVar
 {
     internal sealed class BoundedSlotPool
     {
-        private readonly long[] _slots;
+        private long[] _slots;
         private int _count;
         private readonly object _lock = new();
 
@@ -36,14 +36,13 @@ namespace Liminal.Net.SyncVar
         {
             lock (_lock)
             {
-                if (_count < _slots.Length)
+                if (_count >= _slots.Length)
                 {
-                    _slots[_count++] = slot;
-                    return true;
+                    Array.Resize(ref _slots, _slots.Length * 2);
                 }
+                _slots[_count++] = slot;
+                return true;
             }
-
-            return false;
         }
 
         public void Clear()

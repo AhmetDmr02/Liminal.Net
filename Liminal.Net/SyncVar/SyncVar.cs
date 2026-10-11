@@ -15,8 +15,6 @@ namespace Liminal.Net.SyncVar
         byte[] TokenBytes { get; }
         uint Version { get; }
         (int PageIndex, int PageOffset) ActiveSlotCoordinates { get; }
-        int ActivePageIndex { get; }
-        int ActivePageOffset { get; }
         int Length { get; }
         ushort[] AuthIds { get; }
         ushort[] ExclusionIds { get; }
@@ -87,8 +85,6 @@ namespace Liminal.Net.SyncVar
         public byte[] TokenBytes => _tokenBytes;
         public uint Version => _valueCell.Version;
         public (int PageIndex, int PageOffset) ActiveSlotCoordinates => _wireBuffer.ActiveSlotCoordinates;
-        public int ActivePageIndex => ActiveSlotCoordinates.PageIndex;
-        public int ActivePageOffset => ActiveSlotCoordinates.PageOffset;
         public int Length => _wireBuffer.Length;
         public ushort[] AuthIds => _permissions.Authorities;
         public ushort[] ExclusionIds => _permissions.Exclusions;
@@ -199,7 +195,7 @@ namespace Liminal.Net.SyncVar
             Volatile.Write(ref _isDirty, 0);
         }
 
-        public void AllocateSlots(int size)
+        void ISyncVarInternal.AllocateSlots(int size)
         {
             _wireBuffer.AllocateInitialSlots(size);
         }

@@ -40,9 +40,6 @@ namespace Liminal.Net.SyncVar.Internal
             }
         }
 
-        public int ActivePageIndex => ActiveSlotCoordinates.PageIndex;
-        public int ActivePageOffset => ActiveSlotCoordinates.PageOffset;
-
         public int Length
         {
             get
@@ -60,19 +57,9 @@ namespace Liminal.Net.SyncVar.Internal
             {
                 if (Volatile.Read(ref _isDisposed) != 0) return;
 
-                var spinner = new SpinWait();
-                while (Volatile.Read(ref _readers0) > 0 || Volatile.Read(ref _readers1) > 0)
+                if (_slots[0].PageIndex >= 0)
                 {
-                    spinner.SpinOnce();
-                }
-
-                if (_slotCapacities[0] > 0 && _slots[0].PageIndex >= 0)
-                {
-                    _slab.FreeSlot(_slots[0].PageIndex, _slots[0].PageOffset, _slotCapacities[0]);
-                }
-                if (_slotCapacities[1] > 0 && _slots[1].PageIndex >= 0)
-                {
-                    _slab.FreeSlot(_slots[1].PageIndex, _slots[1].PageOffset, _slotCapacities[1]);
+                    return;
                 }
 
                 _slots[0] = _slab.AllocateSlot(size, out int actual0);

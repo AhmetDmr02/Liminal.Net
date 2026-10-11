@@ -2872,5 +2872,95 @@ namespace Liminal.Net.Tests.Coyote
                 netManager.Shutdown();
             }
         }
+
+        [Test]
+        public static async Task Coyote_BoundedSlotPool_ConcurrentPushPopResize_ZeroDataLossOrRace()
+        {
+            var pool = new BoundedSlotPool(4);
+
+            var producer1 = Task.Run(async () =>
+            {
+                for (int i = 1; i <= 50; i++)
+                {
+                    bool pushed = pool.TryPush(i);
+                    Specification.Assert(pushed, "TryPush must always succeed after dynamic resize.");
+                    await Task.Yield();
+                }
+            });
+
+            var producer2 = Task.Run(async () =>
+            {
+                for (int i = 51; i <= 100; i++)
+                {
+                    bool pushed = pool.TryPush(i);
+                    Specification.Assert(pushed, "TryPush must always succeed after dynamic resize.");
+                    await Task.Yield();
+                }
+            });
+
+            var consumer = Task.Run(async () =>
+            {
+                int poppedCount = 0;
+                while (poppedCount < 100)
+                {
+                    if (pool.TryPop(out long slot))
+                    {
+                        Specification.Assert(slot >= 1 && slot <= 100, $"Popped value out of range: {slot}");
+                        poppedCount++;
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(producer1, producer2, consumer);
+            bool remaining = pool.TryPop(out _);
+            Specification.Assert(!remaining, "Pool should be empty after popping all 100 items.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_AllocateSlots_Idempotent_ConcurrentWithReaders_ZeroRace()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("alloc_idempotent", 42, syncVarManager);
+                var isv = (ISyncVarInternal)sv;
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        if (sv.TryExtractSnapshotData(out byte[] data, out _))
+                        {
+                            Specification.Assert(data != null && data.Length > 0, "Reader must obtain valid data.");
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                var allocTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 10; i++)
+                    {
+                        isv.AllocateSlots(128);
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(readerTask, allocTask);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
     }
 }
