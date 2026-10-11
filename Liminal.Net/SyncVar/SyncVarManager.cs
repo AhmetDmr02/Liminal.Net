@@ -58,6 +58,7 @@ namespace Liminal.Net.SyncVar
         private readonly LinkedList<string> _unboundOrder = new();
         private readonly Dictionary<string, ushort[]> _unboundAuth = new();
         private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, byte>> _pendingClearAcks = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
         private readonly List<SyncVarVisibilityState> _reusableStateList = new(64);
         private readonly List<ISyncVarInternal> _clientAuthorizedList = new(64);
@@ -117,6 +118,8 @@ namespace Liminal.Net.SyncVar
             _attachedManager.Interpreter.Subscribe<SyncVarSlabClientRequestPacket>(HandleClientRequest, this);
             _attachedManager.Interpreter.Subscribe<SyncVarAuthUpdatePacket>(HandleAuthUpdate, this);
             _attachedManager.Interpreter.Subscribe<SyncVarEvictPacket>(HandleEviction, this);
+            _attachedManager.Interpreter.Subscribe<SyncVarClearPacket>(HandleClear, this);
+            _attachedManager.Interpreter.Subscribe<SyncVarClearAckPacket>(HandleClearAck, this);
 
             _attachedManager.Events.OnClientConnected += HandleClientConnected;
             _attachedManager.Events.OnLocalClientDisconnected += HandleLocalClientDisconnected;
@@ -161,6 +164,7 @@ namespace Liminal.Net.SyncVar
                 _unboundOrder.Clear();
                 _unboundAuth.Clear();
             }
+            _pendingClearAcks.Clear();
             DirtyBitset.Clear();
 
             var allVars = new List<ISyncVarInternal>();
@@ -275,7 +279,8 @@ namespace Liminal.Net.SyncVar
             syncVar.AllocateSlots(size);
             Interlocked.Add(ref _totalAllocatedBytes, size * 2);
 
-            writer.WrittenSpan.CopyTo(Slab.GetSpan(syncVar.ActivePageIndex, syncVar.ActivePageOffset, size));
+            var (pageIndex, pageOffset) = syncVar.ActiveSlotCoordinates;
+            writer.WrittenSpan.CopyTo(Slab.GetSpan(pageIndex, pageOffset, size));
 
             UnboundEntry entry = null;
 
@@ -418,10 +423,7 @@ namespace Liminal.Net.SyncVar
                     return;
             }
 
-            var packet = new SyncVarEvictPacket
-            {
-                Token = syncVar.Token
-            };
+            var packet = new SyncVarEvictPacket(syncVar.Token, syncVar.TokenBytes);
 
             if (netManager.Role == NetworkRole.Host && clientId == netManager.localID)
                 netManager.Interpreter.SendCommandAsClient(clientId, packet);
@@ -429,8 +431,74 @@ namespace Liminal.Net.SyncVar
                 netManager.Interpreter.SendCommandAsServer(clientId, packet);
         }
 
+        internal void BroadcastClear(ISyncVarInternal syncVar)
+        {
+            var netManager = _attachedManager;
+            if (netManager == null || netManager.Role == NetworkRole.Client || !netManager.CanSend)
+                return;
+
+            RegisterPendingClear(syncVar.Token);
+
+            var packet = new SyncVarClearPacket(syncVar.Token, syncVar.TokenBytes);
+
+            if (syncVar.Visibility == SyncVarVisibility.Public && syncVar.ExclusionIds.Length == 0)
+            {
+                SendViaManager(SendTo.Everyone, packet);
+                return;
+            }
+
+            int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> allSessions = stackalloc ushort[maxClients];
+            int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
+
+            for (int i = 0; i < totalSessions; i++)
+            {
+                ushort sid = allSessions[i];
+                if (sid == ILiminalTransport.SERVER_ID && netManager.Role == NetworkRole.Host)
+                    continue;
+
+                if (syncVar.IsVisibleTo(sid))
+                {
+                    if (netManager.Role == NetworkRole.Host && sid == netManager.localID)
+                        netManager.Interpreter.SendCommandAsClient(sid, packet);
+                    else
+                        netManager.Interpreter.SendCommandAsServer(sid, packet);
+                }
+            }
+        }
+
+        private void RegisterPendingClear(string token)
+        {
+            var netManager = _attachedManager;
+            if (netManager?.SessionManager == null) return;
+
+            int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+            Span<ushort> allSessions = stackalloc ushort[maxClients];
+            int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
+
+            var pending = _pendingClearAcks.GetOrAdd(token, _ => new ConcurrentDictionary<ushort, byte>());
+            for (int i = 0; i < totalSessions; i++)
+            {
+                ushort sid = allSessions[i];
+                if (sid != ILiminalTransport.SERVER_ID)
+                {
+                    pending[sid] = 1;
+                }
+            }
+        }
+
+        private void AcknowledgeClientClear(string token, ushort clientId)
+        {
+            if (_pendingClearAcks.TryGetValue(token, out var pending))
+            {
+                pending.TryRemove(clientId, out _);
+            }
+        }
+
         private readonly ArrayBufferWriter<byte> _sharedFlushWriter = new(4096);
+        private readonly ArrayBufferWriter<byte> _sharedPayloadWriter = new(4096);
         private readonly ArrayBufferWriter<byte> _tailoredFlushWriter = new(2048);
+        private readonly ArrayBufferWriter<byte> _tailoredPayloadWriter = new(2048);
         private int _isFlushing = 0;
 
         public void FlushDirty()
@@ -472,30 +540,37 @@ namespace Liminal.Net.SyncVar
 
                     if (_clientAuthorizedList.Count == 0) return;
 
-                    _sharedFlushWriter.Clear();
-                    var writer = new MessagePackWriter(_sharedFlushWriter);
-                    writer.WriteArrayHeader(_clientAuthorizedList.Count);
+                    _sharedPayloadWriter.Clear();
+                    var payloadWriter = new MessagePackWriter(_sharedPayloadWriter);
+                    int writtenCount = 0;
 
                     for (int i = 0; i < _clientAuthorizedList.Count; i++)
                     {
                         var syncVar = _clientAuthorizedList[i];
-                        if (!syncVar.TryWriteSlotForWire(ref writer, out _))
+                        if (syncVar.TryWriteSlotForWire(ref payloadWriter, out _))
                         {
-                            if (syncVar.TryMarkDirty())
-                                _dirtyQueue.Enqueue(syncVar);
+                            writtenCount++;
                         }
                     }
 
-                    writer.Flush();
+                    payloadWriter.Flush();
+                    if (writtenCount == 0) return;
+
+                    _sharedFlushWriter.Clear();
+                    var headerWriter = new MessagePackWriter(_sharedFlushWriter);
+                    headerWriter.WriteArrayHeader(writtenCount);
+                    headerWriter.WriteRaw(_sharedPayloadWriter.WrittenSpan);
+                    headerWriter.Flush();
+
                     var sequence = new ReadOnlySequence<byte>(_sharedFlushWriter.WrittenMemory);
                     netManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new SyncVarSlabClientRequestPacket(sequence));
                     return;
                 }
 
                 // Server / Host Flush
-                _sharedFlushWriter.Clear();
-                var masterWriter = new MessagePackWriter(_sharedFlushWriter);
-                masterWriter.WriteArrayHeader(_reusableDirtyList.Count);
+                _sharedPayloadWriter.Clear();
+                var masterPayloadWriter = new MessagePackWriter(_sharedPayloadWriter);
+                int masterWrittenCount = 0;
 
                 bool requiresTargeting = false;
                 for (int i = 0; i < _reusableDirtyList.Count; i++)
@@ -506,14 +581,21 @@ namespace Liminal.Net.SyncVar
                         requiresTargeting = true;
                     }
 
-                    if (!_reusableDirtyList[i].TryWriteSlotForWire(ref masterWriter, out _))
+                    if (_reusableDirtyList[i].TryWriteSlotForWire(ref masterPayloadWriter, out _))
                     {
-                        if (_reusableDirtyList[i].TryMarkDirty())
-                            _dirtyQueue.Enqueue(_reusableDirtyList[i]);
+                        masterWrittenCount++;
                     }
                 }
 
-                masterWriter.Flush();
+                masterPayloadWriter.Flush();
+                if (masterWrittenCount == 0) return;
+
+                _sharedFlushWriter.Clear();
+                var masterHeaderWriter = new MessagePackWriter(_sharedFlushWriter);
+                masterHeaderWriter.WriteArrayHeader(masterWrittenCount);
+                masterHeaderWriter.WriteRaw(_sharedPayloadWriter.WrittenSpan);
+                masterHeaderWriter.Flush();
+
                 var masterPacket = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(_sharedFlushWriter.WrittenMemory));
 
                 if (!requiresTargeting)
@@ -558,18 +640,27 @@ namespace Liminal.Net.SyncVar
                                 _tailoredVarsList.Add(_reusableDirtyList[i]);
                         }
 
-                        if (_tailoredVarsList.Count == 0) continue;
-
-                        _tailoredFlushWriter.Clear();
-                        var tailoredWriter = new MessagePackWriter(_tailoredFlushWriter);
-                        tailoredWriter.WriteArrayHeader(_tailoredVarsList.Count);
+                        _tailoredPayloadWriter.Clear();
+                        var tailoredPayloadWriter = new MessagePackWriter(_tailoredPayloadWriter);
+                        int tailoredWrittenCount = 0;
 
                         for (int i = 0; i < _tailoredVarsList.Count; i++)
                         {
-                            _tailoredVarsList[i].TryWriteSlotForWire(ref tailoredWriter, out _);
+                            if (_tailoredVarsList[i].TryWriteSlotForWire(ref tailoredPayloadWriter, out _))
+                            {
+                                tailoredWrittenCount++;
+                            }
                         }
 
-                        tailoredWriter.Flush();
+                        tailoredPayloadWriter.Flush();
+                        if (tailoredWrittenCount == 0) continue;
+
+                        _tailoredFlushWriter.Clear();
+                        var tailoredHeaderWriter = new MessagePackWriter(_tailoredFlushWriter);
+                        tailoredHeaderWriter.WriteArrayHeader(tailoredWrittenCount);
+                        tailoredHeaderWriter.WriteRaw(_tailoredPayloadWriter.WrittenSpan);
+                        tailoredHeaderWriter.Flush();
+
                         var tailoredPacket = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(_tailoredFlushWriter.WrittenMemory));
 
                         if (netManager.Role == NetworkRole.Host && targetId == netManager.localID)
@@ -732,6 +823,16 @@ namespace Liminal.Net.SyncVar
                     continue;
                 }
 
+                if (_pendingClearAcks.TryGetValue(syncVar.Token, out var pending) && pending.ContainsKey(senderId))
+                {
+                    if (version != 1)
+                    {
+                        LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} attempted stale write (v={version}) to cleared SyncVar '{syncVar.Token}'. Dropped.");
+                        continue;
+                    }
+                    pending.TryRemove(senderId, out _);
+                }
+
                 syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions);
                 if (syncVar.TryMarkDirty())
                 {
@@ -836,11 +937,13 @@ namespace Liminal.Net.SyncVar
             if (netManager != null && netManager.Role == NetworkRole.Client && (!netManager.IsConnected || senderId != ILiminalTransport.SERVER_ID))
                 return;
 
-            if (TryGetSyncVar(packet.Token, out var syncVar))
+            ReadOnlySpan<byte> tokenSpan = packet.TokenBytes.Length > 0 ? packet.TokenBytes.Span : System.Text.Encoding.UTF8.GetBytes(packet.Token);
+
+            if (TryGetSyncVar(tokenSpan, out var syncVar))
             {
                 syncVar.SetLocallyVisible(false);
             }
-            else
+            else if (!string.IsNullOrEmpty(packet.Token))
             {
                 lock (_unboundLock)
                 {
@@ -851,6 +954,44 @@ namespace Liminal.Net.SyncVar
                     _unboundAuth.Remove(packet.Token);
                 }
             }
+        }
+
+        private void HandleClear(SyncVarClearPacket packet, ushort senderId)
+        {
+            var netManager = _attachedManager;
+            if (netManager != null && netManager.Role == NetworkRole.Client && (!netManager.IsConnected || senderId != ILiminalTransport.SERVER_ID))
+                return;
+
+            ReadOnlySpan<byte> tokenSpan = packet.TokenBytes.Length > 0 ? packet.TokenBytes.Span : System.Text.Encoding.UTF8.GetBytes(packet.Token);
+
+            if (TryGetSyncVar(tokenSpan, out var syncVar))
+            {
+                syncVar.ApplyClearFromRemote();
+            }
+            else if (!string.IsNullOrEmpty(packet.Token))
+            {
+                lock (_unboundLock)
+                {
+                    if (_unboundCache.Remove(packet.Token, out var entry))
+                    {
+                        _unboundOrder.Remove(entry.Node);
+                    }
+                    _unboundAuth.Remove(packet.Token);
+                }
+            }
+
+            if (netManager != null && netManager.Role == NetworkRole.Client && netManager.CanSend)
+            {
+                netManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new SyncVarClearAckPacket(packet.Token, packet.TokenBytes));
+            }
+        }
+
+        private void HandleClearAck(SyncVarClearAckPacket packet, ushort senderId)
+        {
+            var netManager = _attachedManager;
+            if (netManager == null || netManager.Role == NetworkRole.Client) return;
+
+            AcknowledgeClientClear(packet.Token, senderId);
         }
     }
 }

@@ -1,37 +1,154 @@
 using Liminal.Net.Core;
 using System;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Threading;
 
 namespace Liminal.Net.SyncVar
 {
+    internal sealed class BoundedSlotPool
+    {
+        private readonly long[] _slots;
+        private int _count;
+        private readonly object _lock = new();
+
+        public BoundedSlotPool(int capacity = 512)
+        {
+            _slots = new long[capacity];
+        }
+
+        public bool TryPop(out long slot)
+        {
+            lock (_lock)
+            {
+                if (_count > 0)
+                {
+                    slot = _slots[--_count];
+                    return true;
+                }
+            }
+
+            slot = 0;
+            return false;
+        }
+
+        public bool TryPush(long slot)
+        {
+            lock (_lock)
+            {
+                if (_count < _slots.Length)
+                {
+                    _slots[_count++] = slot;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public void Clear()
+        {
+            lock (_lock)
+            {
+                _count = 0;
+            }
+        }
+    }
+
     public sealed class SyncVarSlab : IDisposable
     {
+        public const int MinSlotSize = 64;
+
         public readonly int PageSize;
         public readonly int MaxPages;
 
         private readonly byte[][] _pages;
         private int _allocatedBytes;
 
+        private readonly BoundedSlotPool[] _tierPools;
+        private readonly int _tierCount;
+
         public SyncVarSlab(LiminalNetworkConfig config)
         {
-            PageSize = config?.SyncVarMaxPageSize ?? 65536;
+            int configuredPageSize = config?.SyncVarMaxPageSize ?? 65536;
+            PageSize = Math.Max(MinSlotSize, (int)BitOperationsCompat.RoundUpToPowerOf2((uint)configuredPageSize));
             MaxPages = config?.SyncVarMaxPageCount ?? 256;
 
             _pages = new byte[MaxPages][];
             _pages[0] = new byte[PageSize];
+
+            _tierCount = BitOperationsCompat.Log2((uint)PageSize) - BitOperationsCompat.Log2((uint)MinSlotSize) + 1;
+            _tierPools = new BoundedSlotPool[_tierCount];
+            for (int i = 0; i < _tierCount; i++)
+            {
+                _tierPools[i] = new BoundedSlotPool(512);
+            }
+        }
+
+        public int GetTierCapacity(int size)
+        {
+            if (size <= MinSlotSize) return MinSlotSize;
+            if (size > PageSize)
+                throw new ArgumentException($"[SyncVarSlab] Slot size {size} exceeds PageSize {PageSize}.");
+
+            return (int)BitOperationsCompat.RoundUpToPowerOf2((uint)size);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int GetTierIndex(int tierCapacity)
+        {
+            return BitOperationsCompat.TrailingZeroCount(tierCapacity) - 6;
         }
 
         public (int pageIndex, int pageOffset) AllocateSlot(int size)
         {
-            if (size > PageSize)
-                throw new ArgumentException($"[SyncVarSlab] Slot size {size} exceeds PageSize {PageSize}.");
+            return AllocateSlot(size, out _);
+        }
 
+        public (int pageIndex, int pageOffset) AllocateSlot(int size, out int actualCapacity)
+        {
+            int capacity = GetTierCapacity(size);
+            actualCapacity = capacity;
+            int tierIndex = GetTierIndex(capacity);
+
+            if (tierIndex >= 0 && tierIndex < _tierCount)
+            {
+                if (_tierPools[tierIndex].TryPop(out long packed))
+                {
+                    int pageIndex = (int)(packed >> 32);
+                    int pageOffset = (int)(packed & 0xFFFFFFFF);
+                    return (pageIndex, pageOffset);
+                }
+            }
+
+            return AllocateFromBump(capacity);
+        }
+
+        public void FreeSlot(int pageIndex, int pageOffset, int capacity)
+        {
+            if (pageIndex < 0 || pageOffset < 0 || capacity < MinSlotSize || capacity > PageSize)
+                return;
+
+            int tierCapacity = GetTierCapacity(capacity);
+            int tierIndex = GetTierIndex(tierCapacity);
+
+            if (tierIndex >= 0 && tierIndex < _tierCount)
+            {
+                long packed = ((long)pageIndex << 32) | (uint)pageOffset;
+                _tierPools[tierIndex].TryPush(packed);
+            }
+        }
+
+        private (int pageIndex, int pageOffset) AllocateFromBump(int size)
+        {
             while (true)
             {
                 int currentAllocated = Volatile.Read(ref _allocatedBytes);
                 int pageIndex = currentAllocated / PageSize;
                 int pageOffset = currentAllocated % PageSize;
+
+                if (pageIndex >= MaxPages)
+                    throw new OutOfMemoryException("[SyncVarSlab] Exceeded maximum slab capacity.");
 
                 if (pageOffset + size > PageSize)
                 {
@@ -118,6 +235,11 @@ namespace Liminal.Net.SyncVar
                 pageIndex++;
             }
 
+            for (int i = 0; i < _tierCount; i++)
+            {
+                _tierPools[i]?.Clear();
+            }
+
             Volatile.Write(ref _allocatedBytes, snapshot.Length);
         }
 
@@ -126,6 +248,10 @@ namespace Liminal.Net.SyncVar
             for (int i = 0; i < MaxPages; i++)
             {
                 _pages[i] = null;
+            }
+            for (int i = 0; i < _tierCount; i++)
+            {
+                _tierPools[i]?.Clear();
             }
             _allocatedBytes = 0;
         }

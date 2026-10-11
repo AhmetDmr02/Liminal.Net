@@ -1243,56 +1243,63 @@ namespace Liminal.Net.Tests.Coyote
 
             var transport = new MockTransport { IsServer = false };
             var netManager = new LiminalNetworkManager(transport, config);
-            netManager.StartClient("127.0.0.1", 7777);
-            transport.TriggerLocalClientConnected(5);
-
-            var syncVarManager = netManager.SyncVarManager;
-            netManager.Interpreter.Dispatch(
-                LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
-                ILiminalTransport.SERVER_ID,
-                MessagePackSerializer.Serialize(new SyncVarSnapshotPacket()));
-
-            const int count = 4;
-            var svList = new SyncVar<int>[count];
-            for (int i = 0; i < count; i++)
+            try
             {
-                svList[i] = new SyncVar<int>($"client_race_token_{i}", 0, syncVarManager);
-                svList[i].ApplyAuthUpdateFromRemote(new ushort[] { 5 });
-            }
+                netManager.StartClient("127.0.0.1", 7777);
+                transport.TriggerLocalClientConnected(5);
 
-            const int iterations = 30;
+                var syncVarManager = netManager.SyncVarManager;
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    MessagePackSerializer.Serialize(new SyncVarSnapshotPacket()));
 
-            var taskMutate = Task.Run(async () =>
-            {
-                for (int i = 0; i < iterations; i++)
+                const int count = 4;
+                var svList = new SyncVar<int>[count];
+                for (int i = 0; i < count; i++)
                 {
-                    for (int s = 0; s < count; s++)
+                    svList[i] = new SyncVar<int>($"client_race_token_{i}", 0, syncVarManager);
+                    svList[i].ApplyAuthUpdateFromRemote(new ushort[] { 5 });
+                }
+
+                const int iterations = 30;
+
+                var taskMutate = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
                     {
-                        svList[s].Value = i;
+                        for (int s = 0; s < count; s++)
+                        {
+                            svList[s].Value = i;
+                        }
+                        await Task.Yield();
                     }
-                    await Task.Yield();
-                }
-            });
+                });
 
-            var taskFlush = Task.Run(async () =>
-            {
-                for (int i = 0; i < iterations; i++)
+                var taskFlush = Task.Run(async () =>
                 {
-                    syncVarManager.FlushDirty();
-                    await Task.Yield();
-                }
-            });
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        syncVarManager.FlushDirty();
+                        await Task.Yield();
+                    }
+                });
 
-            var taskReset = Task.Run(async () =>
-            {
-                for (int i = 0; i < iterations; i++)
+                var taskReset = Task.Run(async () =>
                 {
-                    syncVarManager.ResetPendingState();
-                    await Task.Yield();
-                }
-            });
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        syncVarManager.ResetPendingState();
+                        await Task.Yield();
+                    }
+                });
 
-            await Task.WhenAll(taskMutate, taskFlush, taskReset);
+                await Task.WhenAll(taskMutate, taskFlush, taskReset);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
         }
 
         [Test]
@@ -1418,78 +1425,85 @@ namespace Liminal.Net.Tests.Coyote
 
             var transport = new MockTransport { IsServer = false };
             var netManager = new LiminalNetworkManager(transport, config);
-            netManager.StartClient("127.0.0.1", 7777);
-            transport.TriggerLocalClientConnected(5);
-
-            var syncVarManager = netManager.SyncVarManager;
-            netManager.Interpreter.Dispatch(
-                LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
-                ILiminalTransport.SERVER_ID,
-                MessagePackSerializer.Serialize(new SyncVarSnapshotPacket()));
-
-            const int count = 5;
-            var svs = new SyncVar<int>[count];
-            for (int i = 0; i < count; i++)
+            try
             {
-                svs[i] = new SyncVar<int>($"flaky_var_{i}", 100 + i, syncVarManager);
-                svs[i].ApplyAuthUpdateFromRemote(new ushort[] { 1 });
-                svs[i].Value = 200 + i;
-            }
+                netManager.StartClient("127.0.0.1", 7777);
+                transport.TriggerLocalClientConnected(5);
 
-            var taskFlush = Task.Run(async () =>
-            {
-                for (int i = 0; i < 5; i++)
-                {
-                    syncVarManager.FlushDirty();
-                    await Task.Yield();
-                }
-            });
+                var syncVarManager = netManager.SyncVarManager;
+                netManager.Interpreter.Dispatch(
+                    LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                    ILiminalTransport.SERVER_ID,
+                    MessagePackSerializer.Serialize(new SyncVarSnapshotPacket()));
 
-            var taskRevoke = Task.Run(async () =>
-            {
+                const int count = 5;
+                var svs = new SyncVar<int>[count];
                 for (int i = 0; i < count; i++)
                 {
-                    svs[i].ApplyAuthUpdateFromRemote(Array.Empty<ushort>());
-                    await Task.Yield();
+                    svs[i] = new SyncVar<int>($"flaky_var_{i}", 100 + i, syncVarManager);
+                    svs[i].ApplyAuthUpdateFromRemote(new ushort[] { 1 });
+                    svs[i].Value = 200 + i;
                 }
-            });
 
-            await Task.WhenAll(taskFlush, taskRevoke);
-
-            for (int p = 0; p < transport.SentPackets.Count; p++)
-            {
-                var record = transport.SentPackets[p];
-                if (record.Data.Length > 2)
+                var taskFlush = Task.Run(async () =>
                 {
-                    ushort packetId = BitConverter.ToUInt16(record.Data, 0);
-                    if (packetId == LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>())
+                    for (int i = 0; i < 5; i++)
                     {
-                        var packet = MessagePackSerializer.Deserialize<SyncVarSlabClientRequestPacket>(
-                            new ReadOnlyMemory<byte>(record.Data, 2, record.Data.Length - 2),
-                            syncVarManager.SerializerOptions);
+                        syncVarManager.FlushDirty();
+                        await Task.Yield();
+                    }
+                });
 
-                        if (!packet.Payload.IsEmpty)
+                var taskRevoke = Task.Run(async () =>
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        svs[i].ApplyAuthUpdateFromRemote(Array.Empty<ushort>());
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskFlush, taskRevoke);
+
+                for (int p = 0; p < transport.SentPackets.Count; p++)
+                {
+                    var record = transport.SentPackets[p];
+                    if (record.Data.Length > 2)
+                    {
+                        ushort packetId = BitConverter.ToUInt16(record.Data, 0);
+                        if (packetId == LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>())
                         {
-                            var reader = new MessagePackReader(packet.Payload);
-                            int arrayCount = reader.ReadArrayHeader();
-                            int itemsRead = 0;
-                            for (int i = 0; i < arrayCount; i++)
+                            var packet = MessagePackSerializer.Deserialize<SyncVarSlabClientRequestPacket>(
+                                new ReadOnlyMemory<byte>(record.Data, 2, record.Data.Length - 2),
+                                syncVarManager.SerializerOptions);
+
+                            if (!packet.Payload.IsEmpty)
                             {
-                                if (reader.End)
+                                var reader = new MessagePackReader(packet.Payload);
+                                int arrayCount = reader.ReadArrayHeader();
+                                int itemsRead = 0;
+                                for (int i = 0; i < arrayCount; i++)
                                 {
-                                    Specification.Assert(false, $"Truncated payload! ArrayHeader promised {arrayCount} items, but only read {itemsRead} items before EOF.");
+                                    if (reader.End)
+                                    {
+                                        Specification.Assert(false, $"Truncated payload! ArrayHeader promised {arrayCount} items, but only read {itemsRead} items before EOF.");
+                                    }
+                                    byte tLen = reader.ReadByte();
+                                    reader.ReadRaw(tLen);
+                                    reader.ReadUInt32();
+                                    int len = reader.ReadInt32();
+                                    reader.ReadRaw(len);
+                                    itemsRead++;
                                 }
-                                byte tLen = reader.ReadByte();
-                                reader.ReadRaw(tLen);
-                                reader.ReadUInt32();
-                                int len = reader.ReadInt32();
-                                reader.ReadRaw(len);
-                                itemsRead++;
+                                Specification.Assert(itemsRead == arrayCount, $"Mismatch: promised {arrayCount}, read {itemsRead}");
                             }
-                            Specification.Assert(itemsRead == arrayCount, $"Mismatch: promised {arrayCount}, read {itemsRead}");
                         }
                     }
                 }
+            }
+            finally
+            {
+                netManager.Shutdown();
             }
         }
 
@@ -1841,6 +1855,1017 @@ namespace Liminal.Net.Tests.Coyote
                         }
                     }
                 }
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ServerClear_ConcurrentWrites_NoStaleRevival()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                const ushort clientA = 10;
+                transport.ConnectedClients.Add(clientA);
+
+                var sv = new SyncVar<int>("token_coyote_clear", 0, syncVarManager);
+                sv.Value = 100;
+                sv.AddAuthority(clientA);
+
+                const int iterations = 15;
+
+                var taskClear = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        sv.Clear();
+                        await Task.Yield();
+                    }
+                });
+
+                static byte[] BuildClientRequestPacketBytes(string token, uint version, int value)
+                {
+                    var valBuf = new ArrayBufferWriter<byte>();
+                    MessagePackSerializer.Serialize(valBuf, value);
+
+                    var buffer = new ArrayBufferWriter<byte>();
+                    var writer = new MessagePackWriter(buffer);
+                    writer.WriteArrayHeader(1);
+                    var tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+                    writer.WriteUInt8((byte)tokenBytes.Length);
+                    writer.WriteRaw(tokenBytes);
+                    writer.WriteUInt32(version);
+                    writer.WriteInt32(valBuf.WrittenCount);
+                    writer.WriteRaw(valBuf.WrittenSpan);
+                    writer.Flush();
+
+                    var packet = new SyncVarSlabClientRequestPacket(new ReadOnlySequence<byte>(buffer.WrittenMemory));
+                    return MessagePackSerializer.Serialize(packet);
+                }
+
+                var taskClientRequests = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        var staleBytes = BuildClientRequestPacketBytes("token_coyote_clear", 999, 50 + i);
+                        netManager.Interpreter.Dispatch(
+                            LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>(),
+                            clientA,
+                            staleBytes);
+
+                        var clearAck = new SyncVarClearAckPacket
+                        {
+                            Token = "token_coyote_clear"
+                        };
+                        netManager.Interpreter.Dispatch(
+                            LiminalPacketLibrary.GetId<SyncVarClearAckPacket>(),
+                            clientA,
+                            MessagePackSerializer.Serialize(clearAck));
+
+                        var freshBytes = BuildClientRequestPacketBytes("token_coyote_clear", 1, 200 + i);
+                        netManager.Interpreter.Dispatch(
+                            LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>(),
+                            clientA,
+                            freshBytes);
+
+                        await Task.Yield();
+                    }
+                });
+
+                var taskObserver = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        syncVarManager.FlushDirty();
+                        var (val, ver) = sv.GetSnapshot();
+                        if (ver == 0)
+                        {
+                            Specification.Assert(val == 0, "SyncVar version is 0 but value was not reset to default.");
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskClear, taskClientRequests, taskObserver);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ContinuousResize_SlabReclaim_NoLeak()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 2048,
+                SyncVarMaxPageCount = 4,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                const int workerCount = 3;
+                const int iterations = 15;
+
+                var vars = new SyncVar<byte[]>[workerCount];
+                for (int w = 0; w < workerCount; w++)
+                {
+                    vars[w] = new SyncVar<byte[]>($"token_reclaim_{w}", new byte[64], syncVarManager);
+                }
+
+                var workers = new Task[workerCount];
+                for (int w = 0; w < workerCount; w++)
+                {
+                    int workerIdx = w;
+                    var sv = vars[workerIdx];
+                    workers[workerIdx] = Task.Run(async () =>
+                    {
+                        for (int i = 0; i < iterations; i++)
+                        {
+                            int size = 32 * ((i % 4) + 1);
+                            byte[] payload = new byte[size];
+                            payload[0] = (byte)(i & 0xFF);
+                            payload[size - 1] = 0xAA;
+
+                            sv.Value = payload;
+
+                            if (i % 5 == 0)
+                            {
+                                sv.Clear();
+                            }
+
+                            await Task.Yield();
+                        }
+                    });
+                }
+
+                var flushTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        syncVarManager.FlushDirty();
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(workers[0], workers[1], workers[2], flushTask);
+
+                for (int w = 0; w < workerCount; w++)
+                {
+                    var sv = vars[w];
+                    Specification.Assert(sv != null, "SyncVar cannot be null.");
+                    if (sv.Version > 0 && sv.Value != null)
+                    {
+                        Specification.Assert(sv.Value![^1] == 0xAA, "SyncVar payload boundary check failed.");
+                    }
+                }
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_Bind_Dispose_Rebind_NoClearSideEffects_Concurrent()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                const ushort clientA = 10;
+                transport.ConnectedClients.Add(clientA);
+
+                var serverVar = new SyncVar<int>("token_dispose_test", 0, syncVarManager);
+                serverVar.Value = 50;
+
+                const int iterations = 15;
+
+                var taskServerWrites = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        serverVar.Value = 50 + i;
+                        await Task.Yield();
+                    }
+                });
+
+                var taskClientLifecycle = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        var bound = syncVarManager.Bind<int>("token_dispose_test", 0);
+                        Specification.Assert(bound != null, "Bound SyncVar cannot be null.");
+
+                        bound.Dispose();
+
+                        Specification.Assert(serverVar.Version >= 1, "Dispose must not reset server SyncVar version to 0.");
+                        Specification.Assert(serverVar.Value >= 50, "Dispose must not reset server SyncVar value to default.");
+
+                        await Task.Yield();
+                    }
+                });
+
+                var taskFlusher = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        syncVarManager.FlushDirty();
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskServerWrites, taskClientLifecycle, taskFlusher);
+
+                Specification.Assert(serverVar.Version >= 1, "Final server version must be >= 1.");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_Utf8TokenRegistry_ConcurrentLookupAndExpansion_Race()
+        {
+            const int count = 150;
+            var taskA = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes($"token_expansion_a_{i}");
+                    string token = Utf8TokenRegistry.GetOrAddCachedToken(bytes);
+                    Specification.Assert(token == $"token_expansion_a_{i}", "Token string mismatch in registry.");
+                    await Task.Yield();
+                }
+            });
+
+            var taskB = Task.Run(async () =>
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes($"token_expansion_b_{i}");
+                    string token = Utf8TokenRegistry.GetOrAddCachedToken(bytes);
+                    Specification.Assert(token == $"token_expansion_b_{i}", "Token string mismatch in registry.");
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(taskA, taskB);
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentDisposeAndFlushDirty_NoSlotCorruption()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                const int iterations = 15;
+
+                var taskMutateDispose = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        var sv = new SyncVar<int>($"dispose_flush_race_{i}", 100 + i, syncVarManager);
+                        sv.Value = 200 + i;
+                        await Task.Yield();
+                        sv.Dispose();
+                        await Task.Yield();
+                    }
+                });
+
+                var taskFlush = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations * 2; i++)
+                    {
+                        syncVarManager.FlushDirty();
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskMutateDispose, taskFlush);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static void Coyote_SyncVar_DisposedSyncVar_MustNotSpinInDirtyQueue()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("token_spin_test", 10, syncVarManager);
+                sv.Value = 20;
+                sv.Dispose();
+
+                syncVarManager.FlushDirty();
+
+                Specification.Assert(!sv.IsDirty, "Disposed SyncVar was re-marked dirty and trapped in dirty queue.");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_DisposeRaceWithSnapshotReader_MustNotThrowIndexOutOfRange()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("token_dispose_extract_race", 123, syncVarManager);
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        sv.TryExtractSnapshotData(out _, out _);
+                        await Task.Yield();
+                    }
+                });
+
+                var disposeTask = Task.Run(async () =>
+                {
+                    await Task.Yield();
+                    sv.Dispose();
+                });
+
+                await Task.WhenAll(readerTask, disposeTask);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_DisposeRaceWithTryWriteSlotForWire_MustNotThrowIndexOutOfRange()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("token_dispose_wire_race", 123, syncVarManager);
+
+                var wireTask = Task.Run(async () =>
+                {
+                    var buffer = new ArrayBufferWriter<byte>(128);
+                    for (int i = 0; i < 20; i++)
+                    {
+                        buffer.Clear();
+                        var writer = new MessagePackWriter(buffer);
+                        sv.TryWriteSlotForWire(ref writer, out _);
+                        writer.Flush();
+                        await Task.Yield();
+                    }
+                });
+
+                var disposeTask = Task.Run(async () =>
+                {
+                    await Task.Yield();
+                    sv.Dispose();
+                });
+
+                await Task.WhenAll(wireTask, disposeTask);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_DisposeRaceWithValueWriter_MustNotLeakOrResurrectSlots()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("dispose_write_race", 10, syncVarManager);
+
+                var writeTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        sv.Value = 100 + i;
+                        await Task.Yield();
+                    }
+                });
+
+                var remoteTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        var bytes = MessagePackSerializer.Serialize(500 + i);
+                        sv.ApplyRemoteBytes(new ReadOnlySequence<byte>(bytes), (uint)(i + 1), syncVarManager.SerializerOptions, force: true);
+                        await Task.Yield();
+                    }
+                });
+
+                var disposeTask = Task.Run(async () =>
+                {
+                    await Task.Yield();
+                    sv.Dispose();
+                });
+
+                await Task.WhenAll(writeTask, remoteTask, disposeTask);
+
+                Specification.Assert(sv.IsDisposed, "SyncVar must be marked disposed.");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ClearRaceWithSnapshotReader_MustNotThrowIndexOutOfRange()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("clear_reader_race", 100, syncVarManager);
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        sv.TryExtractSnapshotData(out _, out _);
+                        await Task.Yield();
+                    }
+                });
+
+                var clearTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 10; i++)
+                    {
+                        sv.Value = 200 + i;
+                        await Task.Yield();
+                        sv.Clear();
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(readerTask, clearTask);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_WriteBytesResizeRaceWithActiveReader_MustNotFreeSlotWhileReading()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<byte[]>("resize_reader_race", new byte[32], syncVarManager);
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        if (sv.TryExtractSnapshotData(out byte[] data, out _))
+                        {
+                            Specification.Assert(data.Length > 0, "Snapshot data length must be > 0.");
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                var writerTask = Task.Run(async () =>
+                {
+                    int[] sizes = new[] { 64, 512, 128, 1024, 256, 2048, 64, 4000 };
+                    for (int i = 0; i < sizes.Length; i++)
+                    {
+                        sv.Value = new byte[sizes[i]];
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(readerTask, writerTask);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentWrites_ValueCellAndWireBufferMustNotDesynchronize()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("concurrent_write_desync", 0, syncVarManager);
+
+                const int writesPerTask = 15;
+
+                var taskA = Task.Run(async () =>
+                {
+                    for (int i = 1; i <= writesPerTask; i++)
+                    {
+                        sv.Value = i;
+                        await Task.Yield();
+                    }
+                });
+
+                var taskB = Task.Run(async () =>
+                {
+                    for (int i = 1; i <= writesPerTask; i++)
+                    {
+                        sv.Value = 100 + i;
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskA, taskB);
+
+                int cellValue = sv.Value;
+                uint cellVersion = sv.Version;
+
+                bool extracted = sv.TryExtractSnapshotData(out byte[] wireData, out uint wireVersion);
+                Specification.Assert(extracted, "Failed to extract snapshot data.");
+
+                int wireValue = MessagePackSerializer.Deserialize<int>(wireData);
+
+                Specification.Assert(cellVersion == wireVersion,
+                    $"TOCTOU Desynchronization: ValueCell Version ({cellVersion}) != WireBuffer Version ({wireVersion}).");
+                Specification.Assert(cellValue == wireValue,
+                    $"TOCTOU Desynchronization: ValueCell Value ({cellValue}) != WireBuffer Value ({wireValue}).");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarWireBuffer_TryBeginRead_FrontSwapTOCTOU_MustNotTearOrRace()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16
+            };
+            var slab = new SyncVarSlab(config);
+            var buffer = new Liminal.Net.SyncVar.Internal.SyncVarWireBuffer(slab);
+
+            try
+            {
+                byte[] initBytes = new byte[64];
+                Array.Fill(initBytes, (byte)1);
+                buffer.WriteBytes(initBytes, 1);
+
+                const int iterations = 30;
+
+                var writerTask = Task.Run(async () =>
+                {
+                    int[] sizes = new[] { 64, 128, 256, 512, 1024, 64, 128, 512, 2048, 64 };
+                    for (int i = 2; i <= iterations; i++)
+                    {
+                        byte b = (byte)i;
+                        int size = sizes[i % sizes.Length];
+                        byte[] data = new byte[size];
+                        Array.Fill(data, b);
+                        buffer.WriteBytes(data, (uint)i);
+                        await Task.Yield();
+                    }
+                });
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        if (buffer.TryBeginRead(out int slotIndex, out int page, out int offset, out int length, out uint version))
+                        {
+                            try
+                            {
+                                ReadOnlySpan<byte> span = buffer.GetSpan(page, offset, length);
+                                byte expected = (byte)version;
+                                for (int k = 0; k < span.Length; k++)
+                                {
+                                    Specification.Assert(span[k] == expected,
+                                        $"Data corruption/tearing! Byte at index {k} was {span[k]}, but expected {expected} for version {version}.");
+                                }
+                            }
+                            finally
+                            {
+                                buffer.EndRead(slotIndex);
+                            }
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(writerTask, readerTask);
+            }
+            finally
+            {
+                buffer.Dispose();
+                slab.Dispose();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_RegisterSyncVar_ConcurrentWrites_ZeroTornCoordinates()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("reg_torn_coords", 1234, syncVarManager);
+
+                var taskWriter = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        sv.Value = 5000 + i;
+                        await Task.Yield();
+                    }
+                });
+
+                var taskReader = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        var (page, offset) = sv.ActiveSlotCoordinates;
+                        if (page >= 0 && offset >= 0)
+                        {
+                            var span = syncVarManager.Slab.GetSpan(page, offset, sizeof(int));
+                            Specification.Assert(span.Length == sizeof(int), "Span length must match integer size.");
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(taskWriter, taskReader);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarWireBuffer_WriteBytes_OutOfOrderVersion_MustNotOverwriteNewerData()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16
+            };
+            var slab = new SyncVarSlab(config);
+            var buffer = new Liminal.Net.SyncVar.Internal.SyncVarWireBuffer(slab);
+
+            try
+            {
+                byte[] dataVer10 = new byte[] { 10, 10, 10, 10 };
+                byte[] dataVer5 = new byte[] { 5, 5, 5, 5 };
+
+                bool write10 = buffer.WriteBytes(dataVer10, 10);
+                Specification.Assert(write10, "Write version 10 should succeed.");
+
+                bool write5 = buffer.WriteBytes(dataVer5, 5);
+                Specification.Assert(!write5, "Out of order write version 5 should be rejected.");
+
+                bool read = buffer.TryBeginRead(out int slotIndex, out int page, out int offset, out int length, out uint version);
+                Specification.Assert(read, "TryBeginRead must succeed.");
+                try
+                {
+                    Specification.Assert(version == 10, $"Version must remain 10, but was {version}.");
+                    var span = buffer.GetSpan(page, offset, length);
+                    Specification.Assert(span[0] == 10, "Data must remain version 10 bytes.");
+                }
+                finally
+                {
+                    buffer.EndRead(slotIndex);
+                }
+                await Task.CompletedTask;
+            }
+            finally
+            {
+                buffer.Dispose();
+                slab.Dispose();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ForceApplyRemote_WireBufferMustNotRejectLowerVersion()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("force_lower_version", 0, syncVarManager);
+
+                var writer10 = new ArrayBufferWriter<byte>();
+                MessagePackSerializer.Serialize(writer10, 100, syncVarManager.SerializerOptions);
+                sv.ApplyRemoteBytes(new ReadOnlySequence<byte>(writer10.WrittenMemory), 10, syncVarManager.SerializerOptions);
+
+                Specification.Assert(sv.Value == 100, "Value should be 100.");
+                Specification.Assert(sv.Version == 10, "Version should be 10.");
+
+                var writer1 = new ArrayBufferWriter<byte>();
+                MessagePackSerializer.Serialize(writer1, 5, syncVarManager.SerializerOptions);
+                sv.ApplyRemoteBytes(new ReadOnlySequence<byte>(writer1.WrittenMemory), 1, syncVarManager.SerializerOptions, force: true);
+
+                Specification.Assert(sv.Value == 5, "Value should be 5 after force apply.");
+                Specification.Assert(sv.Version == 1, "Version should be 1 after force apply.");
+
+                bool extracted = sv.TryExtractSnapshotData(out byte[] wireData, out uint wireVersion);
+                Specification.Assert(extracted, "Snapshot extraction must succeed.");
+                int wireVal = MessagePackSerializer.Deserialize<int>(wireData);
+
+                Specification.Assert(wireVersion == 1,
+                    $"Wire version must be 1, but was {wireVersion} because WireBuffer rejected force write!");
+                Specification.Assert(wireVal == 5,
+                    $"Wire value must be 5, but was {wireVal} because WireBuffer rejected force write!");
+
+                await Task.CompletedTask;
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_CrossVariable_SlabSlotRecycle_NoDataCorruption()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 2048,
+                SyncVarMaxPageCount = 8,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                byte[] initA = new byte[64];
+                Array.Fill(initA, (byte)0x11);
+                byte[] initB = new byte[64];
+                Array.Fill(initB, (byte)0x22);
+
+                var svA = new SyncVar<byte[]>("var_recycle_a", initA, syncVarManager);
+                var svB = new SyncVar<byte[]>("var_recycle_b", initB, syncVarManager);
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 25; i++)
+                    {
+                        if (svA.TryExtractSnapshotData(out byte[] snapshotData, out _))
+                        {
+                            if (snapshotData.Length > 0)
+                            {
+                                var deserialized = MessagePackSerializer.Deserialize<byte[]>(snapshotData);
+                                for (int k = 0; k < deserialized.Length; k++)
+                                {
+                                    Specification.Assert(deserialized[k] != 0x22,
+                                        $"Cross-variable memory corruption: svA read svB payload byte 0x22 at index {k}.");
+                                    Specification.Assert(deserialized[k] == 0x11,
+                                        $"Data tearing: byte at {k} was 0x{deserialized[k]:X2}, expected 0x11.");
+                                }
+                            }
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                var writerTaskA = Task.Run(async () =>
+                {
+                    int[] sizes = new[] { 64, 256, 64, 512, 128, 1024, 64 };
+                    for (int i = 0; i < sizes.Length; i++)
+                    {
+                        byte[] data = new byte[sizes[i]];
+                        Array.Fill(data, (byte)0x11);
+                        svA.Value = data;
+                        await Task.Yield();
+                    }
+                });
+
+                var writerTaskB = Task.Run(async () =>
+                {
+                    int[] sizes = new[] { 64, 128, 256, 512, 64 };
+                    for (int i = 0; i < sizes.Length; i++)
+                    {
+                        byte[] data = new byte[sizes[i]];
+                        Array.Fill(data, (byte)0x22);
+                        svB.Value = data;
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(readerTask, writerTaskA, writerTaskB);
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_SeparateActivePageAndOffset_TOCTOU_TornCoordinates_Demonstration()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                SyncVarMaxPageSize = 512,
+                SyncVarMaxPageCount = 16
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<byte[]>("torn_coord_demo", new byte[32], syncVarManager);
+
+                var writerTask = Task.Run(async () =>
+                {
+                    int[] sizes = new[] { 64, 128, 64, 128, 64, 128 };
+                    for (int i = 0; i < sizes.Length; i++)
+                    {
+                        sv.Value = new byte[sizes[i]];
+                        await Task.Yield();
+                    }
+                });
+
+                var atomicReaderTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        var (page, offset) = sv.ActiveSlotCoordinates;
+                        if (page >= 0 && offset >= 0)
+                        {
+                            var span = syncVarManager.Slab.GetSpan(page, offset, 32);
+                            Specification.Assert(span.Length == 32, "Atomic coordinates must never produce invalid span.");
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(writerTask, atomicReaderTask);
             }
             finally
             {

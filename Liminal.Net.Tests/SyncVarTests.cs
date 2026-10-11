@@ -1492,6 +1492,210 @@ namespace Liminal.Net.Tests
             }
         }
 
+        [Test]
+        public void Test47_SlabReclamation_ReusesFreedSlotsOnResize()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16
+            };
+            var slab = new SyncVarSlab(config);
+
+            var (page0, offset0) = slab.AllocateSlot(256, out int cap0);
+            Assert.That(cap0, Is.EqualTo(256));
+
+            slab.FreeSlot(page0, offset0, cap0);
+
+            var (page1, offset1) = slab.AllocateSlot(256, out int cap1);
+            Assert.That(cap1, Is.EqualTo(256));
+            Assert.That(page1, Is.EqualTo(page0));
+            Assert.That(offset1, Is.EqualTo(offset0), "Freed slot was not reused by the slab pool.");
+        }
+
+        [Test]
+        public void Test48_DynamicPageSize_SupportsCustomPageSizes()
+        {
+            var config128K = new LiminalNetworkConfig
+            {
+                SyncVarMaxPageSize = 131072,
+                SyncVarMaxPageCount = 4
+            };
+            var slab128K = new SyncVarSlab(config128K);
+            Assert.That(slab128K.PageSize, Is.EqualTo(131072));
+
+            var (page, offset) = slab128K.AllocateSlot(100000, out int cap128);
+            Assert.That(cap128, Is.EqualTo(131072));
+            Assert.That(page, Is.EqualTo(0));
+            Assert.That(offset, Is.EqualTo(0));
+
+            slab128K.FreeSlot(page, offset, cap128);
+            var (reusedPage, reusedOffset) = slab128K.AllocateSlot(131072, out _);
+            Assert.That(reusedPage, Is.EqualTo(page));
+            Assert.That(reusedOffset, Is.EqualTo(offset));
+        }
+
+        [Test]
+        public void Test49_SyncVarClear_ServerOnlyEnforcement()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"clear_auth_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 100, _serverManager.SyncVarManager);
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 100, 2000), Is.True);
+
+            // Client calling Clear must be rejected
+            clientVar.Clear();
+            Assert.That(clientVar.Value, Is.EqualTo(100), "Client was able to clear SyncVar without server authority.");
+
+            // Server calling Clear must succeed
+            serverVar.Clear();
+            Assert.That(serverVar.Value, Is.EqualTo(0));
+            Assert.That(serverVar.Version, Is.EqualTo(0));
+            Assert.That(serverVar.Length, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test50_SyncVarClear_SyncsToClientAndFiresValueChanged()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"clear_sync_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 555, _serverManager.SyncVarManager);
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 555, 2000), Is.True);
+
+            int observedOld = -1;
+            int observedNew = -1;
+            bool eventFired = false;
+            clientVar.OnValueChanged += (oldVal, newVal) =>
+            {
+                observedOld = oldVal;
+                observedNew = newVal;
+                eventFired = true;
+            };
+
+            serverVar.Clear();
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 0 && clientVar.Version == 0 && eventFired, 2000), Is.True,
+                "Client did not synchronize clear state from server.");
+            Assert.That(observedOld, Is.EqualTo(555));
+            Assert.That(observedNew, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void Test51_SyncVarClear_PostClearWriteAllocatesFreshSlotsAndVersionIncrements()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"clear_write_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 42, _serverManager.SyncVarManager);
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 42, 2000), Is.True);
+
+            serverVar.Clear();
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 0 && clientVar.Version == 0, 2000), Is.True);
+
+            // Server writes post-clear
+            serverVar.Value = 999;
+            Assert.That(serverVar.Version, Is.EqualTo(1));
+            Assert.That(serverVar.Value, Is.EqualTo(999));
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 999 && clientVar.Version == 1, 2000), Is.True,
+                "Client did not receive post-clear write.");
+        }
+
+        [Test]
+        public void Test52_SyncVarClear_ClientAuthorityPostClearWriteAndStaleRejection()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"clear_client_auth_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 10, _serverManager.SyncVarManager);
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => client.localID > 0 && clientVar.Value == 10, 2000), Is.True);
+            serverVar.AddAuthority(client.localID);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.HasAuthority, 2000), Is.True);
+
+            serverVar.Clear();
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 0 && clientVar.Version == 0, 2000), Is.True);
+
+            // Client writes post-clear
+            clientVar.Value = 777;
+            Assert.That(clientVar.Version, Is.EqualTo(1));
+
+            Assert.That(SpinWait.SpinUntil(() => serverVar.Value == 777 && serverVar.Version == 1, 2000), Is.True,
+                "Server did not accept valid post-clear client write.");
+        }
+
+        [Test]
+        public void Test53_SyncVarEvictPacket_ZeroGCSerialization()
+        {
+            string token = "test_evict_0gc_token";
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+            Utf8TokenRegistry.RegisterToken(token, tokenBytes);
+
+            var packet = new SyncVarEvictPacket(token, tokenBytes);
+
+            var buffer = new System.Buffers.ArrayBufferWriter<byte>(128);
+            var options = MessagePackSerializerOptions.Standard;
+
+            // Warm up
+            MessagePackSerializer.Serialize(buffer, packet, options);
+            var reader = new MessagePackReader(buffer.WrittenMemory);
+            var deserialized = MessagePackSerializer.Deserialize<SyncVarEvictPacket>(ref reader, options);
+            Assert.That(deserialized.Token, Is.EqualTo(token));
+
+            // Assert 0 GC during steady-state serialization and deserialization
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            buffer.Clear();
+            MessagePackSerializer.Serialize(buffer, packet, options);
+            var measureReader = new MessagePackReader(buffer.WrittenMemory);
+            var measureDeserialized = MessagePackSerializer.Deserialize<SyncVarEvictPacket>(ref measureReader, options);
+
+            long allocAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.That(allocAfter - allocBefore, Is.EqualTo(0), "SyncVarEvictPacket serialization/deserialization caused GC allocations.");
+            Assert.That(measureDeserialized.Token, Is.EqualTo(token));
+        }
+
+        [Test]
+        public void Test54_SyncVarDispose_DoesNotCallClear_AndRebindReusesSlab()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"dispose_rebind_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 0, _serverManager.SyncVarManager);
+            serverVar.Value = 42;
+
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 42 && clientVar.Version >= 1, 2000), Is.True);
+            uint serverVerBefore = serverVar.Version;
+
+            clientVar.Dispose();
+
+            Assert.That(serverVar.Value, Is.EqualTo(42));
+            Assert.That(serverVar.Version, Is.EqualTo(serverVerBefore));
+
+            var reboundVar = client.SyncVarManager.Bind<int>(token, 0);
+            Assert.That(reboundVar, Is.Not.Null);
+
+            serverVar.Value = 99;
+            Assert.That(SpinWait.SpinUntil(() => reboundVar.Value == 99 && reboundVar.Version > serverVerBefore, 2000), Is.True);
+        }
+
         #endregion
     }
 }

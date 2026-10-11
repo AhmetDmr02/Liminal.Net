@@ -113,11 +113,175 @@ namespace Liminal.Net.SyncVar
         [Key(1)] public ushort[] AuthIds;
     }
 
-    [MessagePackObject]
     [LiminalPacket]
+    [MessagePackFormatter(typeof(SyncVarEvictWireFormatter))]
     public struct SyncVarEvictPacket
     {
-        [Key(0)] public string Token;
+        public string Token;
+        public ReadOnlyMemory<byte> TokenBytes;
+
+        public SyncVarEvictPacket(string token, byte[] tokenBytes = null)
+        {
+            Token = token;
+            TokenBytes = tokenBytes != null ? tokenBytes : (token != null ? System.Text.Encoding.UTF8.GetBytes(token) : ReadOnlyMemory<byte>.Empty);
+        }
+
+        public SyncVarEvictPacket(string token, ReadOnlyMemory<byte> tokenBytes)
+        {
+            Token = token;
+            TokenBytes = tokenBytes;
+        }
+    }
+
+    public sealed class SyncVarEvictWireFormatter : IMessagePackFormatter<SyncVarEvictPacket>
+    {
+        public void Serialize(ref MessagePackWriter writer, SyncVarEvictPacket value, MessagePackSerializerOptions options)
+        {
+            if (value.TokenBytes.Length > 0)
+            {
+                writer.WriteString(value.TokenBytes.Span);
+            }
+            else
+            {
+                writer.Write(value.Token);
+            }
+        }
+
+        public SyncVarEvictPacket Deserialize(ref MessagePackReader reader, MessagePackSerializerOptions options)
+        {
+            var seq = reader.ReadStringSequence();
+            if (!seq.HasValue)
+            {
+                return new SyncVarEvictPacket(null, ReadOnlyMemory<byte>.Empty);
+            }
+
+            var sequence = seq.Value;
+            if (sequence.IsSingleSegment)
+            {
+                var span = sequence.FirstSpan;
+                string token = Utf8TokenRegistry.GetOrAddCachedToken(span);
+                return new SyncVarEvictPacket(token, sequence.First);
+            }
+
+            Span<byte> stackBuffer = stackalloc byte[(int)Math.Min(sequence.Length, 256)];
+            sequence.CopyTo(stackBuffer);
+            string multiToken = Utf8TokenRegistry.GetOrAddCachedToken(stackBuffer);
+            return new SyncVarEvictPacket(multiToken, stackBuffer.ToArray());
+        }
+    }
+
+    [LiminalPacket]
+    [MessagePackFormatter(typeof(SyncVarClearWireFormatter))]
+    public struct SyncVarClearPacket
+    {
+        public string Token;
+        public ReadOnlyMemory<byte> TokenBytes;
+
+        public SyncVarClearPacket(string token, byte[] tokenBytes = null)
+        {
+            Token = token;
+            TokenBytes = tokenBytes != null ? tokenBytes : (token != null ? System.Text.Encoding.UTF8.GetBytes(token) : ReadOnlyMemory<byte>.Empty);
+        }
+
+        public SyncVarClearPacket(string token, ReadOnlyMemory<byte> tokenBytes)
+        {
+            Token = token;
+            TokenBytes = tokenBytes;
+        }
+    }
+
+    public sealed class SyncVarClearWireFormatter : IMessagePackFormatter<SyncVarClearPacket>
+    {
+        public void Serialize(ref MessagePackWriter writer, SyncVarClearPacket value, MessagePackSerializerOptions options)
+        {
+            if (value.TokenBytes.Length > 0)
+            {
+                writer.WriteString(value.TokenBytes.Span);
+            }
+            else
+            {
+                writer.Write(value.Token);
+            }
+        }
+
+        public SyncVarClearPacket Deserialize(ref MessagePackReader reader, MessagePackSerializerOptions options)
+        {
+            var seq = reader.ReadStringSequence();
+            if (!seq.HasValue)
+            {
+                return new SyncVarClearPacket(null, ReadOnlyMemory<byte>.Empty);
+            }
+
+            var sequence = seq.Value;
+            if (sequence.IsSingleSegment)
+            {
+                var span = sequence.FirstSpan;
+                string token = Utf8TokenRegistry.GetOrAddCachedToken(span);
+                return new SyncVarClearPacket(token, sequence.First);
+            }
+
+            Span<byte> stackBuffer = stackalloc byte[(int)Math.Min(sequence.Length, 256)];
+            sequence.CopyTo(stackBuffer);
+            string multiToken = Utf8TokenRegistry.GetOrAddCachedToken(stackBuffer);
+            return new SyncVarClearPacket(multiToken, stackBuffer.ToArray());
+        }
+    }
+
+    [LiminalPacket]
+    [MessagePackFormatter(typeof(SyncVarClearAckWireFormatter))]
+    public struct SyncVarClearAckPacket
+    {
+        public string Token;
+        public ReadOnlyMemory<byte> TokenBytes;
+
+        public SyncVarClearAckPacket(string token, byte[] tokenBytes = null)
+        {
+            Token = token;
+            TokenBytes = tokenBytes != null ? tokenBytes : (token != null ? System.Text.Encoding.UTF8.GetBytes(token) : ReadOnlyMemory<byte>.Empty);
+        }
+
+        public SyncVarClearAckPacket(string token, ReadOnlyMemory<byte> tokenBytes)
+        {
+            Token = token;
+            TokenBytes = tokenBytes;
+        }
+    }
+
+    public sealed class SyncVarClearAckWireFormatter : IMessagePackFormatter<SyncVarClearAckPacket>
+    {
+        public void Serialize(ref MessagePackWriter writer, SyncVarClearAckPacket value, MessagePackSerializerOptions options)
+        {
+            if (value.TokenBytes.Length > 0)
+            {
+                writer.WriteString(value.TokenBytes.Span);
+            }
+            else
+            {
+                writer.Write(value.Token);
+            }
+        }
+
+        public SyncVarClearAckPacket Deserialize(ref MessagePackReader reader, MessagePackSerializerOptions options)
+        {
+            var seq = reader.ReadStringSequence();
+            if (!seq.HasValue)
+            {
+                return new SyncVarClearAckPacket(null, ReadOnlyMemory<byte>.Empty);
+            }
+
+            var sequence = seq.Value;
+            if (sequence.IsSingleSegment)
+            {
+                var span = sequence.FirstSpan;
+                string token = Utf8TokenRegistry.GetOrAddCachedToken(span);
+                return new SyncVarClearAckPacket(token, sequence.First);
+            }
+
+            Span<byte> stackBuffer = stackalloc byte[(int)Math.Min(sequence.Length, 256)];
+            sequence.CopyTo(stackBuffer);
+            string multiToken = Utf8TokenRegistry.GetOrAddCachedToken(stackBuffer);
+            return new SyncVarClearAckPacket(multiToken, stackBuffer.ToArray());
+        }
     }
 
     #endregion

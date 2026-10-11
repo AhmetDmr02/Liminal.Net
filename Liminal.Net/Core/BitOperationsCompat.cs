@@ -50,5 +50,31 @@ namespace Liminal.Net.Core
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int TrailingZeroCount(int value) => TrailingZeroCount((uint)value);
 #endif
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static uint RoundUpToPowerOf2(uint value)
+        {
+            if (value <= 1) return 1;
+            value--;
+            value |= value >> 1;
+            value |= value >> 2;
+            value |= value >> 4;
+            value |= value >> 8;
+            value |= value >> 16;
+            return value + 1;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int Log2(uint value)
+        {
+            if (value == 0) return 0;
+            int log = 0;
+            if (value >= 1u << 16) { value >>= 16; log += 16; }
+            if (value >= 1u << 8)  { value >>= 8;  log += 8; }
+            if (value >= 1u << 4)  { value >>= 4;  log += 4; }
+            if (value >= 1u << 2)  { value >>= 2;  log += 2; }
+            if (value >= 1u << 1)  { log += 1; }
+            return log;
+        }
     }
 }

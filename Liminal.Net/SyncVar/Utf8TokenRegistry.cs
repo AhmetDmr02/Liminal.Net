@@ -36,6 +36,132 @@ namespace Liminal.Net.SyncVar
 
         public int Count => _table.Count;
 
+        private struct CachedTokenEntry
+        {
+            public ulong Hash;
+            public byte[] TokenBytes;
+            public string Token;
+        }
+
+        private sealed class StaticCacheTable
+        {
+            public readonly CachedTokenEntry[] Entries;
+            public readonly int Count;
+
+            public StaticCacheTable(CachedTokenEntry[] entries, int count)
+            {
+                Entries = entries;
+                Count = count;
+            }
+        }
+
+        private static volatile StaticCacheTable _staticCacheTable = new(new CachedTokenEntry[128], 0);
+        private static readonly object _staticTokenLock = new();
+
+        public static void RegisterToken(string token, byte[] tokenBytes = null)
+        {
+            if (string.IsNullOrEmpty(token)) return;
+            tokenBytes ??= Encoding.UTF8.GetBytes(token);
+            ulong hash = ComputeHash(tokenBytes);
+
+            lock (_staticTokenLock)
+            {
+                var table = _staticCacheTable;
+                for (int i = 0; i < table.Count; i++)
+                {
+                    if (table.Entries[i].Hash == hash && ((ReadOnlySpan<byte>)tokenBytes).SequenceEqual(table.Entries[i].TokenBytes))
+                    {
+                        return;
+                    }
+                }
+
+                var oldEntries = table.Entries;
+                int oldCount = table.Count;
+                CachedTokenEntry[] newEntries;
+                if (oldCount >= oldEntries.Length)
+                {
+                    newEntries = new CachedTokenEntry[oldEntries.Length * 2];
+                    Array.Copy(oldEntries, newEntries, oldCount);
+                }
+                else
+                {
+                    newEntries = new CachedTokenEntry[oldEntries.Length];
+                    Array.Copy(oldEntries, newEntries, oldCount);
+                }
+
+                newEntries[oldCount] = new CachedTokenEntry
+                {
+                    Hash = hash,
+                    TokenBytes = tokenBytes,
+                    Token = token
+                };
+
+                var newTable = new StaticCacheTable(newEntries, oldCount + 1);
+                Volatile.Write(ref _staticCacheTable, newTable);
+            }
+        }
+
+        public static string GetOrAddCachedToken(ReadOnlySpan<byte> tokenSpan)
+        {
+            if (tokenSpan.IsEmpty) return string.Empty;
+            ulong hash = ComputeHash(tokenSpan);
+
+            var table = _staticCacheTable;
+            var entries = table.Entries;
+            int count = table.Count;
+
+            for (int i = 0; i < count; i++)
+            {
+                if (entries[i].Hash == hash && tokenSpan.SequenceEqual(entries[i].TokenBytes))
+                {
+                    return entries[i].Token;
+                }
+            }
+
+            lock (_staticTokenLock)
+            {
+                table = _staticCacheTable;
+                entries = table.Entries;
+                count = table.Count;
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (entries[i].Hash == hash && tokenSpan.SequenceEqual(entries[i].TokenBytes))
+                    {
+                        return entries[i].Token;
+                    }
+                }
+
+                string decoded = Encoding.UTF8.GetString(tokenSpan);
+                byte[] bytes = tokenSpan.ToArray();
+
+                var oldEntries = table.Entries;
+                int oldCount = table.Count;
+                CachedTokenEntry[] newEntries;
+                if (oldCount >= oldEntries.Length)
+                {
+                    newEntries = new CachedTokenEntry[oldEntries.Length * 2];
+                    Array.Copy(oldEntries, newEntries, oldCount);
+                }
+                else
+                {
+                    newEntries = new CachedTokenEntry[oldEntries.Length];
+                    Array.Copy(oldEntries, newEntries, oldCount);
+                }
+
+                newEntries[oldCount] = new CachedTokenEntry
+                {
+                    Hash = hash,
+                    TokenBytes = bytes,
+                    Token = decoded
+                };
+
+                var newTable = new StaticCacheTable(newEntries, oldCount + 1);
+                Volatile.Write(ref _staticCacheTable, newTable);
+                return decoded;
+            }
+        }
+
         public Utf8TokenRegistry(int initialCapacity = 64)
         {
             int size = GetPrime(initialCapacity);
@@ -179,6 +305,7 @@ namespace Liminal.Net.SyncVar
                 newBuckets[bucket] = index;
 
                 Volatile.Write(ref _table, new Table(newBuckets, newEntries, currentCount + 1));
+                RegisterToken(syncVar.Token, tokenBytes);
                 return true;
             }
         }
