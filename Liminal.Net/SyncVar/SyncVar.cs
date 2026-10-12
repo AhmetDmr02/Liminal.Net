@@ -388,7 +388,13 @@ namespace Liminal.Net.SyncVar
         {
             if (IsDisposed) return false;
             uint currentVer = _valueCell.Version;
-            if (!force && newVersion <= currentVer && currentVer != 0) return false;
+            if (!force && newVersion < currentVer && currentVer != 0) return false;
+
+            var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+            if (!force && newVersion == currentVer && currentVer != 0 && netManager != null && netManager.Role != NetworkRole.Client && senderId != 0)
+            {
+                return false;
+            }
 
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
             T oldValue;
@@ -423,7 +429,7 @@ namespace Liminal.Net.SyncVar
                     _wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, newVersion, force);
                 }
 
-                if (force)
+                if (force || (netManager != null && netManager.Role == NetworkRole.Client))
                 {
                     ClearDirty();
                 }

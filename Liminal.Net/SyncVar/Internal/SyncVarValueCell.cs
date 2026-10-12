@@ -161,7 +161,7 @@ namespace Liminal.Net.SyncVar.Internal
             lock (_lock)
             {
                 uint currentVer = Volatile.Read(ref _version);
-                if (!force && newVersion <= currentVer && currentVer != 0)
+                if (!force && newVersion < currentVer && currentVer != 0)
                 {
                     oldValue = default;
                     fireEvent = false;
@@ -169,6 +169,16 @@ namespace Liminal.Net.SyncVar.Internal
                 }
 
                 int currentFront = Volatile.Read(ref _frontIndex);
+                if (!force && newVersion == currentVer && currentVer != 0)
+                {
+                    if (EqualityComparer<T>.Default.Equals(_values[currentFront], deserialized))
+                    {
+                        oldValue = default;
+                        fireEvent = false;
+                        return false;
+                    }
+                }
+
                 int back = 1 - currentFront;
 
                 Interlocked.Increment(ref _valueSeq);

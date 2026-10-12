@@ -4170,5 +4170,278 @@ namespace Liminal.Net.Tests.Coyote
             Specification.Assert(taskException == null,
                 $"FlushDirty during session surge encountered an unhandled exception: {taskException}");
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_RegisterUnboundData_NeverDowngradesLiveNetworkUpdate()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = false };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartClient("127.0.0.1", 7777);
+            netManager.Ticker?.Stop();
+            transport.TriggerLocalClientConnected(10);
+
+            var syncVarManager = netManager.SyncVarManager;
+
+            byte[] stalePayload = MessagePackSerializer.Serialize("StaleUnbound", syncVarManager.SerializerOptions);
+            var snapshotPacket = new SyncVarSnapshotPacket
+            {
+                Entries = new System.Collections.Generic.List<SyncVarSnapshotEntry>
+                {
+                    new SyncVarSnapshotEntry
+                    {
+                        Token = "downgrade_token",
+                        Version = 1,
+                        Data = stalePayload
+                    }
+                }
+            };
+            netManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(snapshotPacket));
+
+            var bufferWriter = new ArrayBufferWriter<byte>();
+            var writer = new MessagePackWriter(bufferWriter);
+            writer.WriteArrayHeader(1);
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes("downgrade_token");
+            writer.WriteUInt8((byte)tokenBytes.Length);
+            writer.WriteRaw(tokenBytes);
+            writer.WriteUInt32(10);
+            byte[] freshPayload = MessagePackSerializer.Serialize("FreshNetwork", syncVarManager.SerializerOptions);
+            writer.WriteInt32(freshPayload.Length);
+            writer.WriteRaw(freshPayload);
+            writer.Flush();
+            var batchPacket = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(bufferWriter.WrittenMemory));
+            byte[] serializedBatch = MessagePackSerializer.Serialize(batchPacket);
+
+            SyncVar<string> boundVar = null;
+            Exception taskException = null;
+
+            var taskBind = Task.Run(() =>
+            {
+                try
+                {
+                    boundVar = syncVarManager.Bind<string>("downgrade_token", "Initial");
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskNetwork = Task.Run(() =>
+            {
+                try
+                {
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                        ILiminalTransport.SERVER_ID,
+                        serializedBatch);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(taskBind, taskNetwork);
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null, $"Unexpected exception: {taskException}");
+            Specification.Assert(boundVar != null, "Bound variable must not be null.");
+
+            Specification.Assert(boundVar.Version == 10,
+                $"SyncVar was downgraded to version {boundVar.Version}! Expected version 10.");
+            Specification.Assert(boundVar.Value == "FreshNetwork",
+                $"SyncVar value was downgraded to '{boundVar.Value}'! Expected 'FreshNetwork'.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_Clear_StaleInFlightWrites_NeverResurrectClearedState()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            netManager.Ticker?.Stop();
+            transport.TriggerClientConnected(2);
+
+            var syncVarManager = netManager.SyncVarManager;
+            var serverVar = syncVarManager.Bind<int>("clear_leak_token", 100);
+            serverVar.AddAuthority(2);
+
+            // Server clears the SyncVar
+            serverVar.Clear();
+            Specification.Assert(serverVar.Version == 0, "Cleared variable should have version 0.");
+            Specification.Assert(serverVar.Value == 0, "Cleared variable should have default value 0.");
+
+            // Helper to build client delta request packet
+            byte[] BuildDeltaRequest(string token, uint version, int value)
+            {
+                var bufferWriter = new ArrayBufferWriter<byte>();
+                var writer = new MessagePackWriter(bufferWriter);
+                writer.WriteArrayHeader(1);
+                byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+                writer.WriteUInt8((byte)tokenBytes.Length);
+                writer.WriteRaw(tokenBytes);
+                writer.WriteUInt32(version);
+                byte[] valBytes = MessagePackSerializer.Serialize(value, syncVarManager.SerializerOptions);
+                writer.WriteInt32(valBytes.Length);
+                writer.WriteRaw(valBytes);
+                writer.Flush();
+                var packet = new SyncVarSlabClientRequestPacket(new ReadOnlySequence<byte>(bufferWriter.WrittenMemory));
+                return MessagePackSerializer.Serialize(packet);
+            }
+
+            byte[] packet1Bytes = BuildDeltaRequest("clear_leak_token", 2, 200);
+            byte[] packet2Bytes = BuildDeltaRequest("clear_leak_token", 3, 300);
+
+            Exception taskException = null;
+
+            var task1 = Task.Run(() =>
+            {
+                try
+                {
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>(),
+                        2,
+                        packet1Bytes);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var task2 = Task.Run(() =>
+            {
+                try
+                {
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>(),
+                        2,
+                        packet2Bytes);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(task1, task2);
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null, $"Unexpected exception: {taskException}");
+            Specification.Assert(serverVar.Version == 0,
+                $"Cleared SyncVar resurrected! Version is {serverVar.Version}, expected 0.");
+            Specification.Assert(serverVar.Value == 0,
+                $"Cleared SyncVar resurrected! Value is {serverVar.Value}, expected 0.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ClientVersionCollision_ReconcilesToAuthoritativeServer()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var clientTransport = new MockTransport { IsServer = false, LocalClientId = 2 };
+            var clientManager = new LiminalNetworkManager(clientTransport, config);
+            clientManager.StartClient("127.0.0.1", 7777);
+            clientManager.Ticker?.Stop();
+            clientTransport.TriggerLocalClientConnected(2);
+
+            var syncVarManager = clientManager.SyncVarManager;
+
+            byte[] basePayload = MessagePackSerializer.Serialize("Base", syncVarManager.SerializerOptions);
+            var snapshotPacket = new SyncVarSnapshotPacket
+            {
+                Entries = new System.Collections.Generic.List<SyncVarSnapshotEntry>
+                {
+                    new SyncVarSnapshotEntry
+                    {
+                        Token = "collision_token",
+                        Version = 5,
+                        AuthIds = new ushort[] { 2 },
+                        Data = basePayload
+                    }
+                }
+            };
+            clientManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(snapshotPacket));
+
+            var clientVar = syncVarManager.Bind<string>("collision_token", "Base");
+            Specification.Assert(clientVar.Version == 5, $"Initial client version should be 5, was {clientVar.Version}");
+            Specification.Assert(clientVar.HasAuthority, "Client 2 must have authority.");
+
+            clientVar.Value = "ClientValue";
+            Specification.Assert(clientVar.Version == 6, $"Client version should be 6 after write, was {clientVar.Version}");
+
+            var bufferWriter = new ArrayBufferWriter<byte>();
+            var writer = new MessagePackWriter(bufferWriter);
+            writer.WriteArrayHeader(1);
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes("collision_token");
+            writer.WriteUInt8((byte)tokenBytes.Length);
+            writer.WriteRaw(tokenBytes);
+            writer.WriteUInt32(6);
+            byte[] serverPayload = MessagePackSerializer.Serialize("ServerValue", syncVarManager.SerializerOptions);
+            writer.WriteInt32(serverPayload.Length);
+            writer.WriteRaw(serverPayload);
+            writer.Flush();
+            var batchPacket = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(bufferWriter.WrittenMemory));
+            byte[] serializedBatch = MessagePackSerializer.Serialize(batchPacket);
+
+            Exception taskException = null;
+
+            var taskReconcile = Task.Run(() =>
+            {
+                try
+                {
+                    clientManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                        ILiminalTransport.SERVER_ID,
+                        serializedBatch);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await taskReconcile;
+
+            clientManager.Shutdown();
+
+            Specification.Assert(taskException == null, $"Unexpected exception: {taskException}");
+            Specification.Assert(clientVar.Version == 6, $"Client version should remain 6, was {clientVar.Version}");
+            Specification.Assert(clientVar.Value == "ServerValue",
+                $"Client desynchronized! Retained rejected local value '{clientVar.Value}', expected server value 'ServerValue'.");
+        }
     }
 }

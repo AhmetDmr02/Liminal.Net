@@ -404,21 +404,21 @@ namespace Liminal.Net.SyncVar
                     entry = e;
                 }
 
+                if (cachedAuth != null)
+                {
+                    syncVar.ApplyAuthUpdateFromRemote(cachedAuth, deferEvent: true);
+                }
+
+                if (entry != null)
+                {
+                    syncVar.SetLocallyVisible(true);
+                    bool force = !syncVar.HasAuthority;
+                    syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force, deferEvent: true);
+                }
+
                 _tokenRegistry.TryAdd(syncVar);
                 Volatile.Write(ref _localRegistry[slot], syncVar);
                 syncVar.LocalSlot = slot;
-            }
-
-            if (cachedAuth != null)
-            {
-                syncVar.ApplyAuthUpdateFromRemote(cachedAuth, deferEvent: true);
-            }
-
-            if (entry != null)
-            {
-                syncVar.SetLocallyVisible(true);
-                bool force = !syncVar.HasAuthority;
-                syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force, deferEvent: true);
             }
 
             syncVar.FirePendingEvents();
@@ -1032,12 +1032,20 @@ namespace Liminal.Net.SyncVar
 
                 if (_pendingClearAcks.TryGetValue(syncVar.Token, out var pending))
                 {
-                    if (pending.TryRemove(senderId, out _))
+                    if (version != 1)
                     {
-                        if (version != 1)
+                        if (pending.ContainsKey(senderId))
                         {
                             LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} attempted stale write (v={version}) to cleared SyncVar '{syncVar.Token}'. Dropped.");
                             continue;
+                        }
+                    }
+                    else
+                    {
+                        pending.TryRemove(senderId, out _);
+                        if (pending.IsEmpty)
+                        {
+                            ((ICollection<KeyValuePair<string, ConcurrentDictionary<ushort, byte>>>)_pendingClearAcks).Remove(new KeyValuePair<string, ConcurrentDictionary<ushort, byte>>(syncVar.Token, pending));
                         }
                     }
                 }
@@ -1052,6 +1060,10 @@ namespace Liminal.Net.SyncVar
                 else if (!syncVar.IsAuthorized(senderId))
                 {
                     LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify Var '{syncVar.Token}'. Dropped.");
+                }
+                else
+                {
+                    SendSyncVarToClient(syncVar, senderId);
                 }
             }
         }
