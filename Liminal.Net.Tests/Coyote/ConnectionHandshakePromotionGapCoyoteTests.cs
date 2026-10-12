@@ -253,5 +253,83 @@ namespace Liminal.Net.Tests.Coyote
                 server.Shutdown();
             }
         }
+
+        [CoyoteTest]
+        public static async Task Coyote_RapidRestart_CancelledConnectTask_NeverClobbersLocalClientId()
+        {
+            var config = CreateConfig();
+            var transport = new TcpTransport();
+            transport.InitializeTransport(config);
+
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+            try
+            {
+                transport.StartClient("127.0.0.1", port);
+                transport.Shutdown();
+
+                transport.StartClient("127.0.0.1", port);
+
+                var newClient = new TcpClient();
+                transport.PromoteLocalClient(1, newClient);
+
+                for (int i = 0; i < 50; i++)
+                {
+                    await Task.Yield();
+                    Specification.Assert(transport.LocalClientId == 1,
+                        $"LocalClientId was corrupted! Expected 1, but found {transport.LocalClientId}");
+                    Specification.Assert(transport.IsConnected,
+                        "IsConnected was unexpectedly reset to false after promotion.");
+                }
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
+                transport.Shutdown();
+            }
+        }
+
+        [CoyoteTest]
+        public static async Task Coyote_RapidRestart_OldReceiveLoop_NeverShutsDownNewSession()
+        {
+            var config = CreateConfig();
+            var transport = new TcpTransport();
+            transport.InitializeTransport(config);
+
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+            try
+            {
+                transport.StartClient("127.0.0.1", port);
+                var oldClient = new TcpClient();
+                await oldClient.ConnectAsync("127.0.0.1", port);
+                transport.PromoteLocalClient(1, oldClient);
+
+                transport.Shutdown();
+
+                transport.StartClient("127.0.0.1", port);
+                var newClient = new TcpClient();
+                await newClient.ConnectAsync("127.0.0.1", port);
+                transport.PromoteLocalClient(2, newClient);
+
+                for (int i = 0; i < 50; i++)
+                {
+                    await Task.Yield();
+                    Specification.Assert(transport.LocalClientId == 2,
+                        $"LocalClientId was corrupted! Expected 2, but found {transport.LocalClientId}");
+                    Specification.Assert(transport.IsConnected,
+                        "IsConnected was unexpectedly reset to false by old receive loop.");
+                }
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { }
+                transport.Shutdown();
+            }
+        }
     }
 }

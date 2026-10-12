@@ -1,6 +1,7 @@
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace Liminal.Net.Tests
@@ -35,33 +36,17 @@ namespace Liminal.Net.Tests
 
         public class ThreadSafeList<T> : IEnumerable<T>
         {
-            private readonly List<T> _list = new();
-            private readonly object _lock = new();
+            private readonly ConcurrentQueue<T> _items = new();
 
-            public void Add(T item)
-            {
-                lock (_lock) _list.Add(item);
-            }
+            public void Add(T item) => _items.Enqueue(item);
 
-            public void Clear()
-            {
-                lock (_lock) _list.Clear();
-            }
+            public void Clear() => _items.Clear();
 
-            public int Count
-            {
-                get { lock (_lock) return _list.Count; }
-            }
+            public int Count => _items.Count;
 
-            public T this[int index]
-            {
-                get { lock (_lock) return _list[index]; }
-            }
+            public T this[int index] => _items.ToArray()[index];
 
-            public IEnumerator<T> GetEnumerator()
-            {
-                lock (_lock) return new List<T>(_list).GetEnumerator();
-            }
+            public IEnumerator<T> GetEnumerator() => _items.GetEnumerator();
 
             System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
         }

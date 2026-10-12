@@ -1002,7 +1002,7 @@ namespace Liminal.Net.Tests
 
             Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect.");
 
-            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50, 2000), Is.True,
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 50 && changedFired, 2000), Is.True,
                 "Unauthorized offline client mutation was not overwritten by server snapshot.");
 
             Assert.That(changedFired, Is.True, "OnValueChanged did not fire when server snapshot corrected the value.");

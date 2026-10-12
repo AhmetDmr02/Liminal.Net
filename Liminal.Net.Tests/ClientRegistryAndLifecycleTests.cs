@@ -477,9 +477,7 @@ namespace Liminal.Net.Tests
             bool started = _serverManager.StartHost();
             Assert.That(started, Is.True);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.IsConnected, 4000), Is.True);
-
-            bridge.Update();
-            Assert.That(clientJoinedCount, Is.GreaterThanOrEqualTo(1));
+            Assert.That(SpinWait.SpinUntil(() => { bridge.Update(); return clientJoinedCount >= 1; }, 4000), Is.True);
             bridge.Dispose();
         }
 

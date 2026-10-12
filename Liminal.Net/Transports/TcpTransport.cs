@@ -222,9 +222,14 @@ namespace Liminal.Net.Transports
         {
             try
             {
-                _clientConnectCts?.Cancel();
-                _clientConnectCts?.Dispose();
-                _clientConnectCts = new CancellationTokenSource();
+                CancellationToken token;
+                lock (_connectionLifecycleLock)
+                {
+                    _clientConnectCts?.Cancel();
+                    _clientConnectCts?.Dispose();
+                    _clientConnectCts = new CancellationTokenSource();
+                    token = _clientConnectCts.Token;
+                }
 
                 string targetIp = ip;
                 if (string.IsNullOrWhiteSpace(targetIp) || targetIp == "0.0.0.0")
@@ -256,7 +261,6 @@ namespace Liminal.Net.Transports
 
                 _isClient = true;
 
-                var token = _clientConnectCts.Token;
                 _ = Task.Run(() => TryToConnectAsync(client, (targetIp, port), token), token);
             }
             catch (Exception ex)
@@ -357,12 +361,12 @@ namespace Liminal.Net.Transports
 
             try
             {
-                _clientConnectCts?.Cancel();
-                _clientConnectCts?.Dispose();
-                _clientConnectCts = null;
-
                 lock (_connectionLifecycleLock)
                 {
+                    _clientConnectCts?.Cancel();
+                    _clientConnectCts?.Dispose();
+                    _clientConnectCts = null;
+
                     _isConnected = false;
                     _isServer = false;
                     _isClient = false;
@@ -631,17 +635,15 @@ namespace Liminal.Net.Transports
         {
             try
             {
+                using var cancelReg = cancelToken.Register(() => { try { client.Close(); } catch { } });
                 using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_config.ConnectionTimeout));
                 using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancelToken);
 
-                using (linkedCts.Token.Register(() => { try { client.Close(); } catch { } }))
-                {
 #if NET5_0_OR_GREATER
-                    await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, linkedCts.Token).ConfigureAwait(false);
+                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port, linkedCts.Token).ConfigureAwait(false);
 #else
-                    await client.ConnectAsync(connectionInfo.ip, connectionInfo.port).ConfigureAwait(false);
+                await client.ConnectAsync(connectionInfo.ip, connectionInfo.port).ConfigureAwait(false);
 #endif
-                }
 
                 if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
                 {
@@ -651,38 +653,32 @@ namespace Liminal.Net.Transports
 
                 _onHandshakeInitialized?.Invoke();
 
-                HandshakeResult result;
-                if (ClientHandshaker != null && ClientHandshaker.Target == null && ClientHandshaker.Method.Name == nameof(DefaultHandshakes.ClientTcpHandshake))
-                {
-                    result = await DefaultHandshakes.ClientTcpHandshake(client, _config, assignedId =>
-                    {
-                        _localClientId = assignedId;
-                    }).ConfigureAwait(false);
-                }
-                else
-                {
-                    result = await ClientHandshaker(client, _config).ConfigureAwait(false);
-                }
+                HandshakeResult result = await ClientHandshaker(client, _config).ConfigureAwait(false);
 
-                if (cancelToken.IsCancellationRequested)
+                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
                 {
-                    _localClientId = 0;
                     try { client.Close(); } catch { }
                     return;
                 }
 
                 if (result.Success)
                 {
-                    _localClientId = result.ClientId;
-                    PromoteLocalClient(_localClientId, client);
+                    PromoteLocalClient(result.ClientId, client);
                 }
                 else
                 {
-                    _localClientId = 0;
                     try { client.Close(); } catch { }
 
-                    if (cancelToken.IsCancellationRequested)
+                    if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
                         return;
+
+                    lock (_connectionLifecycleLock)
+                    {
+                        if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                        {
+                            _localClientId = 0;
+                        }
+                    }
 
                     OnTransportDisconnectReason?.Invoke(ILiminalTransport.SERVER_ID, result.FailureReason, result.FailureMessage);
 
@@ -692,15 +688,22 @@ namespace Liminal.Net.Transports
             }
             catch (OperationCanceledException)
             {
-                _localClientId = 0;
                 try { client.Close(); } catch { }
             }
             catch (Exception ex)
             {
-                _localClientId = 0;
                 try { client.Close(); } catch { }
-                if (cancelToken.IsCancellationRequested)
+                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
                     return;
+
+                lock (_connectionLifecycleLock)
+                {
+                    if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                    {
+                        _localClientId = 0;
+                    }
+                }
+
                 LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
                 Shutdown();
             }
@@ -955,6 +958,7 @@ namespace Liminal.Net.Transports
                     return;
                 }
 
+                _localClientId = assignedId;
                 sendState = new ClientSendState();
                 _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
                 _sockets[ILiminalTransport.SERVER_ID] = client;
@@ -1100,15 +1104,30 @@ namespace Liminal.Net.Transports
                             }
                         }
                     }
-                    else if (_isClient)
+                    else
                     {
-                        LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
+                        bool isCurrent = false;
+                        ushort disconnectedId = 0;
 
-                        ushort disconnectedId = _localClientId;
-                        _isConnected = false;
+                        lock (_connectionLifecycleLock)
+                        {
+                            if (_isShuttingDown == 0 && _isClient &&
+                                _sockets.TryGetValue(ILiminalTransport.SERVER_ID, out var activeClient) &&
+                                ReferenceEquals(activeClient, client))
+                            {
+                                ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(ILiminalTransport.SERVER_ID, client));
+                                disconnectedId = _localClientId;
+                                _isConnected = false;
+                                isCurrent = true;
+                            }
+                        }
 
-                        _onLocalClientDisconnected?.Invoke(disconnectedId);
-                        Shutdown();
+                        if (isCurrent)
+                        {
+                            LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
+                            _onLocalClientDisconnected?.Invoke(disconnectedId);
+                            Shutdown();
+                        }
                     }
 
                     _finalizedConnections.TryRemove(client, out _);
