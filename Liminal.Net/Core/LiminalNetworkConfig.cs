@@ -86,6 +86,8 @@ namespace Liminal.Net.Core
         /// </summary>
         public int SyncVarMaxPageCount = 256; // 65536 * 256 = 16 MB max capacity
 
+        public int SyncVarMaxLocalSlots = 4096;
+
         public List<ILiminalInboundTransformer> InboundPacketProcessors = new();
         public List<ILiminalOutboundTransformer> OutboundPacketProcessors = new();
 
@@ -98,6 +100,10 @@ namespace Liminal.Net.Core
             if (ClientIdResolver == null)
             {
                 ClientIdResolver = new BaseResolver();
+            }
+            if (SyncVarMaxLocalSlots <= 0)
+            {
+                SyncVarMaxLocalSlots = 4096;
             }
             Hiccup.Validate(MaxPacketSizePerBatch, MaxPacketCount, MaxConnectionCount);
         }

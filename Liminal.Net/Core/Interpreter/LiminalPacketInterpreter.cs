@@ -1,6 +1,7 @@
 using Liminal.Net.Interfaces;
 using MessagePack;
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -16,21 +17,113 @@ namespace Liminal.Net.Core
         private readonly ConcurrentDictionary<object, SubscriptionList> _subscribers = new();
         private readonly object _subscriptionGate = new();
 
-        internal sealed class StickyPacketEntry
+        internal sealed class StickyPacketEntry : IDisposable
         {
-            public readonly byte[] Data;
-            public readonly ushort Sender;
-            public readonly long Version;
+            private readonly object _lock = new();
+            private readonly ArrayPool<byte> _pool;
+            private byte[] _rentedBuffer;
+            private int _length;
+            private ushort _sender;
+            private long _version;
+            private bool _hasData;
+            private bool _isDisposed;
 
-            public StickyPacketEntry(byte[] data, ushort sender, long version)
+            public StickyPacketEntry(ArrayPool<byte> pool)
             {
-                Data = data;
-                Sender = sender;
-                Version = version;
+                _pool = pool ?? throw new ArgumentNullException(nameof(pool));
+            }
+
+            public bool HasData => Volatile.Read(ref _hasData);
+            public long Version => Volatile.Read(ref _version);
+            public ushort Sender => Volatile.Read(ref _sender);
+            public bool IsDisposed
+            {
+                get
+                {
+                    lock (_lock) return _isDisposed;
+                }
+            }
+
+            public bool Update(ReadOnlySpan<byte> rawData, ushort sender, long version)
+            {
+                lock (_lock)
+                {
+                    if (_isDisposed)
+                        return false;
+
+                    if (version <= _version)
+                        return false;
+
+                    if (_rentedBuffer == null || _rentedBuffer.Length < rawData.Length)
+                    {
+                        if (_rentedBuffer != null)
+                        {
+                            _pool.Return(_rentedBuffer);
+                        }
+                        _rentedBuffer = _pool.Rent(rawData.Length);
+                    }
+
+                    rawData.CopyTo(_rentedBuffer);
+                    _length = rawData.Length;
+                    Volatile.Write(ref _sender, sender);
+                    Volatile.Write(ref _version, version);
+                    Volatile.Write(ref _hasData, true);
+                    return true;
+                }
+            }
+
+            public bool TryRead<T>(out T packet, out ushort sender, out long version, MessagePackSerializerOptions options)
+            {
+                lock (_lock)
+                {
+                    if (_isDisposed || !_hasData || _rentedBuffer == null)
+                    {
+                        packet = default;
+                        sender = 0;
+                        version = 0;
+                        return false;
+                    }
+
+                    try
+                    {
+                        var mpReader = new MessagePackReader(new ReadOnlyMemory<byte>(_rentedBuffer, 0, _length));
+                        packet = MessagePackSerializer.Deserialize<T>(ref mpReader, options);
+                        sender = _sender;
+                        version = _version;
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        LiminalLogger.LogError($"[Interpreter] Error reading sticky packet {typeof(T).Name}: {ex}");
+                        packet = default;
+                        sender = 0;
+                        version = 0;
+                        return false;
+                    }
+                }
+            }
+
+            public void Dispose()
+            {
+                lock (_lock)
+                {
+                    if (_isDisposed) return;
+                    _isDisposed = true;
+                    Volatile.Write(ref _hasData, false);
+                    _length = 0;
+                    Volatile.Write(ref _sender, (ushort)0);
+                    Volatile.Write(ref _version, 0L);
+                    if (_rentedBuffer != null)
+                    {
+                        _pool.Return(_rentedBuffer);
+                        _rentedBuffer = null;
+                    }
+                }
             }
         }
 
         private readonly ConcurrentDictionary<ushort, StickyPacketEntry> _stickyPackets = new();
+        private readonly ArrayPool<byte> _stickyPool = ArrayPool<byte>.Create();
         private long _stickySequence;
 
         private readonly LiminalNetworkConfig _config;
@@ -70,6 +163,8 @@ namespace Liminal.Net.Core
 
                 public void EnqueueAndDrain(StickyPacketEntry entry, MessagePackSerializerOptions options)
                 {
+                    if (!entry.HasData) return;
+
                     while (true)
                     {
                         var currentPending = Volatile.Read(ref PendingEntry);
@@ -98,24 +193,25 @@ namespace Liminal.Net.Core
                         var toDeliver = Interlocked.Exchange(ref PendingEntry, null);
                         if (toDeliver != null)
                         {
-                            long delivered = Volatile.Read(ref DeliveredVersion);
-                            if (toDeliver.Version > delivered)
+                            if (toDeliver.TryRead<T>(out T packet, out ushort sender, out long version, options))
                             {
-                                Volatile.Write(ref DeliveredVersion, toDeliver.Version);
-                                try
+                                long delivered = Volatile.Read(ref DeliveredVersion);
+                                if (version > delivered)
                                 {
-                                    var mpReader = new MessagePackReader(toDeliver.Data);
-                                    T packet = MessagePackSerializer.Deserialize<T>(ref mpReader, options);
-                                    Callback(packet, toDeliver.Sender);
-                                }
-                                catch (Exception ex)
-                                {
-                                    LiminalLogger.LogError($"[Interpreter] Error in callback for sticky packet {typeof(T).Name}: {ex}");
+                                    Volatile.Write(ref DeliveredVersion, version);
+                                    try
+                                    {
+                                        Callback(packet, sender);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        LiminalLogger.LogError($"[Interpreter] Error in callback for sticky packet {typeof(T).Name}: {ex}");
+                                    }
                                 }
                             }
                         }
 
-                        Volatile.Write(ref IsDraining, 0);
+                        Interlocked.Exchange(ref IsDraining, 0);
 
                         if (Volatile.Read(ref PendingEntry) == null)
                         {
@@ -447,7 +543,7 @@ namespace Liminal.Net.Core
                     currentSticky = getSticky();
                 }
 
-                if (currentSticky != null)
+                if (currentSticky != null && currentSticky.HasData)
                 {
                     sub.EnqueueAndDrain(currentSticky, options);
                 }
@@ -773,18 +869,7 @@ namespace Liminal.Net.Core
             if (!_stickyPackets.TryGetValue(packetId, out var entry))
                 return false;
 
-            try
-            {
-                var mpReader = new MessagePackReader(entry.Data);
-                packet = MessagePackSerializer.Deserialize<T>(ref mpReader, _options);
-                sender = entry.Sender;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Interpreter] Error reading sticky packet {typeof(T).Name}: {ex}");
-                return false;
-            }
+            return entry.TryRead(out packet, out sender, out _, _options);
         }
 
         public bool TryGetSticky<T>(out T packet) where T : struct => TryGetSticky(out packet, out _);
@@ -794,7 +879,10 @@ namespace Liminal.Net.Core
             int idInt = LiminalPacketLibrary.GetId<T>();
             if (idInt == 0) return;
             ushort packetId = checked((ushort)idInt);
-            _stickyPackets.TryRemove(packetId, out _);
+            if (_stickyPackets.TryRemove(packetId, out var entry))
+            {
+                entry.Dispose();
+            }
             if (_handlers.TryGetValue(packetId, out var dispatcher))
             {
                 dispatcher.ResetSticky();
@@ -803,6 +891,13 @@ namespace Liminal.Net.Core
 
         public void ClearAllSticky()
         {
+            foreach (var kvp in _stickyPackets)
+            {
+                if (_stickyPackets.TryRemove(kvp.Key, out var entry))
+                {
+                    entry.Dispose();
+                }
+            }
             _stickyPackets.Clear();
             foreach (var kvp in _handlers)
             {
@@ -1631,9 +1726,29 @@ namespace Liminal.Net.Core
             if (isSticky)
             {
                 long version = Interlocked.Increment(ref _stickySequence);
-                var entry = new StickyPacketEntry(rawData.ToArray(), sender, version);
-                _stickyPackets.AddOrUpdate(packetId, entry, (_, existing) => entry.Version > existing.Version ? entry : existing);
-                LiminalLogger.Log($"[Interpreter] Sticky packet cached (ID: {packetId})", LiminalLogger.LogLevel.Detailed);
+                StickyPacketEntry entry;
+                while (true)
+                {
+                    if (!_stickyPackets.TryGetValue(packetId, out entry))
+                    {
+                        var newEntry = new StickyPacketEntry(_stickyPool);
+                        entry = _stickyPackets.GetOrAdd(packetId, newEntry);
+                        if (entry != newEntry)
+                        {
+                            newEntry.Dispose();
+                        }
+                    }
+
+                    if (!entry.Update(rawData.Span, sender, version))
+                    {
+                        if (entry.IsDisposed)
+                        {
+                            _stickyPackets.TryRemove(packetId, out _);
+                            continue;
+                        }
+                    }
+                    break;
+                }
 
                 if (!_handlers.TryGetValue(packetId, out var stickyDispatcher))
                 {

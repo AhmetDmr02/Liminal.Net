@@ -1,10 +1,24 @@
+using Liminal.Net.Core;
+using System.Runtime.CompilerServices;
 using System.Threading;
 
 namespace Liminal.Net.SyncVar
 {
     public sealed class LockFreeDirtyBitset
     {
-        private readonly long[] _masks = new long[64];
+        private readonly long[] _masks;
+        private readonly int _capacity;
+
+        public int Capacity => _capacity;
+        public int BucketCount => _masks.Length;
+
+        public LockFreeDirtyBitset(int capacity = 4096)
+        {
+            if (capacity <= 0) capacity = 4096;
+            _capacity = capacity;
+            int buckets = (capacity + 63) / 64;
+            _masks = new long[buckets];
+        }
 
         public void SetDirty(ushort id)
         {
@@ -27,6 +41,34 @@ namespace Liminal.Net.SyncVar
 #endif
         }
 
+        public void ClearDirty(ushort id)
+        {
+            int bucket = id >> 6;
+            if ((uint)bucket >= (uint)_masks.Length) return;
+            long bit = 1L << (id & 63);
+
+#if NET5_0_OR_GREATER
+            Interlocked.And(ref _masks[bucket], ~bit);
+#else
+            long current = Volatile.Read(ref _masks[bucket]);
+            while ((current & bit) != 0)
+            {
+                long updated = current & ~bit;
+                long prior = Interlocked.CompareExchange(ref _masks[bucket], updated, current);
+                if (prior == current)
+                    break;
+                current = prior;
+            }
+#endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool IsBucketEmpty(int bucketIndex)
+        {
+            if ((uint)bucketIndex >= (uint)_masks.Length) return true;
+            return Volatile.Read(ref _masks[bucketIndex]) == 0;
+        }
+
         public bool TryConsumeBucket(int bucketIndex, out long dirtyMask)
         {
             if ((uint)bucketIndex >= (uint)_masks.Length)
@@ -46,12 +88,24 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool IsDirty(ushort id)
         {
             int bucket = id >> 6;
             if ((uint)bucket >= (uint)_masks.Length) return false;
             long bit = 1L << (id & 63);
             return (Volatile.Read(ref _masks[bucket]) & bit) != 0;
+        }
+
+        public int CountDirtyBits()
+        {
+            int count = 0;
+            for (int i = 0; i < _masks.Length; i++)
+            {
+                ulong u = (ulong)Volatile.Read(ref _masks[i]);
+                count += BitOperationsCompat.PopCount(u);
+            }
+            return count;
         }
     }
 }

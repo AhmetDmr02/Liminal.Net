@@ -37,6 +37,7 @@ namespace Liminal.Net.Transports
         public bool IsClient => _isClient;
 
         protected TcpListener _listener;
+        public EndPoint? LocalEndpoint => _listener?.LocalEndpoint;
         private CancellationTokenSource _clientConnectCts;
 
         public ServerHandshakeOrchestrator<TcpClient> ServerHandshaker { get; set; } = DefaultHandshakes.ServerTcpHandshake;
@@ -148,10 +149,11 @@ namespace Liminal.Net.Transports
         internal readonly ConcurrentDictionary<ushort, ClientSendState> _sendQueues = new();
         private readonly object _connectionLifecycleLock = new();
 
-        internal void SetConnectedForTesting(bool isConnected = true, bool isServer = true)
+        internal void SetConnectedForTesting(bool isConnected = true, bool isServer = true, bool isClient = false)
         {
             _isConnected = isConnected;
             _isServer = isServer;
+            _isClient = isClient;
         }
 
         #region Initialization
@@ -359,31 +361,34 @@ namespace Liminal.Net.Transports
                 _clientConnectCts?.Dispose();
                 _clientConnectCts = null;
 
-                _isConnected = false;
-                _isServer = false;
-                _isClient = false;
-                _localClientId = 0;
-
-                foreach (var id in _sockets.Keys)
+                lock (_connectionLifecycleLock)
                 {
-                    TeardownSendQueue(id);
+                    _isConnected = false;
+                    _isServer = false;
+                    _isClient = false;
+                    _localClientId = 0;
 
-                    if (_sockets.TryRemove(id, out var clientSocket))
+                    foreach (var id in _sockets.Keys)
                     {
-                        try { clientSocket.Close(); } catch { }
-                        LiminalLogger.Log($"[Transport] Client {id} cleared.");
+                        TeardownSendQueue(id);
+
+                        if (_sockets.TryRemove(id, out var clientSocket))
+                        {
+                            try { clientSocket.Close(); } catch { }
+                            LiminalLogger.Log($"[Transport] Client {id} cleared.");
+                        }
                     }
-                }
 
-                foreach (var id in _sendQueues.Keys)
-                {
-                    TeardownSendQueue(id);
-                }
+                    foreach (var id in _sendQueues.Keys)
+                    {
+                        TeardownSendQueue(id);
+                    }
 
-                if (_listener != null)
-                {
-                    try { _listener.Stop(); } catch { }
-                    _listener = null;
+                    if (_listener != null)
+                    {
+                        try { _listener.Stop(); } catch { }
+                        _listener = null;
+                    }
                 }
 
                 _onShutdown?.Invoke();
@@ -447,6 +452,11 @@ namespace Liminal.Net.Transports
         {
             if (!_sendQueues.TryGetValue(targetId, out var sendState))
             {
+                if ((flags & TransportFlags.WirePing) != 0)
+                {
+                    return;
+                }
+
                 LiminalLogger.LogError($"[Transport] Cannot send: no outbound queue for client {targetId}");
                 if (IsServer) Kick(targetId);
                 else Shutdown();
@@ -932,15 +942,24 @@ namespace Liminal.Net.Transports
             PostPromoteClient(clientId, client, sendState);
         }
 
-        private void PromoteLocalClient(ushort assignedId, TcpClient client)
+        internal void PromoteLocalClient(ushort assignedId, TcpClient client)
         {
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
 
-            var sendState = new ClientSendState();
-            _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
-            _sockets[ILiminalTransport.SERVER_ID] = client;
+            ClientSendState sendState;
+            lock (_connectionLifecycleLock)
+            {
+                if (_isShuttingDown != 0 || !_isClient)
+                {
+                    try { client.Close(); } catch { }
+                    return;
+                }
 
-            _isConnected = true;
+                sendState = new ClientSendState();
+                _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
+                _sockets[ILiminalTransport.SERVER_ID] = client;
+                _isConnected = true;
+            }
             try
             {
                 _onLocalClientConnected?.Invoke(assignedId);
@@ -1220,7 +1239,7 @@ namespace Liminal.Net.Transports
 
         public void SendWirePing(ushort targetId)
         {
-            if (!_sockets.ContainsKey(targetId)) return;
+            if (!_sendQueues.ContainsKey(targetId)) return;
 
             long now = Stopwatch.GetTimestamp();
             uint seq;

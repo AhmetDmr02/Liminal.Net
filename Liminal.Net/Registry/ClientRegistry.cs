@@ -13,6 +13,7 @@ namespace Liminal.Net.Registry
     {
         private readonly LiminalNetworkManager _manager;
         private readonly ConcurrentDictionary<ushort, ConnectedClient> _clients = new();
+        private readonly object _rosterLock = new();
 
         private int _rosterVersion;
 
@@ -26,7 +27,7 @@ namespace Liminal.Net.Registry
             private set => Volatile.Write(ref _localClient, value);
         }
 
-        public ConnectedClient HostClient => HostClientId.HasValue && _clients.TryGetValue(HostClientId.Value, out var host) ? host : null;
+        public ConnectedClient HostClient => HostClientId is { } id && _clients.TryGetValue(id, out var host) ? host : null;
 
         private int _hostClientId;
         public ushort? HostClientId
@@ -70,10 +71,13 @@ namespace Liminal.Net.Registry
 
         public void Reset()
         {
-            _clients.Clear();
-            LocalClient = null;
-            Interlocked.Exchange(ref _hostClientId, 0);
-            Volatile.Write(ref _rosterVersion, 0);
+            lock (_rosterLock)
+            {
+                _clients.Clear();
+                LocalClient = null;
+                Interlocked.Exchange(ref _hostClientId, 0);
+                Volatile.Write(ref _rosterVersion, 0);
+            }
         }
 
         public void Attach()
@@ -115,38 +119,46 @@ namespace Liminal.Net.Registry
             }
 
             var client = new ConnectedClient(clientId, isLocal: isHost, isHost: isHost);
+            bool added;
 
-            if (_clients.TryAdd(clientId, client))
+            lock (_rosterLock)
             {
-                uint newVersion = (uint)Interlocked.Increment(ref _rosterVersion);
-                if (isHost) LocalClient = client;
-
-                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, client);
-            }
-
-            if (!isHost)
-            {
-                ushort hostId = HostClientId ?? 0;
-                ushort[] currentRoster = _clients.Keys.ToArray();
-
-                _manager.Interpreter.SendCommandAsServer(clientId, new ClientRosterSnapshotPacket
+                added = _clients.TryAdd(clientId, client);
+                if (added)
                 {
-                    RosterVersion = RosterVersion,
-                    HostClientId = hostId,
-                    ConnectedClientIds = currentRoster
-                }, DeliveryMethod.Reliable);
+                    uint newVersion = (uint)Interlocked.Increment(ref _rosterVersion);
+                    if (isHost) LocalClient = client;
 
-                foreach (var otherId in _clients.Keys)
-                {
-                    if (otherId != clientId && otherId != ILiminalTransport.SERVER_ID)
+                    if (!isHost)
                     {
-                        _manager.Interpreter.SendCommandAsServer(otherId, new ClientJoinedNotificationPacket
+                        ushort hostId = HostClientId ?? 0;
+                        ushort[] currentRoster = _clients.Keys.ToArray();
+
+                        _manager.Interpreter.SendCommandAsServer(clientId, new ClientRosterSnapshotPacket
                         {
-                            RosterVersion = RosterVersion,
-                            ClientId = clientId
+                            RosterVersion = newVersion,
+                            HostClientId = hostId,
+                            ConnectedClientIds = currentRoster
                         }, DeliveryMethod.Reliable);
+
+                        foreach (var otherId in _clients.Keys)
+                        {
+                            if (otherId != clientId && otherId != ILiminalTransport.SERVER_ID)
+                            {
+                                _manager.Interpreter.SendCommandAsServer(otherId, new ClientJoinedNotificationPacket
+                                {
+                                    RosterVersion = newVersion,
+                                    ClientId = clientId
+                                }, DeliveryMethod.Reliable);
+                            }
+                        }
                     }
                 }
+            }
+
+            if (added)
+            {
+                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, client);
             }
         }
 
@@ -154,27 +166,35 @@ namespace Liminal.Net.Registry
         {
             if (!_manager.IsServer) return;
 
-            if (_clients.TryRemove(clientId, out var client))
+            ConnectedClient removedClient = null;
+
+            lock (_rosterLock)
             {
-                uint newVersion = (uint)Interlocked.Increment(ref _rosterVersion);
-                if (Volatile.Read(ref _hostClientId) == clientId)
+                if (_clients.TryRemove(clientId, out removedClient))
                 {
-                    Interlocked.Exchange(ref _hostClientId, 0);
-                }
-
-                LiminalAtomicHelpers.SafeInvoke(_onClientLeft, client);
-
-                foreach (var remainingId in _clients.Keys)
-                {
-                    if (remainingId != clientId && remainingId != ILiminalTransport.SERVER_ID)
+                    uint newVersion = (uint)Interlocked.Increment(ref _rosterVersion);
+                    if (Volatile.Read(ref _hostClientId) == clientId)
                     {
-                        _manager.Interpreter.SendCommandAsServer(remainingId, new ClientLeftNotificationPacket
+                        Interlocked.Exchange(ref _hostClientId, 0);
+                    }
+
+                    foreach (var remainingId in _clients.Keys)
+                    {
+                        if (remainingId != clientId && remainingId != ILiminalTransport.SERVER_ID)
                         {
-                            RosterVersion = newVersion,
-                            ClientId = clientId
-                        }, DeliveryMethod.Reliable);
+                            _manager.Interpreter.SendCommandAsServer(remainingId, new ClientLeftNotificationPacket
+                            {
+                                RosterVersion = newVersion,
+                                ClientId = clientId
+                            }, DeliveryMethod.Reliable);
+                        }
                     }
                 }
+            }
+
+            if (removedClient != null)
+            {
+                LiminalAtomicHelpers.SafeInvoke(_onClientLeft, removedClient);
             }
         }
 
@@ -182,15 +202,19 @@ namespace Liminal.Net.Registry
         {
             if (!_manager.IsServer) return;
 
-            ushort hostId = HostClientId ?? 0;
-            ushort[] currentRoster = _clients.Keys.ToArray();
-
-            _manager.Interpreter.SendCommandAsServer(senderId, new ClientRosterSnapshotPacket
+            lock (_rosterLock)
             {
-                RosterVersion = RosterVersion,
-                HostClientId = hostId,
-                ConnectedClientIds = currentRoster
-            }, DeliveryMethod.Reliable);
+                ushort hostId = HostClientId ?? 0;
+                ushort[] currentRoster = _clients.Keys.ToArray();
+                uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+
+                _manager.Interpreter.SendCommandAsServer(senderId, new ClientRosterSnapshotPacket
+                {
+                    RosterVersion = currentVersion,
+                    HostClientId = hostId,
+                    ConnectedClientIds = currentRoster
+                }, DeliveryMethod.Reliable);
+            }
         }
         #endregion
 
@@ -200,35 +224,54 @@ namespace Liminal.Net.Registry
             if (_manager.Role == NetworkRole.Host)
             {
                 Interlocked.Exchange(ref _hostClientId, localId);
-                if (_clients.TryGetValue(localId, out var existing))
+                ConnectedClient hostClientJoined = null;
+                ConnectedClient readyClient = null;
+
+                lock (_rosterLock)
                 {
-                    if (!existing.IsHost || !existing.IsLocal)
+                    if (_clients.TryGetValue(localId, out var existing))
                     {
-                        var updated = new ConnectedClient(localId, isLocal: true, isHost: true);
-                        _clients[localId] = updated;
-                        LocalClient = updated;
+                        if (!existing.IsHost || !existing.IsLocal)
+                        {
+                            var updated = new ConnectedClient(localId, isLocal: true, isHost: true);
+                            _clients[localId] = updated;
+                            LocalClient = updated;
+                        }
+                        else
+                        {
+                            LocalClient = existing;
+                        }
                     }
                     else
                     {
-                        LocalClient = existing;
+                        var hostClient = new ConnectedClient(localId, isLocal: true, isHost: true);
+                        _clients.TryAdd(localId, hostClient);
+                        LocalClient = hostClient;
+                        hostClientJoined = hostClient;
                     }
-                }
-                else
-                {
-                    var hostClient = new ConnectedClient(localId, isLocal: true, isHost: true);
-                    _clients.TryAdd(localId, hostClient);
-                    LocalClient = hostClient;
-                    LiminalAtomicHelpers.SafeInvoke(_onClientJoined, hostClient);
+
+                    readyClient = LocalClient;
                 }
 
-                LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, LocalClient);
+                if (hostClientJoined != null)
+                {
+                    LiminalAtomicHelpers.SafeInvoke(_onClientJoined, hostClientJoined);
+                }
+
+                LiminalAtomicHelpers.SafeInvoke(_onLocalClientReady, readyClient);
                 return;
             }
 
             var localClient = new ConnectedClient(localId, isLocal: true, isHost: false);
             LocalClient = localClient;
+            bool addedLocal;
 
-            if (_clients.TryAdd(localId, localClient))
+            lock (_rosterLock)
+            {
+                addedLocal = _clients.TryAdd(localId, localClient);
+            }
+
+            if (addedLocal)
             {
                 LiminalAtomicHelpers.SafeInvoke(_onClientJoined, localClient);
             }
@@ -245,50 +288,73 @@ namespace Liminal.Net.Registry
         {
             if (_manager.Role != NetworkRole.Client) return;
 
-            uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
-            if (packet.RosterVersion < currentVersion)
-            {
-                // Stale snapshot; current state is already newer
-                return;
-            }
+            List<ConnectedClient> leftClients = null;
+            List<ConnectedClient> joinedClients = null;
 
-            Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
-            Interlocked.Exchange(ref _hostClientId, packet.HostClientId);
-
-            var snapshotSet = new HashSet<ushort>(packet.ConnectedClientIds);
-            foreach (var kvp in _clients)
+            lock (_rosterLock)
             {
-                if (!snapshotSet.Contains(kvp.Key))
+                uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+                if (packet.RosterVersion < currentVersion)
                 {
-                    if (_clients.TryRemove(kvp.Key, out var removed))
+                    return;
+                }
+
+                Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
+                Interlocked.Exchange(ref _hostClientId, packet.HostClientId);
+
+                var snapshotSet = new HashSet<ushort>(packet.ConnectedClientIds);
+                foreach (var kvp in _clients)
+                {
+                    if (!snapshotSet.Contains(kvp.Key))
                     {
-                        LiminalAtomicHelpers.SafeInvoke(_onClientLeft, removed);
+                        if (_clients.TryRemove(kvp.Key, out var removed))
+                        {
+                            leftClients ??= new List<ConnectedClient>();
+                            leftClients.Add(removed);
+                        }
+                    }
+                }
+
+                foreach (var id in packet.ConnectedClientIds)
+                {
+                    bool isLocal = id == _manager.localID;
+                    bool isHost = HostClientId.HasValue && id == HostClientId.Value;
+
+                    if (_clients.TryGetValue(id, out var existing))
+                    {
+                        if (existing.IsHost != isHost || existing.IsLocal != isLocal)
+                        {
+                            var updated = new ConnectedClient(id, isLocal, isHost);
+                            _clients[id] = updated;
+                            if (isLocal) LocalClient = updated;
+                        }
+                    }
+                    else
+                    {
+                        var newClient = new ConnectedClient(id, isLocal, isHost);
+                        if (_clients.TryAdd(id, newClient))
+                        {
+                            if (isLocal) LocalClient = newClient;
+                            joinedClients ??= new List<ConnectedClient>();
+                            joinedClients.Add(newClient);
+                        }
                     }
                 }
             }
 
-            foreach (var id in packet.ConnectedClientIds)
+            if (leftClients != null)
             {
-                bool isLocal = id == _manager.localID;
-                bool isHost = HostClientId.HasValue && id == HostClientId.Value;
-
-                if (_clients.TryGetValue(id, out var existing))
+                for (int i = 0; i < leftClients.Count; i++)
                 {
-                    if (existing.IsHost != isHost || existing.IsLocal != isLocal)
-                    {
-                        var updated = new ConnectedClient(id, isLocal, isHost);
-                        _clients[id] = updated;
-                        if (isLocal) LocalClient = updated;
-                    }
+                    LiminalAtomicHelpers.SafeInvoke(_onClientLeft, leftClients[i]);
                 }
-                else
+            }
+
+            if (joinedClients != null)
+            {
+                for (int i = 0; i < joinedClients.Count; i++)
                 {
-                    var newClient = new ConnectedClient(id, isLocal, isHost);
-                    if (_clients.TryAdd(id, newClient))
-                    {
-                        if (isLocal) LocalClient = newClient;
-                        LiminalAtomicHelpers.SafeInvoke(_onClientJoined, newClient);
-                    }
+                    LiminalAtomicHelpers.SafeInvoke(_onClientJoined, joinedClients[i]);
                 }
             }
         }
@@ -297,28 +363,45 @@ namespace Liminal.Net.Registry
         {
             if (_manager.Role != NetworkRole.Client) return;
 
-            uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
-            if (packet.RosterVersion <= currentVersion)
+            ConnectedClient joinedClient = null;
+            bool requestReconcile = false;
+
+            lock (_rosterLock)
             {
-                // Stale or duplicate delta packet
-                return;
+                uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+                if (packet.RosterVersion <= currentVersion)
+                {
+                    return;
+                }
+
+                if (packet.RosterVersion > currentVersion + 1)
+                {
+                    requestReconcile = true;
+                }
+                else
+                {
+                    Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
+                    bool isHost = HostClientId.HasValue && packet.ClientId == HostClientId.Value;
+                    bool isLocal = packet.ClientId == _manager.localID;
+
+                    var client = new ConnectedClient(packet.ClientId, isLocal, isHost);
+                    if (_clients.TryAdd(packet.ClientId, client))
+                    {
+                        if (isLocal) LocalClient = client;
+                        joinedClient = client;
+                    }
+                }
             }
 
-            if (packet.RosterVersion > currentVersion + 1)
+            if (requestReconcile)
             {
                 RequestRosterReconciliation();
                 return;
             }
 
-            Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
-            bool isHost = HostClientId.HasValue && packet.ClientId == HostClientId.Value;
-            bool isLocal = packet.ClientId == _manager.localID;
-
-            var client = new ConnectedClient(packet.ClientId, isLocal, isHost);
-            if (_clients.TryAdd(packet.ClientId, client))
+            if (joinedClient != null)
             {
-                if (isLocal) LocalClient = client;
-                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, client);
+                LiminalAtomicHelpers.SafeInvoke(_onClientJoined, joinedClient);
             }
         }
 
@@ -326,23 +409,40 @@ namespace Liminal.Net.Registry
         {
             if (_manager.Role != NetworkRole.Client) return;
 
-            uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
-            if (packet.RosterVersion <= currentVersion)
+            ConnectedClient leftClient = null;
+            bool requestReconcile = false;
+
+            lock (_rosterLock)
             {
-                // Stale or duplicate delta packet
-                return;
+                uint currentVersion = (uint)Volatile.Read(ref _rosterVersion);
+                if (packet.RosterVersion <= currentVersion)
+                {
+                    return;
+                }
+
+                if (packet.RosterVersion > currentVersion + 1)
+                {
+                    requestReconcile = true;
+                }
+                else
+                {
+                    Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
+                    if (_clients.TryRemove(packet.ClientId, out var client))
+                    {
+                        leftClient = client;
+                    }
+                }
             }
 
-            if (packet.RosterVersion > currentVersion + 1)
+            if (requestReconcile)
             {
                 RequestRosterReconciliation();
                 return;
             }
 
-            Volatile.Write(ref _rosterVersion, (int)packet.RosterVersion);
-            if (_clients.TryRemove(packet.ClientId, out var client))
+            if (leftClient != null)
             {
-                LiminalAtomicHelpers.SafeInvoke(_onClientLeft, client);
+                LiminalAtomicHelpers.SafeInvoke(_onClientLeft, leftClient);
             }
         }
 

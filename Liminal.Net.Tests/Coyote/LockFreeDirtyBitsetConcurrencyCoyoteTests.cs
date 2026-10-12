@@ -171,6 +171,150 @@ namespace Liminal.Net.Tests.Coyote
             Specification.Assert(!bitset.TryConsumeBucket(0, out _), "Bucket 0 should be empty after final drain.");
         }
 
+        [CoyoteTest]
+        public static async Task Coyote_SlotBitset_ConcurrentAllocateAndFree_ZeroCollisionsOrLeaks()
+        {
+            const int capacity = 128;
+            var slotBitset = new LockFreeSlotBitset(capacity);
+            var occupied = new int[capacity];
+
+            const int workers = 4;
+            const int opsPerWorker = 20;
+            var tasks = new Task[workers];
+
+            for (int w = 0; w < workers; w++)
+            {
+                tasks[w] = Task.Run(async () =>
+                {
+                    for (int i = 0; i < opsPerWorker; i++)
+                    {
+                        if (slotBitset.TryAllocate(out ushort slot))
+                        {
+                            int count = Interlocked.Increment(ref occupied[slot]);
+                            Specification.Assert(count == 1, $"Slot collision detected on slot {slot}!");
+
+                            await Task.Yield();
+
+                            int released = Interlocked.Decrement(ref occupied[slot]);
+                            Specification.Assert(released == 0, $"Slot state corruption on release of slot {slot}!");
+                            slotBitset.Free(slot);
+                        }
+                        await Task.Yield();
+                    }
+                });
+            }
+
+            await Task.WhenAll(tasks);
+
+            Specification.Assert(slotBitset.CountAllocated() == 0, "Slot leak detected: count is not zero after all workers completed.");
+            for (int i = 0; i < capacity; i++)
+            {
+                Specification.Assert(Volatile.Read(ref occupied[i]) == 0, $"Occupancy tracker leaked for slot {i}.");
+            }
+        }
+
+        [CoyoteTest]
+        public static async Task Coyote_DirtyBitset_HardwareScanAtFlush_AllBitsExtractedCorrectly()
+        {
+            var bitset = new LockFreeDirtyBitset(128);
+            const int workers = 3;
+            const int iterations = 15;
+
+            long expectedBucket0 = 0;
+            long expectedBucket1 = 0;
+
+            for (ushort id = 0; id < 40; id++)
+                expectedBucket0 |= (1L << id);
+            for (ushort id = 64; id < 100; id++)
+                expectedBucket1 |= (1L << (id - 64));
+
+            long scannedBucket0 = 0;
+            long scannedBucket1 = 0;
+            int flusherRunning = 1;
+
+            var workerTasks = new Task[workers];
+            workerTasks[0] = Task.Run(async () =>
+            {
+                for (int iter = 0; iter < iterations; iter++)
+                {
+                    for (ushort id = 0; id < 25; id++)
+                    {
+                        bitset.SetDirty(id);
+                        await Task.Yield();
+                    }
+                }
+            });
+
+            workerTasks[1] = Task.Run(async () =>
+            {
+                for (int iter = 0; iter < iterations; iter++)
+                {
+                    for (ushort id = 20; id < 40; id++)
+                    {
+                        bitset.SetDirty(id);
+                        await Task.Yield();
+                    }
+                }
+            });
+
+            workerTasks[2] = Task.Run(async () =>
+            {
+                for (int iter = 0; iter < iterations; iter++)
+                {
+                    for (ushort id = 64; id < 100; id++)
+                    {
+                        bitset.SetDirty(id);
+                        await Task.Yield();
+                    }
+                }
+            });
+
+            var flusher = Task.Run(async () =>
+            {
+                while (Volatile.Read(ref flusherRunning) == 1)
+                {
+                    for (int b = 0; b < 2; b++)
+                    {
+                        if (bitset.IsBucketEmpty(b)) continue;
+                        if (!bitset.TryConsumeBucket(b, out long mask)) continue;
+
+                        ulong umask = (ulong)mask;
+                        while (umask != 0)
+                        {
+                            int bit = Liminal.Net.Core.BitOperationsCompat.TrailingZeroCount(umask);
+                            if (b == 0) InterlockedHelperOr(ref scannedBucket0, 1L << bit);
+                            else InterlockedHelperOr(ref scannedBucket1, 1L << bit);
+                            umask &= (umask - 1);
+                        }
+                    }
+                    await Task.Yield();
+                }
+            });
+
+            await Task.WhenAll(workerTasks);
+            Volatile.Write(ref flusherRunning, 0);
+            await flusher;
+
+            // Final drain
+            for (int b = 0; b < 2; b++)
+            {
+                if (bitset.TryConsumeBucket(b, out long mask))
+                {
+                    ulong umask = (ulong)mask;
+                    while (umask != 0)
+                    {
+                        int bit = Liminal.Net.Core.BitOperationsCompat.TrailingZeroCount(umask);
+                        if (b == 0) InterlockedHelperOr(ref scannedBucket0, 1L << bit);
+                        else InterlockedHelperOr(ref scannedBucket1, 1L << bit);
+                        umask &= (umask - 1);
+                    }
+                }
+            }
+
+            Specification.Assert(scannedBucket0 == expectedBucket0, $"Bit scan mismatch in bucket 0. Expected: 0x{expectedBucket0:X}, Got: 0x{scannedBucket0:X}");
+            Specification.Assert(scannedBucket1 == expectedBucket1, $"Bit scan mismatch in bucket 1. Expected: 0x{expectedBucket1:X}, Got: 0x{scannedBucket1:X}");
+        }
+
         private static void InterlockedHelperOr(ref long target, long mask)
         {
             long current = Volatile.Read(ref target);

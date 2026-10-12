@@ -564,9 +564,16 @@ namespace Liminal.Net.Core
             return BeginBitStream(targetClientIds, in meta, deliveryMethod);
         }
 
+        private static int GetSessionCapacity(LiminalNetworkManager manager)
+        {
+            int active = manager.SessionManager?.GetActiveSessionCount() ?? 0;
+            int maxConfig = (manager.Transport?.Config?.MaxConnectionCount ?? manager.Config?.MaxConnectionCount ?? 10) + 4;
+            return Math.Max(active + 4, maxConfig);
+        }
+
         private static void ResolveAndSendMulticast<T>(LiminalNetworkManager manager, SendTo target, T packet, DeliveryMethod deliveryMethod) where T : struct
         {
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(manager);
             Span<ushort> filteredTargets = stackalloc ushort[maxClients];
             int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
 
@@ -586,7 +593,7 @@ namespace Liminal.Net.Core
 
         private static void ResolveAndSendBitStreamMulticast<TMeta>(LiminalNetworkManager manager, SendTo target, in TMeta meta, ReadOnlySpan<byte> bitstream, DeliveryMethod deliveryMethod) where TMeta : struct
         {
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(manager);
             Span<ushort> filteredTargets = stackalloc ushort[maxClients];
             int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
 
@@ -606,7 +613,7 @@ namespace Liminal.Net.Core
 
         private static void ResolveAndSendBitStreamActionMulticast<TMeta>(LiminalNetworkManager manager, SendTo target, in TMeta meta, BitStreamAction packAction, DeliveryMethod deliveryMethod) where TMeta : struct
         {
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(manager);
             Span<ushort> filteredTargets = stackalloc ushort[maxClients];
             int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
 
@@ -619,7 +626,7 @@ namespace Liminal.Net.Core
 
         private static void ResolveAndSendBitStreamActionStateMulticast<TMeta, TState>(LiminalNetworkManager manager, SendTo target, in TMeta meta, in TState state, BitStreamAction<TState> packAction, DeliveryMethod deliveryMethod) where TMeta : struct
         {
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(manager);
             Span<ushort> filteredTargets = stackalloc ushort[maxClients];
             int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
 
@@ -632,7 +639,7 @@ namespace Liminal.Net.Core
 
         internal static void ResolveAndSendBitStream(LiminalNetworkManager manager, SendTo target, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod)
         {
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(manager);
             Span<ushort> filteredTargets = stackalloc ushort[maxClients];
             int targetCount = ResolveTargets(manager, target, filteredTargets, out bool sendAsClient);
 
@@ -645,7 +652,7 @@ namespace Liminal.Net.Core
         private static int ResolveTargets(LiminalNetworkManager manager, SendTo target, Span<ushort> destination, out bool sendAsClient)
         {
             sendAsClient = false;
-            int maxClients = manager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(manager);
             Span<ushort> allSessions = stackalloc ushort[maxClients];
             int totalSessions = manager.SessionManager.GetSessionIds(allSessions);
 

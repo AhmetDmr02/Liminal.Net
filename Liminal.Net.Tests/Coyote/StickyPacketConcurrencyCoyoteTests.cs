@@ -170,5 +170,201 @@ namespace Liminal.Net.Tests.Coyote
                 manager.Shutdown();
             }
         }
+
+        [CoyoteTest]
+        [NUnitTest]
+        public static async Task Coyote_StickyPacket_ConcurrentDispatchAndClearSticky_ZeroMemoryCorruptionOrTear()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config);
+            var interpreter = manager.Interpreter;
+
+            try
+            {
+                LiminalPacketLibrary.Initialize();
+                ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<TestStickyCounterPacket>());
+
+                const int iterations = 15;
+                int readSuccessCount = 0;
+
+                var writerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        var packet = new TestStickyCounterPacket { Counter = i };
+                        byte[] bytes = MessagePackSerializer.Serialize(packet);
+                        interpreter.Dispatch(packetId, 1, bytes);
+                        await Task.Yield();
+                    }
+                });
+
+                var clearerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations / 2; i++)
+                    {
+                        interpreter.ClearSticky<TestStickyCounterPacket>();
+                        await Task.Yield();
+                    }
+                });
+
+                var readerTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        if (interpreter.TryGetSticky<TestStickyCounterPacket>(out var pkt, out var sender))
+                        {
+                            Interlocked.Increment(ref readSuccessCount);
+                            Specification.Assert(pkt.Counter >= 0 && pkt.Counter < iterations,
+                                $"Invalid counter {pkt.Counter} read during concurrent clear/dispatch");
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(writerTask, clearerTask, readerTask);
+            }
+            finally
+            {
+                manager.Shutdown();
+            }
+        }
+
+        [CoyoteTest]
+        [NUnitTest]
+        public static async Task Coyote_StickyPacket_DynamicPayloadBufferGrowth_ZeroBufferLeakOrTear()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config);
+            var interpreter = manager.Interpreter;
+
+            try
+            {
+                LiminalPacketLibrary.Initialize();
+                ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<TestStickyStatePacket>());
+
+                const int iterations = 10;
+                int receivedCount = 0;
+                int malformedDetections = 0;
+
+                object sub = new object();
+                interpreter.Subscribe<TestStickyStatePacket>((pkt, sender) =>
+                {
+                    Interlocked.Increment(ref receivedCount);
+                    if (string.IsNullOrEmpty(pkt.StateName) || pkt.StateName.Length != pkt.StateId)
+                    {
+                        Interlocked.Increment(ref malformedDetections);
+                    }
+                }, sub);
+
+                var smallTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        int len = 8 + (i % 4);
+                        var packet = new TestStickyStatePacket { StateId = len, StateName = new string('S', len) };
+                        byte[] bytes = MessagePackSerializer.Serialize(packet);
+                        interpreter.Dispatch(packetId, 1, bytes);
+                        await Task.Yield();
+                    }
+                });
+
+                var largeTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations; i++)
+                    {
+                        int len = 256 + (i * 16);
+                        var packet = new TestStickyStatePacket { StateId = len, StateName = new string('L', len) };
+                        byte[] bytes = MessagePackSerializer.Serialize(packet);
+                        interpreter.Dispatch(packetId, 2, bytes);
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(smallTask, largeTask);
+
+                Specification.Assert(malformedDetections == 0,
+                    $"Detected {malformedDetections} malformed or torn payloads during concurrent buffer expansion.");
+                Specification.Assert(receivedCount > 0, "Subscriber must have processed packets.");
+            }
+            finally
+            {
+                manager.Shutdown();
+            }
+        }
+
+        [CoyoteTest]
+        [NUnitTest]
+        public static async Task Coyote_StickyPacket_ConcurrentSubscribeUnsubscribeAndClearAllSticky_ZeroDeadlock()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config);
+            var interpreter = manager.Interpreter;
+
+            try
+            {
+                LiminalPacketLibrary.Initialize();
+                ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<TestStickyCounterPacket>());
+
+                const int cycles = 8;
+
+                var subTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < cycles; i++)
+                    {
+                        object subObj = new object();
+                        interpreter.Subscribe<TestStickyCounterPacket>((pkt, s) => { }, subObj);
+                        await Task.Yield();
+                        interpreter.Unsubscribe<TestStickyCounterPacket>(subObj);
+                        await Task.Yield();
+                    }
+                });
+
+                var dispatchTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < cycles; i++)
+                    {
+                        var packet = new TestStickyCounterPacket { Counter = i };
+                        interpreter.Dispatch(packetId, 1, MessagePackSerializer.Serialize(packet));
+                        await Task.Yield();
+                    }
+                });
+
+                var clearTask = Task.Run(async () =>
+                {
+                    for (int i = 0; i < cycles / 2; i++)
+                    {
+                        interpreter.ClearAllSticky();
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(subTask, dispatchTask, clearTask);
+            }
+            finally
+            {
+                manager.Shutdown();
+            }
+        }
     }
 }

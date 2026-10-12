@@ -1,5 +1,6 @@
-﻿using Liminal.Net.Core;
+using Liminal.Net.Core;
 using System;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,6 +26,8 @@ namespace Liminal.Net.Interfaces
         public bool IsConnected { get; }
 
         public LiminalNetworkConfig Config { get; }
+
+        public EndPoint? LocalEndpoint => null;
 
         #region Connection State
         public bool IsClientConnected(ushort clientId);

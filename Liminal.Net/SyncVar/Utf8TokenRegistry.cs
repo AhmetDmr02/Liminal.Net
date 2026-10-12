@@ -133,6 +133,10 @@ namespace Liminal.Net.SyncVar
                 }
 
                 string decoded = Encoding.UTF8.GetString(tokenSpan);
+                if (table.Count >= 2048)
+                {
+                    return decoded;
+                }
                 byte[] bytes = tokenSpan.ToArray();
 
                 var oldEntries = table.Entries;

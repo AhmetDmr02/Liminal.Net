@@ -16,6 +16,12 @@ namespace Liminal.Net.Core
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int TrailingZeroCount(int value) => System.Numerics.BitOperations.TrailingZeroCount(value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int PopCount(ulong value) => System.Numerics.BitOperations.PopCount(value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int PopCount(uint value) => System.Numerics.BitOperations.PopCount(value);
 #else
         // 64-bit De Bruijn lookup table matching .NET Core runtime implementation
         private static readonly byte[] TrailingZeroCountDeBruijn = new byte[64]
@@ -49,6 +55,22 @@ namespace Liminal.Net.Core
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int TrailingZeroCount(int value) => TrailingZeroCount((uint)value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int PopCount(ulong value)
+        {
+            const ulong c1 = 0x5555555555555555UL;
+            const ulong c2 = 0x3333333333333333UL;
+            const ulong c4 = 0x0F0F0F0F0F0F0F0FUL;
+            const ulong c5 = 0x0101010101010101UL;
+            value -= (value >> 1) & c1;
+            value = (value & c2) + ((value >> 2) & c2);
+            value = (value + (value >> 4)) & c4;
+            return (int)((value * c5) >> 56);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int PopCount(uint value) => PopCount((ulong)value);
 #endif
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

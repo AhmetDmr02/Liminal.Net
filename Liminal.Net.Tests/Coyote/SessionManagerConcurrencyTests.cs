@@ -949,5 +949,49 @@ namespace Liminal.Net.Tests
 
             await Task.WhenAll(sender1, sender2, tickerWorker, queryWorker);
         }
+
+        [Test]
+        public static async Task Coyote_SessionManager_ConcurrentDisconnectAndTryGetOrAllocate_ZeroResurrection()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                MaxPacketSizePerBatch = 256,
+                MaxPacketCount = 10,
+                MaxConnectionCount = 4,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var sessionManager = netManager.SessionManager;
+            ushort clientId = 2;
+
+            transport.TriggerClientConnected(clientId);
+            Specification.Assert(sessionManager.HasSession(clientId), "Session must exist initially.");
+
+            byte[] dummyData = new byte[16];
+
+            var taskDisconnect = Task.Run(() =>
+            {
+                transport.TriggerClientDisconnected(clientId);
+            });
+
+            var taskReceive = Task.Run(() =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    transport.TriggerMessageReceived(dummyData, clientId);
+                }
+            });
+
+            await Task.WhenAll(taskDisconnect, taskReceive);
+
+            Specification.Assert(!sessionManager.HasSession(clientId),
+                $"Disconnected client {clientId} was resurrected in active sessions!");
+            Specification.Assert(!transport.IsClientConnected(clientId),
+                $"Client {clientId} must be disconnected on transport.");
+
+            netManager.Shutdown();
+        }
     }
 }

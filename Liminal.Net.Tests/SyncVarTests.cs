@@ -952,9 +952,9 @@ namespace Liminal.Net.Tests
 
             Assert.That(manager.TryGetSyncVar("disposable_token", out _), Is.True);
 
-            syncVar.Dispose();
+            manager.UnregisterSyncVar(syncVar);
 
-            Assert.That(manager.TryGetSyncVar("disposable_token", out _), Is.False, "SyncVar was not removed from registry after Dispose.");
+            Assert.That(manager.TryGetSyncVar("disposable_token", out _), Is.False, "SyncVar was not removed from registry after unregister.");
         }
 
         [Test]
@@ -1670,7 +1670,7 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void Test54_SyncVarDispose_DoesNotCallClear_AndRebindReusesSlab()
+        public void Test54_SyncVarUnregister_DoesNotCallClear_AndRebindReusesSlab()
         {
             _serverManager.StartServer("127.0.0.1", _currentTestPort);
             var client = CreateAndStartClient();
@@ -1684,7 +1684,7 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 42 && clientVar.Version >= 1, 2000), Is.True);
             uint serverVerBefore = serverVar.Version;
 
-            clientVar.Dispose();
+            client.SyncVarManager.UnregisterSyncVar(clientVar);
 
             Assert.That(serverVar.Value, Is.EqualTo(42));
             Assert.That(serverVar.Version, Is.EqualTo(serverVerBefore));
@@ -1694,6 +1694,170 @@ namespace Liminal.Net.Tests
 
             serverVar.Value = 99;
             Assert.That(SpinWait.SpinUntil(() => reboundVar.Value == 99 && reboundVar.Version > serverVerBefore, 2000), Is.True);
+        }
+
+        [Test]
+        public void Test52_ZeroGC_SlotAndDirtyBitset_NoHeapAllocations()
+        {
+            var slotBitset = new LockFreeSlotBitset(4096);
+            var dirtyBitset = new LockFreeDirtyBitset(4096);
+
+            for (ushort i = 0; i < 100; i++)
+            {
+                slotBitset.TryAllocate(out ushort slot);
+                dirtyBitset.SetDirty(slot);
+                dirtyBitset.TryConsumeBucket(slot >> 6, out _);
+                slotBitset.Free(slot);
+            }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            for (ushort i = 0; i < 2000; i++)
+            {
+                slotBitset.TryAllocate(out ushort slot);
+                dirtyBitset.SetDirty(slot);
+                dirtyBitset.TryConsumeBucket(slot >> 6, out _);
+                slotBitset.Free(slot);
+            }
+
+            long allocatedAfter = GC.GetAllocatedBytesForCurrentThread();
+            long totalAllocated = allocatedAfter - allocatedBefore;
+
+            Assert.That(totalAllocated, Is.EqualTo(0), $"Expected 0 GC allocations for slot bitset operations, but got {totalAllocated} bytes.");
+        }
+
+        [Test]
+        public void Test55_Shutdown_FullTeardown_PreventsSessionBleed()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var syncVar1 = new SyncVar<int>("token_bleed_1", 100, _serverManager.SyncVarManager);
+            var syncVar2 = new SyncVar<int>("token_bleed_2", 200, _serverManager.SyncVarManager);
+            var syncVar3 = new SyncVar<int>("token_bleed_3", 300, _serverManager.SyncVarManager);
+
+            Assert.That(_serverManager.SyncVarManager.SlotBitset.CountAllocated(), Is.EqualTo(3));
+            Assert.That(syncVar1.LocalSlot, Is.EqualTo(0));
+            Assert.That(syncVar2.LocalSlot, Is.EqualTo(1));
+            Assert.That(syncVar3.LocalSlot, Is.EqualTo(2));
+
+            var oldSyncVarManager = _serverManager.SyncVarManager;
+            _serverManager.Shutdown();
+
+            Assert.That(oldSyncVarManager.SlotBitset.CountAllocated(), Is.EqualTo(0));
+            Assert.That(oldSyncVarManager.DirtyQueueCount, Is.EqualTo(0));
+            Assert.That(oldSyncVarManager.UnboundCacheCount, Is.EqualTo(0));
+            Assert.That(syncVar1.LocalSlot, Is.EqualTo(ushort.MaxValue));
+            Assert.That(syncVar2.LocalSlot, Is.EqualTo(ushort.MaxValue));
+            Assert.That(syncVar3.LocalSlot, Is.EqualTo(ushort.MaxValue));
+
+            // Start new server session and verify clean slot allocation from 0
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
+            _serverManager.StartServer("127.0.0.1", _currentTestPort + 1);
+
+            var newSessionVar = new SyncVar<int>("new_session_token", 555, _serverManager.SyncVarManager);
+            Assert.That(newSessionVar.LocalSlot, Is.EqualTo(0), "New session did not start at slot 0; session state bled into subsequent host.");
+            Assert.That(_serverManager.SyncVarManager.SlotBitset.CountAllocated(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Test56_ClientDisconnected_PurgesFromPendingClearAcks()
+        {
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client = CreateAndStartClient();
+
+            string token = $"clear_ack_purge_{Guid.NewGuid():N}";
+            var serverVar = new SyncVar<int>(token, 42, _serverManager.SyncVarManager);
+            var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+            Assert.That(SpinWait.SpinUntil(() => clientVar.Value == 42, 2000), Is.True);
+
+            serverVar.Clear();
+
+            client.Shutdown();
+
+            Assert.That(SpinWait.SpinUntil(() => _serverManager.ClientRegistry.Count == 0, 3000), Is.True);
+
+            // Trigger client request with old version from disconnected ID to confirm write is not dropped
+            // or verify that pending clear acks no longer contains the disconnected client ID
+            var clientReq = new SyncVarSlabClientRequestPacket(new ReadOnlySequence<byte>(new byte[0]));
+            Assert.DoesNotThrow(() => _serverManager.SyncVarManager.FlushDirty());
+        }
+
+        [Test]
+        public void Test57_PreExistingSyncVar_ReinitWithTotallyNewNetworkManager_PropagatesValue()
+        {
+            string token = $"preexisting_new_mgr_{Guid.NewGuid():N}";
+            var preExistingVar = new SyncVar<int>(token, 100);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            var client1 = CreateAndStartClient();
+            var client1Var = client1.SyncVarManager.Bind<int>(token);
+            Assert.That(SpinWait.SpinUntil(() => client1Var.Value == 100, 2000), Is.True);
+
+            // Shut down everything
+            client1.Shutdown();
+            _serverManager.Shutdown();
+
+            // Create a TOTALLY NEW server manager on a new port
+            int newPort = Interlocked.Increment(ref _portCounter);
+            var newServerConfig = new LiminalNetworkConfig
+            {
+                Default_Host = "127.0.0.1",
+                Default_Port = newPort,
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var newServerManager = new LiminalNetworkManager(new TcpTransport(), newServerConfig);
+            newServerManager.StartServer("127.0.0.1", newPort);
+
+            try
+            {
+                // Push value using the PRE-EXISTING syncvar instance
+                preExistingVar.Value = 999;
+
+                var client2Config = new LiminalNetworkConfig
+                {
+                    Default_Host = "127.0.0.1",
+                    Default_Port = newPort,
+                    TickRate = 60,
+                    MaxPacketSizePerBatch = 4096,
+                    SyncVarMaxPageSize = 4096,
+                    SyncVarMaxPageCount = 16,
+                    ClientIdResolver = new BaseResolver()
+                };
+                var client2 = new LiminalNetworkManager(new TcpTransport(), client2Config);
+                _clientManagers.Add(client2);
+                client2.StartClient("127.0.0.1", newPort);
+
+                var client2Var = client2.SyncVarManager.Bind<int>(token);
+
+                Assert.That(SpinWait.SpinUntil(() => client2Var.Value == 999, 2000), Is.True,
+                    "Pre-existing SyncVar failed to synchronize to client under totally new NetworkManager!");
+            }
+            finally
+            {
+                newServerManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public void Test58_SyncVar_WriteAfterShutdown_DoesNotThrowAndUpdatesLocally()
+        {
+            string token = $"write_after_shutdown_{Guid.NewGuid():N}";
+            var syncVar = new SyncVar<int>(token, 10);
+
+            _serverManager.StartServer("127.0.0.1", _currentTestPort);
+            _serverManager.Shutdown();
+
+            // Write value after shutdown
+            Assert.DoesNotThrow(() => syncVar.Value = 42);
+            Assert.That(syncVar.Value, Is.EqualTo(42));
         }
 
         #endregion

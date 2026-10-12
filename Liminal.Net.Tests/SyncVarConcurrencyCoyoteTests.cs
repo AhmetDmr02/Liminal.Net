@@ -2,7 +2,9 @@ using Liminal.Net.BasePackets;
 using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
+using Liminal.Net.Misc;
 using Liminal.Net.SyncVar;
+using Liminal.Net.SyncVar.Internal;
 using Liminal.Net.Test;
 using MessagePack;
 using Microsoft.Coyote.Specifications;
@@ -448,87 +450,97 @@ namespace Liminal.Net.Tests.Coyote
         [Test]
         public static async Task Coyote_Utf8TokenRegistry_ConcurrentReadersAndWriters_NoRaceOrDeadlock()
         {
-            var registry = new Utf8TokenRegistry(8); 
+            var config = new LiminalNetworkConfig();
+            var syncVarManager = new SyncVarManager(null, config);
 
-            const int preSeedCount = 10;
-            for (int i = 0; i < preSeedCount; i++)
+            try
             {
-                registry.TryAdd(new SyncVar<int>($"seed_token_{i}", i));
+                var registry = new Utf8TokenRegistry(8); 
+
+                const int preSeedCount = 10;
+                for (int i = 0; i < preSeedCount; i++)
+                {
+                    registry.TryAdd(new SyncVar<int>($"seed_token_{i}", i, syncVarManager));
+                }
+
+                const int workerIterations = 15;
+                int successfulReads = 0;
+                int failedReads = 0;
+
+                var reader1 = Task.Run(async () =>
+                {
+                    byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("seed_token_5");
+                    byte[] nonExistent = System.Text.Encoding.UTF8.GetBytes("missing_token");
+
+                    for (int i = 0; i < workerIterations; i++)
+                    {
+                        if (registry.TryGet(targetBytes.AsSpan(), out var syncVar))
+                        {
+                            Interlocked.Increment(ref successfulReads);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref failedReads);
+                        }
+
+                        _ = registry.TryGet(nonExistent.AsSpan(), out _);
+                        await Task.Yield();
+                    }
+                });
+
+                var reader2 = Task.Run(async () =>
+                {
+                    byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("seed_token_2");
+
+                    for (int i = 0; i < workerIterations; i++)
+                    {
+                        if (registry.TryGet(targetBytes.AsSpan(), out var syncVar))
+                        {
+                            Interlocked.Increment(ref successfulReads);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref failedReads);
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                // Writer 1: Adds new tokens and removes some, forcing resizes
+                var writer1 = Task.Run(async () =>
+                {
+                    for (int i = 0; i < workerIterations; i++)
+                    {
+                        registry.TryAdd(new SyncVar<int>($"w1_token_{i}", i, syncVarManager));
+                        if (i > 3)
+                        {
+                            registry.TryRemove($"w1_token_{i - 3}", out _);
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                // Writer 2: Adds different new tokens
+                var writer2 = Task.Run(async () =>
+                {
+                    for (int i = 0; i < workerIterations; i++)
+                    {
+                        registry.TryAdd(new SyncVar<int>($"w2_token_{i}", i, syncVarManager));
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(reader1, reader2, writer1, writer2);
+
+                Specification.Assert(failedReads == 0,
+                    $"Pre-seeded token was not found during concurrent operations. Failed reads: {failedReads}");
+                Specification.Assert(successfulReads == workerIterations * 2,
+                    $"Expected {workerIterations * 2} successful reads, got {successfulReads}");
             }
-
-            const int workerIterations = 15;
-            int successfulReads = 0;
-            int failedReads = 0;
-
-            var reader1 = Task.Run(async () =>
+            finally
             {
-                byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("seed_token_5");
-                byte[] nonExistent = System.Text.Encoding.UTF8.GetBytes("missing_token");
-
-                for (int i = 0; i < workerIterations; i++)
-                {
-                    if (registry.TryGet(targetBytes.AsSpan(), out var syncVar))
-                    {
-                        Interlocked.Increment(ref successfulReads);
-                    }
-                    else
-                    {
-                        Interlocked.Increment(ref failedReads);
-                    }
-
-                    _ = registry.TryGet(nonExistent.AsSpan(), out _);
-                    await Task.Yield();
-                }
-            });
-
-            var reader2 = Task.Run(async () =>
-            {
-                byte[] targetBytes = System.Text.Encoding.UTF8.GetBytes("seed_token_2");
-
-                for (int i = 0; i < workerIterations; i++)
-                {
-                    if (registry.TryGet(targetBytes.AsSpan(), out var syncVar))
-                    {
-                        Interlocked.Increment(ref successfulReads);
-                    }
-                    else
-                    {
-                        Interlocked.Increment(ref failedReads);
-                    }
-                    await Task.Yield();
-                }
-            });
-
-            // Writer 1: Adds new tokens and removes some, forcing resizes
-            var writer1 = Task.Run(async () =>
-            {
-                for (int i = 0; i < workerIterations; i++)
-                {
-                    registry.TryAdd(new SyncVar<int>($"w1_token_{i}", i));
-                    if (i > 3)
-                    {
-                        registry.TryRemove($"w1_token_{i - 3}", out _);
-                    }
-                    await Task.Yield();
-                }
-            });
-
-            // Writer 2: Adds different new tokens
-            var writer2 = Task.Run(async () =>
-            {
-                for (int i = 0; i < workerIterations; i++)
-                {
-                    registry.TryAdd(new SyncVar<int>($"w2_token_{i}", i));
-                    await Task.Yield();
-                }
-            });
-
-            await Task.WhenAll(reader1, reader2, writer1, writer2);
-
-            Specification.Assert(failedReads == 0,
-                $"Pre-seeded token was not found during concurrent operations. Failed reads: {failedReads}");
-            Specification.Assert(successfulReads == workerIterations * 2,
-                $"Expected {workerIterations * 2} successful reads, got {successfulReads}");
+                syncVarManager.FullTeardown();
+            }
         }
 
         [Test]
@@ -1599,39 +1611,49 @@ namespace Liminal.Net.Tests.Coyote
         [Test]
         public static async Task Coyote_SyncVar_VersionAndValue_AtomicPublication_NoVersionValueDesync()
         {
-            var sv = new SyncVar<int>("desync_test", 0);
+            var config = new LiminalNetworkConfig();
+            var syncVarManager = new SyncVarManager(null, config);
 
-            const int iterations = 30;
-            int desyncObserved = 0;
-
-            var writer = Task.Run(async () =>
+            try
             {
-                for (int i = 1; i <= iterations; i++)
-                {
-                    sv.Value = i;
-                    await Task.Yield();
-                }
-            });
+                var sv = new SyncVar<int>("desync_test", 0, syncVarManager);
 
-            var reader = Task.Run(async () =>
-            {
-                for (int i = 0; i < iterations * 2; i++)
-                {
-                    uint ver = sv.Version;
-                    int val = sv.Value;
+                const int iterations = 30;
+                int desyncObserved = 0;
 
-                    if (ver > 0 && val < (int)ver)
+                var writer = Task.Run(async () =>
+                {
+                    for (int i = 1; i <= iterations; i++)
                     {
-                        Interlocked.Increment(ref desyncObserved);
+                        sv.Value = i;
+                        await Task.Yield();
                     }
-                    await Task.Yield();
-                }
-            });
+                });
 
-            await Task.WhenAll(writer, reader);
+                var reader = Task.Run(async () =>
+                {
+                    for (int i = 0; i < iterations * 2; i++)
+                    {
+                        uint ver = sv.Version;
+                        int val = sv.Value;
 
-            Specification.Assert(desyncObserved == 0,
-                $"Version and Value publication desynchronized! Reader observed Version ahead of Value {desyncObserved} times.");
+                        if (ver > 0 && val < (int)ver)
+                        {
+                            Interlocked.Increment(ref desyncObserved);
+                        }
+                        await Task.Yield();
+                    }
+                });
+
+                await Task.WhenAll(writer, reader);
+
+                Specification.Assert(desyncObserved == 0,
+                    $"Version and Value publication desynchronized! Reader observed Version ahead of Value {desyncObserved} times.");
+            }
+            finally
+            {
+                syncVarManager.FullTeardown();
+            }
         }
 
         [Test]
@@ -2091,7 +2113,7 @@ namespace Liminal.Net.Tests.Coyote
                         var bound = syncVarManager.Bind<int>("token_dispose_test", 0);
                         Specification.Assert(bound != null, "Bound SyncVar cannot be null.");
 
-                        bound.Dispose();
+                        ((ISyncVarInternal)bound).InternalTeardown();
 
                         Specification.Assert(serverVar.Version >= 1, "Dispose must not reset server SyncVar version to 0.");
                         Specification.Assert(serverVar.Value >= 50, "Dispose must not reset server SyncVar value to default.");
@@ -2175,7 +2197,7 @@ namespace Liminal.Net.Tests.Coyote
                         var sv = new SyncVar<int>($"dispose_flush_race_{i}", 100 + i, syncVarManager);
                         sv.Value = 200 + i;
                         await Task.Yield();
-                        sv.Dispose();
+                        ((ISyncVarInternal)sv).InternalTeardown();
                         await Task.Yield();
                     }
                 });
@@ -2217,7 +2239,7 @@ namespace Liminal.Net.Tests.Coyote
             {
                 var sv = new SyncVar<int>("token_spin_test", 10, syncVarManager);
                 sv.Value = 20;
-                sv.Dispose();
+                ((ISyncVarInternal)sv).InternalTeardown();
 
                 syncVarManager.FlushDirty();
 
@@ -2261,7 +2283,7 @@ namespace Liminal.Net.Tests.Coyote
                 var disposeTask = Task.Run(async () =>
                 {
                     await Task.Yield();
-                    sv.Dispose();
+                    ((ISyncVarInternal)sv).InternalTeardown();
                 });
 
                 await Task.WhenAll(readerTask, disposeTask);
@@ -2308,7 +2330,7 @@ namespace Liminal.Net.Tests.Coyote
                 var disposeTask = Task.Run(async () =>
                 {
                     await Task.Yield();
-                    sv.Dispose();
+                    ((ISyncVarInternal)sv).InternalTeardown();
                 });
 
                 await Task.WhenAll(wireTask, disposeTask);
@@ -2361,7 +2383,7 @@ namespace Liminal.Net.Tests.Coyote
                 var disposeTask = Task.Run(async () =>
                 {
                     await Task.Yield();
-                    sv.Dispose();
+                    ((ISyncVarInternal)sv).InternalTeardown();
                 });
 
                 await Task.WhenAll(writeTask, remoteTask, disposeTask);
@@ -2961,6 +2983,1192 @@ namespace Liminal.Net.Tests.Coyote
             {
                 netManager.Shutdown();
             }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_ConcurrentBind_ZeroSlotLeakageOrDuplicates()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = netManager.SyncVarManager;
+
+            try
+            {
+                SyncVar<int> sv1 = null;
+                SyncVar<int> sv2 = null;
+
+                var task1 = Task.Run(() =>
+                {
+                    sv1 = syncVarManager.Bind<int>("token_concurrent_bind", 100);
+                });
+
+                var task2 = Task.Run(() =>
+                {
+                    sv2 = syncVarManager.Bind<int>("token_concurrent_bind", 100);
+                });
+
+                await Task.WhenAll(task1, task2);
+
+                Specification.Assert(ReferenceEquals(sv1, sv2), "Concurrent Bind must return the exact same instance.");
+                Specification.Assert(syncVarManager.SlotBitset.CountAllocated() == 1, "Only one slot must be allocated for the bound token.");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_RegisterSyncVar_RaceWithLiveDelta_MonotonicVersions()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartClient("127.0.0.1", 7777);
+            netManager.Ticker?.Stop();
+            transport.TriggerLocalClientConnected(5);
+            var syncVarManager = netManager.SyncVarManager;
+
+            const string token = "token_live_overwrite";
+
+            // Deliver older version 1 while unbound
+            var bufferV1 = new ArrayBufferWriter<byte>();
+            var writerV1 = new MessagePackWriter(bufferV1);
+            writerV1.WriteArrayHeader(1);
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+            writerV1.WriteUInt8((byte)tokenBytes.Length);
+            writerV1.WriteRaw(tokenBytes);
+            writerV1.WriteUInt32(1); // Version 1
+            byte[] valV1 = MessagePackSerializer.Serialize(111);
+            writerV1.WriteInt32(valV1.Length);
+            writerV1.WriteRaw(valV1);
+            writerV1.Flush();
+
+            var batchV1 = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(bufferV1.WrittenMemory));
+            netManager.Interpreter.Dispatch(
+                LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                ILiminalTransport.SERVER_ID,
+                MessagePackSerializer.Serialize(batchV1));
+
+            // Prepare live version 2 packet
+            var bufferV2 = new ArrayBufferWriter<byte>();
+            var writerV2 = new MessagePackWriter(bufferV2);
+            writerV2.WriteArrayHeader(1);
+            writerV2.WriteUInt8((byte)tokenBytes.Length);
+            writerV2.WriteRaw(tokenBytes);
+            writerV2.WriteUInt32(2); // Version 2
+            byte[] valV2 = MessagePackSerializer.Serialize(222);
+            writerV2.WriteInt32(valV2.Length);
+            writerV2.WriteRaw(valV2);
+            writerV2.Flush();
+
+            var batchV2 = new SyncVarSlabBatchPacket(new ReadOnlySequence<byte>(bufferV2.WrittenMemory));
+            byte[] serializedV2 = MessagePackSerializer.Serialize(batchV2);
+
+            try
+            {
+                SyncVar<int> sv = null;
+
+                var registerTask = Task.Run(() =>
+                {
+                    sv = new SyncVar<int>(token, 0, syncVarManager);
+                });
+
+                var livePacketTask = Task.Run(() =>
+                {
+                    netManager.Interpreter.Dispatch(
+                        LiminalPacketLibrary.GetId<SyncVarSlabBatchPacket>(),
+                        ILiminalTransport.SERVER_ID,
+                        serializedV2);
+                });
+
+                await Task.WhenAll(registerTask, livePacketTask);
+
+                Specification.Assert(sv != null, "SyncVar must be initialized.");
+                Specification.Assert(sv.GetSnapshot().Version == 2, $"Version must be 2, got {sv.GetSnapshot().Version}");
+                Specification.Assert(sv.Value == 222, $"Value must be 222 from live packet V2, got {sv.Value}");
+            }
+            finally
+            {
+                netManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentSetAuthIds_ZeroOutOfOrderBroadcasts()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, config);
+            serverManager.StartServer(7777);
+            serverTransport.TriggerClientConnected(2);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            string token = "test_auth_order";
+            var sv = new SyncVar<int>(token, 42, syncVarManager);
+
+            ushort authPacketId = checked((ushort)LiminalPacketLibrary.GetId<SyncVarAuthUpdatePacket>());
+            var broadcastedAuths = new System.Collections.Concurrent.ConcurrentQueue<ushort[]>();
+
+            serverManager.Interpreter.OnSendRequest += (senderId, targetId, packetId, payload, delivery) =>
+            {
+                if (packetId == authPacketId)
+                {
+                    var packet = MessagePackSerializer.Deserialize<SyncVarAuthUpdatePacket>(payload.ToArray());
+                    if (packet.Token == token)
+                    {
+                        broadcastedAuths.Enqueue(packet.AuthIds);
+                    }
+                }
+            };
+
+            try
+            {
+                var task1 = Task.Run(() => sv.SetAuthIds(10));
+                var task2 = Task.Run(() => sv.SetAuthIds(20));
+
+                await Task.WhenAll(task1, task2);
+
+                ushort[] lastBroadcast = null;
+                while (broadcastedAuths.TryDequeue(out var b))
+                {
+                    lastBroadcast = b;
+                }
+
+                Specification.Assert(lastBroadcast != null, "At least one auth broadcast must occur.");
+                Specification.Assert(sv.AuthIds.Length == 1, "Authorities length must be 1.");
+                Specification.Assert(lastBroadcast.Length == 1, "Last broadcast length must be 1.");
+                Specification.Assert(lastBroadcast[0] == sv.AuthIds[0],
+                    $"Broadcast out-of-order! Last broadcasted {lastBroadcast[0]} but server authorities is {sv.AuthIds[0]}");
+            }
+            finally
+            {
+                serverManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_ConcurrentFlushDirtyAndFullTeardown_ZeroSlabAccessViolation()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, config);
+            serverManager.StartServer(7777);
+            serverTransport.TriggerClientConnected(2);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            var sv = new SyncVar<int>("token_flush_teardown_race", 1, syncVarManager);
+            sv.Value = 999;
+
+            Exception flushException = null;
+
+            var flushTask = Task.Run(() =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    try
+                    {
+                        sv.Value = i;
+                        syncVarManager.FlushDirty();
+                    }
+                    catch (Exception ex)
+                    {
+                        flushException = ex;
+                        break;
+                    }
+                }
+            });
+
+            var teardownTask = Task.Run(() =>
+            {
+                syncVarManager.FullTeardown();
+            });
+
+            await Task.WhenAll(flushTask, teardownTask);
+
+            serverManager.Shutdown();
+
+            Specification.Assert(flushException == null,
+                $"FlushDirty encountered an unhandled exception during concurrent FullTeardown: {flushException}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentWriteAndManagerShutdown_ZeroException()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, config);
+            serverManager.StartServer(7777);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            var sv = new SyncVar<int>("token_write_shutdown_race", 1, syncVarManager);
+            sv.Value = 100;
+
+            Exception writeException = null;
+
+            var writeTask = Task.Run(() =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    try
+                    {
+                        sv.Value = i;
+                    }
+                    catch (Exception ex)
+                    {
+                        writeException = ex;
+                        break;
+                    }
+                }
+            });
+
+            var shutdownTask = Task.Run(() =>
+            {
+                serverManager.Shutdown();
+            });
+
+            await Task.WhenAll(writeTask, shutdownTask);
+
+            Specification.Assert(writeException == null,
+                $"SyncVar write encountered an unhandled exception during concurrent Shutdown: {writeException}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_ConcurrentRegister_ZeroSlotLeakage()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverManager = new LiminalNetworkManager(new MockTransport { IsServer = true }, config);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            var sv = new SyncVar<int>("concurrent_reg_token", 42, null);
+
+            var task1 = Task.Run(() => syncVarManager.RegisterSyncVar(sv));
+            var task2 = Task.Run(() => syncVarManager.RegisterSyncVar(sv));
+            var task3 = Task.Run(() => syncVarManager.RegisterSyncVar(sv));
+
+            await Task.WhenAll(task1, task2, task3);
+
+            int allocatedSlots = syncVarManager.SlotBitset.CountAllocated();
+            Specification.Assert(allocatedSlots == 1,
+                $"Concurrent RegisterSyncVar leaked bitset slots! Expected 1 allocated slot, but found {allocatedSlots}.");
+
+            serverManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_TwoPhaseCommit_WriteBytesFailureConsistency()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverManager = new LiminalNetworkManager(new MockTransport { IsServer = true }, config);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            try
+            {
+                var sv = new SyncVar<int>("two_phase_commit_test", 100, syncVarManager);
+
+                var taskWriter = Task.Run(() =>
+                {
+                    for (int i = 1; i <= 20; i++)
+                    {
+                        sv.Value = 100 + i;
+                    }
+                });
+
+                var taskReader = Task.Run(() =>
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        if (sv.TryExtractSnapshotData(out byte[] data, out uint wireVersion))
+                        {
+                            int deserialized = MessagePackSerializer.Deserialize<int>(data);
+                            Specification.Assert(deserialized == (int)(100 + wireVersion),
+                                $"Committed snapshot data ({deserialized}) must exactly correspond to its wire version ({wireVersion}).");
+                        }
+                    }
+                });
+
+                await Task.WhenAll(taskWriter, taskReader);
+
+                Specification.Assert(sv.TryExtractSnapshotData(out byte[] finalData, out uint finalVersion),
+                    "Final snapshot extraction must succeed.");
+                int finalDeserialized = MessagePackSerializer.Deserialize<int>(finalData);
+                Specification.Assert(finalVersion == sv.Version, "Final wire version must match memory version.");
+                Specification.Assert(finalDeserialized == sv.Value, "Final wire payload must match memory value.");
+            }
+            finally
+            {
+                serverManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SafeInvoke_IdenticalMethodTargets_NoDuplicateOrDropped()
+        {
+            int callsA = 0;
+            int callsB = 0;
+            int callsC = 0;
+
+            void TargetA() => Interlocked.Increment(ref callsA);
+            void TargetThrowing() => throw new InvalidOperationException("Simulated error in handler");
+            void TargetB() => Interlocked.Increment(ref callsB);
+            void TargetC() => Interlocked.Increment(ref callsC);
+
+            Action multicast = TargetA;
+            multicast += TargetThrowing;
+            multicast += TargetB;
+            multicast += TargetC;
+
+            var task1 = Task.Run(() => LiminalAtomicHelpers.SafeInvoke(multicast));
+            var task2 = Task.Run(() => LiminalAtomicHelpers.SafeInvoke(multicast));
+
+            await Task.WhenAll(task1, task2);
+
+            Specification.Assert(callsA == 2, $"TargetA expected 2 invocations, got {callsA}");
+            Specification.Assert(callsB == 2, $"TargetB expected 2 invocations, got {callsB}");
+            Specification.Assert(callsC == 2, $"TargetC expected 2 invocations, got {callsC}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentVisibilityAndExclusion_StrictFifo()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, config);
+            serverManager.StartServer(7777);
+            ushort clientTarget = 2;
+            serverTransport.TriggerClientConnected(clientTarget);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            string token = "concurrent_visibility_fifo";
+            var sv = new SyncVar<int>(token, 42, syncVarManager);
+
+            ushort snapshotPacketId = checked((ushort)LiminalPacketLibrary.GetId<SyncVarSnapshotPacket>());
+            ushort evictPacketId = checked((ushort)LiminalPacketLibrary.GetId<SyncVarEvictPacket>());
+
+            var packetHistory = new System.Collections.Concurrent.ConcurrentQueue<ushort>();
+
+            serverManager.Interpreter.OnSendRequest += (senderId, targetId, packetId, payload, delivery) =>
+            {
+                if (targetId == clientTarget && (packetId == snapshotPacketId || packetId == evictPacketId))
+                {
+                    packetHistory.Enqueue(packetId);
+                }
+            };
+
+            try
+            {
+                var task1 = Task.Run(() =>
+                {
+                    sv.AddExclusion(clientTarget);
+                });
+
+                var task2 = Task.Run(() =>
+                {
+                    sv.RemoveExclusion(clientTarget);
+                });
+
+                await Task.WhenAll(task1, task2);
+
+                ushort lastPacket = 0;
+                while (packetHistory.TryDequeue(out var p))
+                {
+                    lastPacket = p;
+                }
+
+                bool isVisible = sv.IsVisibleTo(clientTarget);
+                if (isVisible)
+                {
+                    Specification.Assert(lastPacket == snapshotPacketId,
+                        $"Client {clientTarget} is visible, but last sent packet was not snapshot ({lastPacket}).");
+                }
+                else
+                {
+                    Specification.Assert(lastPacket == evictPacketId,
+                        $"Client {clientTarget} is excluded/hidden, but last sent packet was not eviction ({lastPacket}).");
+                }
+            }
+            finally
+            {
+                serverManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_HandleClientRequest_ConcurrentAuthorityRevocation_BlocksWrite()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, config);
+            serverManager.StartServer(7777);
+            serverManager.Ticker.Stop();
+            ushort clientTarget = 2;
+            serverTransport.TriggerClientConnected(clientTarget);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            string token = "handle_req_auth_race";
+            var sv = new SyncVar<int>(token, 10, syncVarManager);
+            sv.SetAuthIds(clientTarget);
+
+            sv.ClearDirty();
+
+            try
+            {
+                var payload = MessagePackSerializer.Serialize(999);
+                var seq = new System.Buffers.ReadOnlySequence<byte>(payload);
+
+                bool applied = false;
+                var taskWrite = Task.Run(() =>
+                {
+                    applied = sv.ApplyRemoteBytes(seq, 2, syncVarManager.SerializerOptions, force: false, deferEvent: false, senderId: clientTarget);
+                    if (applied)
+                    {
+                        sv.TryMarkDirty();
+                    }
+                });
+
+                var taskRevoke = Task.Run(() =>
+                {
+                    sv.RemoveAuthority(clientTarget);
+                });
+
+                await Task.WhenAll(taskWrite, taskRevoke);
+
+                Specification.Assert(!sv.IsAuthorized(clientTarget), "Client authority must be revoked.");
+                if (applied)
+                {
+                    Specification.Assert(sv.Value == 999, "Value must be updated if write was accepted.");
+                    Specification.Assert(sv.IsDirty, "Valid write preceding revocation must be marked dirty.");
+                }
+                else
+                {
+                    Specification.Assert(sv.Value == 10, "Value must remain initial if write was blocked.");
+                    Specification.Assert(!sv.IsDirty, "SyncVar must not be marked dirty when write was blocked.");
+                }
+            }
+            finally
+            {
+                serverManager.Shutdown();
+            }
+        }
+
+        [Test]
+        public static async Task Coyote_DisconnectReasonCoordinator_ConcurrentAuthoritativeAndGenericReasons_PreservesSpecificReason()
+        {
+            var config = new LiminalNetworkConfig();
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            var coordinator = netManager.DisconnectCoordinator;
+            ushort clientId = 3;
+
+            transport.TriggerClientConnected(clientId);
+
+            var taskGeneric = Task.Run(() =>
+            {
+                coordinator.HandleTransportReason(clientId, DisconnectReason.ConnectionLost, "Generic lost");
+            });
+
+            var taskSpecific = Task.Run(() =>
+            {
+                coordinator.RecordReason(clientId, DisconnectReason.Kicked, "Authoritative kick");
+            });
+
+            await Task.WhenAll(taskGeneric, taskSpecific);
+
+            bool resolved = coordinator.TryGetResolvedReason(clientId, out var finalReason, out _);
+            Specification.Assert(resolved, "Reason must be resolved in coordinator.");
+            Specification.Assert(finalReason == DisconnectReason.Kicked,
+                $"Authoritative kick was overwritten by generic reason! Found {finalReason}");
+
+            netManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_PendingClearAck_ConcurrentWrites_MonotonicVersionsNotDropped()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, config);
+            serverManager.StartServer(7777);
+            serverManager.Ticker.Stop();
+            ushort clientTarget = 2;
+            serverTransport.TriggerClientConnected(clientTarget);
+            var syncVarManager = serverManager.SyncVarManager;
+
+            string token = "pending_clear_concurrent_writes";
+            var sv = new SyncVar<int>(token, 10, syncVarManager);
+            sv.SetAuthIds(clientTarget);
+
+            // Server clears variable, requiring clear ACK from clientTarget
+            sv.Clear();
+
+            var writer1 = new ArrayBufferWriter<byte>();
+            MessagePackSerializer.Serialize(writer1, 101);
+            var writer2 = new ArrayBufferWriter<byte>();
+            MessagePackSerializer.Serialize(writer2, 102);
+
+            byte[] tokenBytes = System.Text.Encoding.UTF8.GetBytes(token);
+
+            var payloadWriter1 = new ArrayBufferWriter<byte>();
+            var msgWriter1 = new MessagePackWriter(payloadWriter1);
+            msgWriter1.WriteArrayHeader(1);
+            msgWriter1.WriteUInt8((byte)tokenBytes.Length);
+            msgWriter1.WriteRaw(tokenBytes);
+            msgWriter1.WriteUInt32(1);
+            msgWriter1.WriteInt32(writer1.WrittenCount);
+            msgWriter1.WriteRaw(writer1.WrittenSpan);
+            msgWriter1.Flush();
+
+            var payloadWriter2 = new ArrayBufferWriter<byte>();
+            var msgWriter2 = new MessagePackWriter(payloadWriter2);
+            msgWriter2.WriteArrayHeader(1);
+            msgWriter2.WriteUInt8((byte)tokenBytes.Length);
+            msgWriter2.WriteRaw(tokenBytes);
+            msgWriter2.WriteUInt32(2);
+            msgWriter2.WriteInt32(writer2.WrittenCount);
+            msgWriter2.WriteRaw(writer2.WrittenSpan);
+            msgWriter2.Flush();
+
+            var requestPacket1 = new SyncVarSlabClientRequestPacket(payloadWriter1.WrittenMemory);
+            var requestPacket2 = new SyncVarSlabClientRequestPacket(payloadWriter2.WrittenMemory);
+
+            byte[] bytes1 = MessagePackSerializer.Serialize(requestPacket1);
+            byte[] bytes2 = MessagePackSerializer.Serialize(requestPacket2);
+            ushort packetId = checked((ushort)LiminalPacketLibrary.GetId<SyncVarSlabClientRequestPacket>());
+
+            var taskWrite1 = Task.Run(() =>
+            {
+                serverManager.Interpreter.Dispatch(packetId, clientTarget, bytes1);
+            });
+
+            var taskWrite2 = Task.Run(() =>
+            {
+                serverManager.Interpreter.Dispatch(packetId, clientTarget, bytes2);
+            });
+
+            await Task.WhenAll(taskWrite1, taskWrite2);
+
+            // If write 1 processed first or concurrently, write 2 should not be falsely dropped as stale
+            Specification.Assert(sv.Value == 101 || sv.Value == 102,
+                $"Expected committed value 101 or 102, but found {sv.Value}");
+
+            serverManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentLocalWriteAndRegistration_NoDeadlock()
+        {
+            var config = new LiminalNetworkConfig();
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var syncVarManager = netManager.SyncVarManager;
+
+            string token = "concurrent_write_reg_nodeadlock";
+            var sv = new SyncVar<int>(token, 0);
+
+            var taskWrite = Task.Run(() =>
+            {
+                sv.Value = 42;
+            });
+
+            var taskRegister = Task.Run(() =>
+            {
+                syncVarManager.RegisterSyncVar(sv);
+            });
+
+            await Task.WhenAll(taskWrite, taskRegister);
+
+            Specification.Assert(sv.Value == 42 || sv.Value == 0, "Value must be consistent without deadlock.");
+
+            netManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarWireBuffer_ConcurrentReadAndTeardown_ZeroNRE()
+        {
+            var config = new LiminalNetworkConfig();
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var syncVarManager = netManager.SyncVarManager;
+
+            var sv = new SyncVar<int>("wire_read_teardown", 123, syncVarManager);
+
+            bool readCompletedWithoutError = false;
+
+            var taskReader = Task.Run(() =>
+            {
+                var writer = new ArrayBufferWriter<byte>();
+                var msgWriter = new MessagePackWriter(writer);
+                sv.TryWriteSlotForWire(ref msgWriter, out _);
+                readCompletedWithoutError = true;
+            });
+
+            var taskTeardown = Task.Run(() =>
+            {
+                sv.InternalTeardown();
+            });
+
+            await Task.WhenAll(taskReader, taskTeardown);
+
+            Specification.Assert(readCompletedWithoutError, "Reader must complete without throwing NullReferenceException.");
+
+            netManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_OfflineConstructed_ConcurrentWritesOnOnline_ConsistentRegistration()
+        {
+            var config = new LiminalNetworkConfig();
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            netManager.Ticker.Stop();
+
+            var sv = new SyncVar<int>("offline_constructed_var", 5);
+
+            var taskWrite1 = Task.Run(() =>
+            {
+                sv.Value = 100;
+            });
+
+            var taskWrite2 = Task.Run(() =>
+            {
+                sv.Value = 200;
+            });
+
+            await Task.WhenAll(taskWrite1, taskWrite2);
+
+            Specification.Assert(sv.Value == 100 || sv.Value == 200, "Final value must be one of the written values.");
+            Specification.Assert(sv.LocalSlot != ushort.MaxValue, "Offline SyncVar must have been assigned a valid slot upon online write.");
+
+            netManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_ConcurrentInitialize_ZeroKeyCollision()
+        {
+            var config = new LiminalNetworkConfig();
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+
+            SyncVarManager m1 = null;
+            SyncVarManager m2 = null;
+
+            var taskInit1 = Task.Run(() =>
+            {
+                m1 = SyncVarManager.Initialize(netManager, config);
+            });
+
+            var taskInit2 = Task.Run(() =>
+            {
+                m2 = SyncVarManager.Initialize(netManager, config);
+            });
+
+            await Task.WhenAll(taskInit1, taskInit2);
+
+            Specification.Assert(m1 != null && m2 != null, "Both initialize calls must return a manager instance.");
+            Specification.Assert(ReferenceEquals(m1, m2), "Both initialize calls must resolve to the identical manager instance without throwing.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarValueCell_ConcurrentConsecutiveWritesAndReads_ZeroTornReads()
+        {
+            var cell = new SyncVarValueCell<CoyoteStatePayload>(new CoyoteStatePayload
+            {
+                Iteration = 0,
+                TimestampTicks = 0,
+                Checksum = 0 ^ 0x5A5A5A5A
+            });
+
+            bool tornReadObserved = false;
+
+            var taskReader = Task.Run(() =>
+            {
+                for (int i = 0; i < 5; i++)
+                {
+                    var val = cell.Value;
+                    if (!val.IsConsistent)
+                    {
+                        tornReadObserved = true;
+                    }
+                }
+            });
+
+            var taskWriter1 = Task.Run(() =>
+            {
+                for (int i = 1; i <= 3; i++)
+                {
+                    cell.CommitUpdate(new CoyoteStatePayload
+                    {
+                        Iteration = i,
+                        TimestampTicks = i * 100L,
+                        Checksum = i ^ 0x5A5A5A5A
+                    }, (uint)i, deferEvent: false, out _, out _);
+                }
+            });
+
+            var taskWriter2 = Task.Run(() =>
+            {
+                for (int i = 10; i <= 12; i++)
+                {
+                    cell.CommitUpdate(new CoyoteStatePayload
+                    {
+                        Iteration = i,
+                        TimestampTicks = i * 100L,
+                        Checksum = i ^ 0x5A5A5A5A
+                    }, (uint)i, deferEvent: false, out _, out _);
+                }
+            });
+
+            await Task.WhenAll(taskReader, taskWriter1, taskWriter2);
+
+            Specification.Assert(!tornReadObserved, "Seqlock permitted reading a torn struct during concurrent consecutive writes.");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_Bind_ConcurrentCallbacks_ZeroDeadlock()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var syncVarManager = netManager.SyncVarManager;
+
+            Exception? taskException = null;
+
+            var task1 = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        var sv = syncVarManager.Bind<int>($"bind_concurrent_{i}", i);
+                        sv.OnValueChanged += (oldVal, newVal) =>
+                        {
+                            var nested = syncVarManager.Bind<int>($"nested_bind_{newVal}", newVal);
+                            nested.Value = newVal + 1;
+                        };
+                        sv.Value = i + 10;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var task2 = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        var sv = syncVarManager.Bind<int>($"bind_concurrent_{i}", 0);
+                        syncVarManager.UnregisterSyncVar($"bind_concurrent_{i}");
+                        var svNew = syncVarManager.Bind<int>($"bind_concurrent_{i}", i * 2);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var task3 = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        var sv = syncVarManager.Bind<int>($"other_token_{i}", i * 3);
+                        sv.Value = i * 5;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(task1, task2, task3);
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null,
+                $"Concurrent Bind and nested callbacks encountered an exception: {taskException}");
+        }
+
+        [Test]
+        public static async Task Coyote_SessionManager_RapidReconnect_AllocatesSessionAndRoutesPackets()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var sessionManager = netManager.SessionManager;
+
+            const ushort targetClientId = 2;
+            transport.TriggerClientConnected(targetClientId);
+
+            Exception? taskException = null;
+
+            var taskDisconnectReconnect = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 10; i++)
+                    {
+                        transport.TriggerClientDisconnected(targetClientId);
+                        transport.TriggerClientConnected(targetClientId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskProcessDisconnects = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 15; i++)
+                    {
+                        sessionManager.ProcessPendingDisconnects();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskSessionLookup = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 15; i++)
+                    {
+                        if (sessionManager.TryGetSession(targetClientId, out var session))
+                        {
+                            if (session.TryReserveInboundPacketUnreliable(10))
+                            {
+                                session.ReleaseInboundPacketUnreliable();
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(taskDisconnectReconnect, taskProcessDisconnects, taskSessionLookup);
+
+            bool clientConnectedInTransport = transport.IsClientConnected(targetClientId);
+            bool hasSession = sessionManager.TryGetSession(targetClientId, out var finalSession);
+
+            if (clientConnectedInTransport)
+            {
+                Specification.Assert(hasSession && finalSession != null && !finalSession.IsDisposed(),
+                    "Rapid client reconnect left client without an active session in SessionManager!");
+            }
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null,
+                $"Rapid reconnect encountered an unhandled exception: {taskException}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_Register_ConcurrentWrite_ZeroSlabSlotCorruption()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var syncVarManager = netManager.SyncVarManager;
+
+            Exception? taskException = null;
+            var sv = new SyncVar<byte[]>("offline_slab_race", new byte[16], SyncVarVisibility.Public, null);
+
+            var taskAttach = Task.Run(() =>
+            {
+                try
+                {
+                    syncVarManager.AttachPreExisting(sv);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskWrite = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        byte[] large = new byte[256];
+                        large[0] = (byte)(i + 1);
+                        sv.Value = large;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskOtherAllocations = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        syncVarManager.Bind<byte[]>($"other_alloc_{i}", new byte[64]);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(taskAttach, taskWrite, taskOtherAllocations);
+
+            var (pageIndex, pageOffset) = sv.ActiveSlotCoordinates;
+            Specification.Assert(pageIndex >= 0 && pageOffset >= 0, "ActiveSlotCoordinates must be valid after concurrent attach and write.");
+            Specification.Assert(sv.LocalSlot != ushort.MaxValue, "LocalSlot must be valid and registered.");
+            Specification.Assert(sv.Value != null && sv.Value.Length == 256, "Value length must match latest write.");
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null,
+                $"Concurrent attach and large write encountered an unhandled exception: {taskException}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_Bind_ConcurrentRegistration_NeverReturnsOrphanInstance()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var syncVarManager = netManager.SyncVarManager;
+
+            Exception? taskException = null;
+            SyncVar<int>? boundInstance = null;
+            var offlineVar = new SyncVar<int>("orphan_race_token", 555, SyncVarVisibility.Public, null);
+
+            var taskBind = Task.Run(() =>
+            {
+                try
+                {
+                    boundInstance = syncVarManager.Bind<int>("orphan_race_token", 100);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskAttach = Task.Run(() =>
+            {
+                try
+                {
+                    syncVarManager.AttachPreExisting(offlineVar);
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(taskBind, taskAttach);
+
+            Specification.Assert(boundInstance != null, "Bound instance must not be null.");
+            Specification.Assert(boundInstance.LocalSlot != ushort.MaxValue,
+                $"Bind<T> returned an unregistered orphan instance! LocalSlot is {boundInstance.LocalSlot}");
+
+            bool isRegistered = syncVarManager.TryGetSyncVar("orphan_race_token", out var registered);
+            Specification.Assert(isRegistered && registered != null, "Token must be registered in SyncVarManager.");
+            Specification.Assert(ReferenceEquals(boundInstance, registered),
+                "Bind<T> must return the canonical registered instance, not an orphan!");
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null,
+                $"Concurrent bind and attach encountered an unhandled exception: {taskException}");
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVarManager_FlushDirty_DynamicSessionSurge_ZeroSessionTruncation()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                MaxConnectionCount = 2,
+                ClientIdResolver = new BaseResolver()
+            };
+            var transport = new MockTransport { IsServer = true };
+            var netManager = new LiminalNetworkManager(transport, config);
+            netManager.StartServer(7777);
+            var syncVarManager = netManager.SyncVarManager;
+
+            var sv = syncVarManager.Bind<int>("flush_surge_token", 1);
+            Exception? taskException = null;
+
+            for (ushort id = 1; id <= 6; id++)
+            {
+                transport.TriggerClientConnected(id);
+            }
+
+            var taskFlush = Task.Run(() =>
+            {
+                try
+                {
+                    for (int i = 0; i < 10; i++)
+                    {
+                        sv.Value = i + 10;
+                        syncVarManager.FlushDirty();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            var taskChurn = Task.Run(() =>
+            {
+                try
+                {
+                    for (ushort id = 7; id <= 10; id++)
+                    {
+                        transport.TriggerClientConnected(id);
+                        transport.TriggerClientDisconnected(id);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    taskException = ex;
+                }
+            });
+
+            await Task.WhenAll(taskFlush, taskChurn);
+
+            netManager.Shutdown();
+
+            Specification.Assert(taskException == null,
+                $"FlushDirty during session surge encountered an unhandled exception: {taskException}");
         }
     }
 }

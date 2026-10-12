@@ -13,6 +13,7 @@ namespace Liminal.Net.SyncVar
     public class SyncVarManager
     {
         private static readonly ConditionalWeakTable<LiminalNetworkManager, SyncVarManager> _managerMap = new();
+        private static readonly object _managerMapLock = new();
         private static volatile SyncVarManager _lastCreatedManager;
 
         public static SyncVarManager Instance => LiminalNetworkManager.Instance?.SyncVarManager ?? Volatile.Read(ref _lastCreatedManager);
@@ -21,28 +22,35 @@ namespace Liminal.Net.SyncVar
         {
             if (netManager == null) throw new ArgumentNullException(nameof(netManager));
 
-            if (_managerMap.TryGetValue(netManager, out var existing))
+            lock (_managerMapLock)
             {
-                existing.Reattach(netManager);
-                Volatile.Write(ref _lastCreatedManager, existing);
-                return existing;
-            }
+                if (_managerMap.TryGetValue(netManager, out var existing))
+                {
+                    existing.Reattach(netManager);
+                    Volatile.Write(ref _lastCreatedManager, existing);
+                    return existing;
+                }
 
-            var newManager = new SyncVarManager(netManager, config);
-            _managerMap.Add(netManager, newManager);
-            Volatile.Write(ref _lastCreatedManager, newManager);
-            return newManager;
+                var newManager = new SyncVarManager(netManager, config);
+                _managerMap.Add(netManager, newManager);
+                Volatile.Write(ref _lastCreatedManager, newManager);
+                return newManager;
+            }
         }
+
+        public bool IsTornDown => Volatile.Read(ref _lifecycleGate) == 2;
 
         internal static SyncVarManager GetManagerForRegistration()
         {
             var manager = LiminalNetworkManager.Instance;
-            if (manager?.SyncVarManager != null) return manager.SyncVarManager;
+            if (manager?.SyncVarManager != null && !manager.SyncVarManager.IsTornDown)
+                return manager.SyncVarManager;
+
             var last = Volatile.Read(ref _lastCreatedManager);
-            if (last != null) return last;
-            var created = new SyncVarManager(null, null);
-            Interlocked.CompareExchange(ref _lastCreatedManager, created, null);
-            return Volatile.Read(ref _lastCreatedManager);
+            if (last != null && !last.IsTornDown)
+                return last;
+
+            return null;
         }
 
         private sealed class UnboundEntry
@@ -54,10 +62,12 @@ namespace Liminal.Net.SyncVar
 
         private readonly Utf8TokenRegistry _tokenRegistry = new();
         private readonly object _unboundLock = new();
+        private readonly object _bindLock = new();
         private readonly Dictionary<string, UnboundEntry> _unboundCache = new();
         private readonly LinkedList<string> _unboundOrder = new();
         private readonly Dictionary<string, ushort[]> _unboundAuth = new();
-        private readonly ConcurrentQueue<ISyncVarInternal> _dirtyQueue = new();
+        private readonly LockFreeSlotBitset _slotBitset;
+        private readonly ISyncVarInternal[] _localRegistry;
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, byte>> _pendingClearAcks = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
         private readonly List<SyncVarVisibilityState> _reusableStateList = new(64);
@@ -76,10 +86,11 @@ namespace Liminal.Net.SyncVar
                 lock (_unboundLock) return _unboundCache.Count;
             }
         }
-        public int DirtyQueueCount => _dirtyQueue.Count;
+        public int DirtyQueueCount => DirtyBitset.CountDirtyBits();
 
         public SyncVarSlab Slab { get; private set; }
-        public LockFreeDirtyBitset DirtyBitset { get; } = new();
+        public LockFreeDirtyBitset DirtyBitset { get; }
+        public LockFreeSlotBitset SlotBitset => _slotBitset;
 
         private volatile LiminalNetworkManager _attachedManager;
         public LiminalNetworkManager AttachedManager => _attachedManager;
@@ -92,6 +103,11 @@ namespace Liminal.Net.SyncVar
         public SyncVarManager(LiminalNetworkManager manager, LiminalNetworkConfig config)
         {
             Slab = new SyncVarSlab(config);
+
+            int maxSlots = config?.SyncVarMaxLocalSlots > 0 ? config.SyncVarMaxLocalSlots : 4096;
+            DirtyBitset = new LockFreeDirtyBitset(maxSlots);
+            _slotBitset = new LockFreeSlotBitset(maxSlots);
+            _localRegistry = new ISyncVarInternal[maxSlots];
 
             int maxPlayers = config?.MaxConnectionCount > 0 ? config.MaxConnectionCount : 32;
             int scale = (config?.Hiccup != null && config.Hiccup.Enabled)
@@ -112,6 +128,7 @@ namespace Liminal.Net.SyncVar
             DetachFromManager();
 
             _attachedManager = manager;
+            Volatile.Write(ref _lifecycleGate, 0);
 
             _attachedManager.Interpreter.Subscribe<SyncVarSnapshotPacket>(HandleSnapshot, this);
             _attachedManager.Interpreter.Subscribe<SyncVarSlabBatchPacket>(HandleBatchDelta, this);
@@ -122,6 +139,7 @@ namespace Liminal.Net.SyncVar
             _attachedManager.Interpreter.Subscribe<SyncVarClearAckPacket>(HandleClearAck, this);
 
             _attachedManager.Events.OnClientConnected += HandleClientConnected;
+            _attachedManager.Events.OnClientDisconnected += HandleClientDisconnected;
             _attachedManager.Events.OnLocalClientDisconnected += HandleLocalClientDisconnected;
             _attachedManager.Events.OnManagerShutdown += HandleShutdown;
             _attachedManager.OnPreFlush += FlushDirty;
@@ -135,6 +153,7 @@ namespace Liminal.Net.SyncVar
             {
                 _attachedManager.OnPreFlush -= FlushDirty;
                 _attachedManager.Events.OnClientConnected -= HandleClientConnected;
+                _attachedManager.Events.OnClientDisconnected -= HandleClientDisconnected;
                 _attachedManager.Events.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
                 _attachedManager.Events.OnManagerShutdown -= HandleShutdown;
                 _attachedManager.Interpreter.UnsubscribeAll(this);
@@ -154,10 +173,7 @@ namespace Liminal.Net.SyncVar
         public void ResetPendingState()
         {
             Volatile.Write(ref _hasReceivedInitialSnapshot, 0);
-            while (_dirtyQueue.TryDequeue(out var syncVar))
-            {
-                syncVar.ClearDirty();
-            }
+            DirtyBitset.Clear();
             lock (_unboundLock)
             {
                 _unboundCache.Clear();
@@ -165,7 +181,6 @@ namespace Liminal.Net.SyncVar
                 _unboundAuth.Clear();
             }
             _pendingClearAcks.Clear();
-            DirtyBitset.Clear();
 
             var allVars = new List<ISyncVarInternal>();
             _tokenRegistry.GetAll(allVars);
@@ -173,6 +188,36 @@ namespace Liminal.Net.SyncVar
             {
                 allVars[i].SetLocallyVisible(false);
             }
+        }
+
+        public void FullTeardown()
+        {
+            var spinner = new SpinWait();
+            while (Interlocked.CompareExchange(ref _lifecycleGate, 2, 0) != 0)
+            {
+                if (Volatile.Read(ref _lifecycleGate) == 2)
+                    return;
+                spinner.SpinOnce();
+            }
+
+            ResetPendingState();
+            Interlocked.CompareExchange(ref _lastCreatedManager, null, this);
+
+            var allVars = new List<ISyncVarInternal>();
+            _tokenRegistry.GetAll(allVars);
+            for (int i = 0; i < allVars.Count; i++)
+            {
+                allVars[i].ResetSession();
+            }
+            _tokenRegistry.Clear();
+
+            for (int i = 0; i < _localRegistry.Length; i++)
+            {
+                Volatile.Write(ref _localRegistry[i], null);
+            }
+            _slotBitset.Clear();
+
+            Slab?.Reset();
         }
 
         public bool UnregisterSyncVar(ISyncVarInternal syncVar)
@@ -191,7 +236,27 @@ namespace Liminal.Net.SyncVar
                     _unboundOrder.Remove(entry.Node);
                 }
                 _unboundAuth.Remove(token);
-                return _tokenRegistry.TryRemove(token, out _);
+                if (_tokenRegistry.TryRemove(token, out var syncVar))
+                {
+                    ushort slot = syncVar.LocalSlot;
+                    if (slot != ushort.MaxValue)
+                    {
+                        DirtyBitset.ClearDirty(slot);
+                        Volatile.Write(ref _localRegistry[slot], null);
+                        _slotBitset.Free(slot);
+                        syncVar.LocalSlot = ushort.MaxValue;
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        private void HandleClientDisconnected(ushort clientId)
+        {
+            foreach (var pending in _pendingClearAcks.Values)
+            {
+                pending.TryRemove(clientId, out _);
             }
         }
 
@@ -202,7 +267,7 @@ namespace Liminal.Net.SyncVar
 
         private void HandleShutdown()
         {
-            ResetPendingState();
+            FullTeardown();
         }
 
         private void StoreUnboundAuth(string token, ushort[] authIds)
@@ -268,27 +333,69 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        [ThreadStatic]
+        private static ArrayBufferWriter<byte> _regWriter;
+
+        public void AttachPreExisting(ISyncVarInternal syncVar)
+        {
+            if (syncVar == null) return;
+            syncVar.ResetSession();
+            RegisterSyncVar(syncVar);
+        }
+
         public void RegisterSyncVar(ISyncVarInternal syncVar)
         {
             if (syncVar == null) throw new ArgumentNullException(nameof(syncVar));
 
-            var writer = new ArrayBufferWriter<byte>(128);
-            syncVar.SerializeInitial(writer, SerializerOptions);
-
-            int size = writer.WrittenCount;
-            syncVar.AllocateSlots(size);
-            Interlocked.Add(ref _totalAllocatedBytes, size * 2);
-
-            var (pageIndex, pageOffset) = syncVar.ActiveSlotCoordinates;
-            writer.WrittenSpan.CopyTo(Slab.GetSpan(pageIndex, pageOffset, size));
+            if (Volatile.Read(ref _lifecycleGate) == 2 || syncVar.IsDisposed)
+            {
+                return;
+            }
 
             UnboundEntry entry = null;
+            ushort[] cachedAuth = null;
 
             lock (_unboundLock)
             {
-                if (_unboundAuth.Remove(syncVar.Token, out var cachedAuth))
+                if (Volatile.Read(ref _lifecycleGate) == 2 || syncVar.IsDisposed)
                 {
-                    syncVar.ApplyAuthUpdateFromRemote(cachedAuth, deferEvent: true);
+                    return;
+                }
+
+                if (syncVar.LocalSlot != ushort.MaxValue && _slotBitset.IsAllocated(syncVar.LocalSlot) && Volatile.Read(ref _localRegistry[syncVar.LocalSlot]) == syncVar)
+                {
+                    _tokenRegistry.TryAdd(syncVar);
+                    return;
+                }
+
+                if (_tokenRegistry.TryGet(syncVar.Token, out var existingRegistered) && !ReferenceEquals(existingRegistered, syncVar))
+                {
+                    LiminalLogger.LogWarning($"[SyncVarManager] SyncVar with token '{syncVar.Token}' is already registered.");
+                    return;
+                }
+
+                syncVar.AttachManager(this);
+
+                if (!_slotBitset.TryAllocate(out ushort slot))
+                {
+                    throw new InvalidOperationException($"[SyncVarManager] Exceeded maximum local SyncVar capacity ({_slotBitset.Capacity}).");
+                }
+
+                var writer = _regWriter ??= new ArrayBufferWriter<byte>(128);
+                writer.Clear();
+                syncVar.SerializeInitial(writer, SerializerOptions);
+
+                int size = writer.WrittenCount;
+                if (!syncVar.TryInitializeSlabSlots(writer.WrittenSpan))
+                {
+                    _slotBitset.Free(slot);
+                    return;
+                }
+                Interlocked.Add(ref _totalAllocatedBytes, size * 2);
+
+                if (_unboundAuth.Remove(syncVar.Token, out var auth))
+                {
+                    cachedAuth = auth;
                 }
 
                 if (_unboundCache.Remove(syncVar.Token, out var e))
@@ -298,6 +405,13 @@ namespace Liminal.Net.SyncVar
                 }
 
                 _tokenRegistry.TryAdd(syncVar);
+                Volatile.Write(ref _localRegistry[slot], syncVar);
+                syncVar.LocalSlot = slot;
+            }
+
+            if (cachedAuth != null)
+            {
+                syncVar.ApplyAuthUpdateFromRemote(cachedAuth, deferEvent: true);
             }
 
             if (entry != null)
@@ -310,12 +424,9 @@ namespace Liminal.Net.SyncVar
             syncVar.FirePendingEvents();
 
             var netManager = _attachedManager;
-            if (netManager != null && netManager.Role != NetworkRole.Client && netManager.Role != NetworkRole.None)
+            if (syncVar.IsDirty || (netManager != null && netManager.Role != NetworkRole.Client && netManager.Role != NetworkRole.None))
             {
-                if (syncVar.TryMarkDirty())
-                {
-                    EnqueueDirty(syncVar);
-                }
+                DirtyBitset.SetDirty(syncVar.LocalSlot);
             }
         }
 
@@ -326,7 +437,21 @@ namespace Liminal.Net.SyncVar
                 return (SyncVar<T>)existing;
             }
 
-            return new SyncVar<T>(token, defaultValue, this);
+            lock (_bindLock)
+            {
+                if (_tokenRegistry.TryGet(token, out existing))
+                {
+                    return (SyncVar<T>)existing;
+                }
+
+                var created = new SyncVar<T>(token, defaultValue, this);
+                if (_tokenRegistry.TryGet(token, out existing) && !ReferenceEquals(existing, created))
+                {
+                    return (SyncVar<T>)existing;
+                }
+
+                return created;
+            }
         }
 
         public SyncVar<T> Bind<T>(string token, SyncVarVisibility visibility)
@@ -344,7 +469,31 @@ namespace Liminal.Net.SyncVar
                 return sv;
             }
 
-            return new SyncVar<T>(token, defaultValue, visibility, this);
+            lock (_bindLock)
+            {
+                if (_tokenRegistry.TryGet(token, out existing))
+                {
+                    var sv = (SyncVar<T>)existing;
+                    if (_attachedManager == null || _attachedManager.Role != NetworkRole.Client)
+                    {
+                        sv.SetVisibility(visibility);
+                    }
+                    return sv;
+                }
+
+                var created = new SyncVar<T>(token, defaultValue, visibility, this);
+                if (_tokenRegistry.TryGet(token, out existing) && !ReferenceEquals(existing, created))
+                {
+                    var sv = (SyncVar<T>)existing;
+                    if (_attachedManager == null || _attachedManager.Role != NetworkRole.Client)
+                    {
+                        sv.SetVisibility(visibility);
+                    }
+                    return sv;
+                }
+
+                return created;
+            }
         }
 
         public bool TryGetSyncVar(ReadOnlySpan<byte> tokenSpan, out ISyncVarInternal syncVar)
@@ -360,7 +509,10 @@ namespace Liminal.Net.SyncVar
         public void EnqueueDirty(ISyncVarInternal syncVar)
         {
             if (syncVar == null) return;
-            _dirtyQueue.Enqueue(syncVar);
+            if (syncVar.LocalSlot != ushort.MaxValue)
+            {
+                DirtyBitset.SetDirty(syncVar.LocalSlot);
+            }
         }
 
         internal void BroadcastAuthChange(string token, ushort[] newAuthIds)
@@ -431,6 +583,13 @@ namespace Liminal.Net.SyncVar
                 netManager.Interpreter.SendCommandAsServer(clientId, packet);
         }
 
+        private static int GetSessionCapacity(LiminalNetworkManager netManager)
+        {
+            int active = netManager.SessionManager?.GetActiveSessionCount() ?? 0;
+            int maxConfig = (netManager.Transport?.Config?.MaxConnectionCount ?? netManager.Config?.MaxConnectionCount ?? 10) + 4;
+            return Math.Max(active + 4, maxConfig);
+        }
+
         internal void BroadcastClear(ISyncVarInternal syncVar)
         {
             var netManager = _attachedManager;
@@ -447,7 +606,7 @@ namespace Liminal.Net.SyncVar
                 return;
             }
 
-            int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(netManager);
             Span<ushort> allSessions = stackalloc ushort[maxClients];
             int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
 
@@ -472,7 +631,7 @@ namespace Liminal.Net.SyncVar
             var netManager = _attachedManager;
             if (netManager?.SessionManager == null) return;
 
-            int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(netManager);
             Span<ushort> allSessions = stackalloc ushort[maxClients];
             int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
 
@@ -499,7 +658,7 @@ namespace Liminal.Net.SyncVar
         private readonly ArrayBufferWriter<byte> _sharedPayloadWriter = new(4096);
         private readonly ArrayBufferWriter<byte> _tailoredFlushWriter = new(2048);
         private readonly ArrayBufferWriter<byte> _tailoredPayloadWriter = new(2048);
-        private int _isFlushing = 0;
+        private int _lifecycleGate = 0;
 
         public void FlushDirty()
         {
@@ -510,18 +669,40 @@ namespace Liminal.Net.SyncVar
             if (netManager.Role == NetworkRole.Client && Volatile.Read(ref _hasReceivedInitialSnapshot) == 0)
                 return;
 
-            if (Interlocked.CompareExchange(ref _isFlushing, 1, 0) != 0)
+            if (Interlocked.CompareExchange(ref _lifecycleGate, 1, 0) != 0)
                 return;
 
             try
             {
                 _reusableDirtyList.Clear();
                 _reusableStateList.Clear();
-                while (_dirtyQueue.TryDequeue(out var syncVar))
+
+                int bucketCount = DirtyBitset.BucketCount;
+                for (int bucket = 0; bucket < bucketCount; bucket++)
                 {
-                    syncVar.ClearDirty();
-                    _reusableDirtyList.Add(syncVar);
-                    _reusableStateList.Add(syncVar.VisibilityState);
+                    if (DirtyBitset.IsBucketEmpty(bucket))
+                        continue;
+
+                    if (!DirtyBitset.TryConsumeBucket(bucket, out long mask))
+                        continue;
+
+                    ulong umask = (ulong)mask;
+                    int baseIndex = bucket << 6;
+
+                    while (umask != 0)
+                    {
+                        int bitPos = BitOperationsCompat.TrailingZeroCount(umask);
+                        ushort slot = (ushort)(baseIndex + bitPos);
+
+                        var syncVar = Volatile.Read(ref _localRegistry[slot]);
+                        if (syncVar != null && !syncVar.IsDisposed && syncVar.LocalSlot == slot)
+                        {
+                            _reusableDirtyList.Add(syncVar);
+                            _reusableStateList.Add(syncVar.VisibilityState);
+                        }
+
+                        umask &= (umask - 1);
+                    }
                 }
 
                 if (_reusableDirtyList.Count == 0) return;
@@ -550,6 +731,14 @@ namespace Liminal.Net.SyncVar
                         if (syncVar.TryWriteSlotForWire(ref payloadWriter, out _))
                         {
                             writtenCount++;
+                        }
+                        else
+                        {
+                            ushort slot = syncVar.LocalSlot;
+                            if (slot != ushort.MaxValue && !syncVar.IsDisposed && _slotBitset.IsAllocated(slot) && Volatile.Read(ref _localRegistry[slot]) == syncVar)
+                            {
+                                DirtyBitset.SetDirty(slot);
+                            }
                         }
                     }
 
@@ -581,9 +770,18 @@ namespace Liminal.Net.SyncVar
                         requiresTargeting = true;
                     }
 
-                    if (_reusableDirtyList[i].TryWriteSlotForWire(ref masterPayloadWriter, out _))
+                    var sv = _reusableDirtyList[i];
+                    if (sv.TryWriteSlotForWire(ref masterPayloadWriter, out _))
                     {
                         masterWrittenCount++;
+                    }
+                    else
+                    {
+                        ushort slot = sv.LocalSlot;
+                        if (slot != ushort.MaxValue && !sv.IsDisposed && _slotBitset.IsAllocated(slot) && Volatile.Read(ref _localRegistry[slot]) == sv)
+                        {
+                            DirtyBitset.SetDirty(slot);
+                        }
                     }
                 }
 
@@ -604,7 +802,7 @@ namespace Liminal.Net.SyncVar
                     return;
                 }
 
-                int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+                int maxClients = GetSessionCapacity(netManager);
                 Span<ushort> allSessions = stackalloc ushort[maxClients];
                 int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
 
@@ -646,9 +844,18 @@ namespace Liminal.Net.SyncVar
 
                         for (int i = 0; i < _tailoredVarsList.Count; i++)
                         {
-                            if (_tailoredVarsList[i].TryWriteSlotForWire(ref tailoredPayloadWriter, out _))
+                            var sv = _tailoredVarsList[i];
+                            if (sv.TryWriteSlotForWire(ref tailoredPayloadWriter, out _))
                             {
                                 tailoredWrittenCount++;
+                            }
+                            else
+                            {
+                                ushort slot = sv.LocalSlot;
+                                if (slot != ushort.MaxValue && !sv.IsDisposed && _slotBitset.IsAllocated(slot) && Volatile.Read(ref _localRegistry[slot]) == sv)
+                                {
+                                    DirtyBitset.SetDirty(slot);
+                                }
                             }
                         }
 
@@ -690,7 +897,7 @@ namespace Liminal.Net.SyncVar
                 _tailoredVarsList.Clear();
                 _reusableDirtyList.Clear();
                 _reusableStateList.Clear();
-                Volatile.Write(ref _isFlushing, 0);
+                Interlocked.CompareExchange(ref _lifecycleGate, 0, 1);
             }
         }
 
@@ -705,7 +912,7 @@ namespace Liminal.Net.SyncVar
                 return;
             }
 
-            int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
+            int maxClients = GetSessionCapacity(netManager);
             Span<ushort> allSessions = stackalloc ushort[maxClients];
             int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
             if (totalSessions == 0) return;
@@ -823,20 +1030,28 @@ namespace Liminal.Net.SyncVar
                     continue;
                 }
 
-                if (_pendingClearAcks.TryGetValue(syncVar.Token, out var pending) && pending.ContainsKey(senderId))
+                if (_pendingClearAcks.TryGetValue(syncVar.Token, out var pending))
                 {
-                    if (version != 1)
+                    if (pending.TryRemove(senderId, out _))
                     {
-                        LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} attempted stale write (v={version}) to cleared SyncVar '{syncVar.Token}'. Dropped.");
-                        continue;
+                        if (version != 1)
+                        {
+                            LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} attempted stale write (v={version}) to cleared SyncVar '{syncVar.Token}'. Dropped.");
+                            continue;
+                        }
                     }
-                    pending.TryRemove(senderId, out _);
                 }
 
-                syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions);
-                if (syncVar.TryMarkDirty())
+                if (syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions, force: false, deferEvent: false, senderId: senderId))
                 {
-                    EnqueueDirty(syncVar);
+                    if (syncVar.TryMarkDirty())
+                    {
+                        EnqueueDirty(syncVar);
+                    }
+                }
+                else if (!syncVar.IsAuthorized(senderId))
+                {
+                    LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify Var '{syncVar.Token}'. Dropped.");
                 }
             }
         }

@@ -37,6 +37,7 @@ namespace Liminal.Net.Core
         private readonly LiminalHiccupController _hiccup;
 
         private volatile bool _sessionManagerDisposed;
+        private int _isPolling;
 
         private long _totalPacketsInbound;
         private long _totalPacketsOutbound;
@@ -84,36 +85,45 @@ namespace Liminal.Net.Core
             if (_sessions.TryGetValue(id, out session))
                 return true;
 
-            if (_sessionManagerDisposed || _disconnectingSessions.ContainsKey(id))
+            if (_sessionManagerDisposed)
             {
                 session = null;
                 return false;
             }
 
-            if (_transport != null && _transport.IsClientConnected(id))
+            lock (_lifecycleLock)
             {
-                if (id == ILiminalTransport.SERVER_ID && !_transport.IsServer)
+                if (_sessionManagerDisposed)
                 {
-                    HandleLocalConnection(id);
-                }
-                else
-                {
-                    HandleClientConnected(id);
+                    session = null;
+                    return false;
                 }
 
-                return _sessions.TryGetValue(id, out session);
+                if (_sessions.TryGetValue(id, out session))
+                    return true;
+
+                if (_transport != null && _transport.IsClientConnected(id))
+                {
+                    if (id == ILiminalTransport.SERVER_ID && !_transport.IsServer)
+                    {
+                        HandleLocalConnection(id);
+                    }
+                    else
+                    {
+                        HandleClientConnected(id);
+                    }
+
+                    return _sessions.TryGetValue(id, out session);
+                }
+
+                session = null;
+                return false;
             }
-
-            session = null;
-            return false;
         }
 
         private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData, DeliveryMethod deliveryMethod)
         {
             if (_sessionManagerDisposed)
-                return;
-
-            if (_disconnectingSessions.ContainsKey(ownerId))
                 return;
 
             if (!_sessions.TryGetValue(ownerId, out var session))
@@ -136,7 +146,7 @@ namespace Liminal.Net.Core
                     if (session.IsDisposed())
                         return;
 
-                    if (_disconnectingSessions.ContainsKey(ownerId))
+                    if (!_sessions.TryGetValue(ownerId, out var current) || !ReferenceEquals(current, session))
                         return;
 
                     if (deliveryMethod == DeliveryMethod.Unreliable)
@@ -450,7 +460,7 @@ namespace Liminal.Net.Core
                     if (session.IsDisposed())
                         return;
 
-                    if (_disconnectingSessions.ContainsKey(targetId))
+                    if (!_sessions.TryGetValue(targetId, out var current) || !ReferenceEquals(current, session))
                         return;
 
                     if (deliveryMethod == DeliveryMethod.Unreliable)
@@ -673,7 +683,7 @@ namespace Liminal.Net.Core
                     if (session.IsDisposed())
                         return;
 
-                    if (_disconnectingSessions.ContainsKey(session.Id))
+                    if (!_sessions.TryGetValue(session.Id, out var current) || !ReferenceEquals(current, session))
                         return;
 
                     if (session.RawSendCursorUnreliable > 0)
@@ -795,52 +805,25 @@ namespace Liminal.Net.Core
                 return;
             }
 
-            while (!_loopbackQueue.IsEmpty &&
-                   _loopbackQueue.TryDequeue(out var loopbackItem))
+            if (Interlocked.CompareExchange(ref _isPolling, 1, 0) != 0)
             {
-                var senderId = loopbackItem.SenderId;
-                var packet = loopbackItem.Packet;
-
-                try
-                {
-                    _interpreter.Dispatch(
-                        packet.PacketId,
-                        senderId,
-                        packet.AsMemory());
-                }
-                finally
-                {
-                    ReturnPacketBuffer(packet);
-                }
+                return;
             }
 
-            long now = Stopwatch.GetTimestamp();
-
-            LiminalSession[] activeSessions = Volatile.Read(ref _activeSessions);
-            for (int i = 0; i < activeSessions.Length; i++)
+            try
             {
-                var session = activeSessions[i];
-                if (session.IsDisposed())
-                    continue;
-
-                if (_disconnectingSessions.ContainsKey(session.Id))
-                    continue;
-
-                while (session.InboundQueueUnreliable.TryDequeue(out var packet))
+                while (!_loopbackQueue.IsEmpty &&
+                       _loopbackQueue.TryDequeue(out var loopbackItem))
                 {
-                    session.ReleaseInboundPacketUnreliable();
+                    var senderId = loopbackItem.SenderId;
+                    var packet = loopbackItem.Packet;
 
                     try
                     {
                         _interpreter.Dispatch(
                             packet.PacketId,
-                            session.Id,
+                            senderId,
                             packet.AsMemory());
-                    }
-                    catch (Exception ex)
-                    {
-                        LiminalLogger.LogError(
-                            $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
                     }
                     finally
                     {
@@ -848,32 +831,71 @@ namespace Liminal.Net.Core
                     }
                 }
 
-                while (session.InboundQueueReliable.TryDequeue(out var packet))
-                {
-                    session.ReleaseInboundPacketReliable();
+                long now = Stopwatch.GetTimestamp();
 
-                    try
+                LiminalSession[] activeSessions = Volatile.Read(ref _activeSessions);
+                for (int i = 0; i < activeSessions.Length; i++)
+                {
+                    var session = activeSessions[i];
+                    if (session.IsDisposed())
+                        continue;
+
+                    if (!_sessions.TryGetValue(session.Id, out var current) || !ReferenceEquals(current, session))
+                        continue;
+
+                    while (session.InboundQueueUnreliable.TryDequeue(out var packet))
                     {
-                        _interpreter.Dispatch(
-                            packet.PacketId,
-                            session.Id,
-                            packet.AsMemory());
+                        session.ReleaseInboundPacketUnreliable();
+
+                        try
+                        {
+                            _interpreter.Dispatch(
+                                packet.PacketId,
+                                session.Id,
+                                packet.AsMemory());
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError(
+                                $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                        }
+                        finally
+                        {
+                            ReturnPacketBuffer(packet);
+                        }
                     }
-                    catch (Exception ex)
+
+                    while (session.InboundQueueReliable.TryDequeue(out var packet))
                     {
-                        LiminalLogger.LogError(
-                            $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                        session.ReleaseInboundPacketReliable();
+
+                        try
+                        {
+                            _interpreter.Dispatch(
+                                packet.PacketId,
+                                session.Id,
+                                packet.AsMemory());
+                        }
+                        catch (Exception ex)
+                        {
+                            LiminalLogger.LogError(
+                                $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+                        }
+                        finally
+                        {
+                            ReturnPacketBuffer(packet);
+                        }
                     }
-                    finally
-                    {
-                        ReturnPacketBuffer(packet);
-                    }
+
+                    _hiccup.ReleaseInboundWhenSafe(session, now);
                 }
 
-                _hiccup.ReleaseInboundWhenSafe(session, now);
+                ProcessPendingDisconnects();
             }
-
-            ProcessPendingDisconnects();
+            finally
+            {
+                Volatile.Write(ref _isPolling, 0);
+            }
         }
 
         #endregion
@@ -903,10 +925,15 @@ namespace Liminal.Net.Core
                 if (_sessionManagerDisposed)
                     return;
 
-                if (_sessions.ContainsKey(ILiminalTransport.SERVER_ID))
-                    return;
+                if (_disconnectingSessions.TryRemove(ILiminalTransport.SERVER_ID, out var staleServerSession))
+                {
+                    DisposeDisconnectedSession(staleServerSession);
+                }
 
-                _disconnectingSessions.TryRemove(ILiminalTransport.SERVER_ID, out _);
+                if (_sessions.TryRemove(ILiminalTransport.SERVER_ID, out var existingServerSession))
+                {
+                    DisposeDisconnectedSession(existingServerSession);
+                }
 
                 _sessions[ILiminalTransport.SERVER_ID] = new LiminalSession(
                     ILiminalTransport.SERVER_ID,
@@ -929,10 +956,18 @@ namespace Liminal.Net.Core
                 if (_sessionManagerDisposed)
                     return;
 
-                if (_sessions.ContainsKey(id))
+                if (_transport != null && !_transport.IsClientConnected(id))
                     return;
 
-                _disconnectingSessions.TryRemove(id, out _);
+                if (_disconnectingSessions.TryRemove(id, out var staleSession))
+                {
+                    DisposeDisconnectedSession(staleSession);
+                }
+
+                if (_sessions.TryRemove(id, out var existingSession))
+                {
+                    DisposeDisconnectedSession(existingSession);
+                }
 
                 _sessions[id] = new LiminalSession(
                     id,
@@ -1073,7 +1108,11 @@ namespace Liminal.Net.Core
                 _privatePool.Return(packet.BackingBuffer);
         }
 
-        public int GetActiveSessionCount() => _sessions.Count;
+        public int GetActiveSessionCount()
+        {
+            var arr = Volatile.Read(ref _activeSessions);
+            return Math.Max(_sessions.Count, arr != null ? arr.Length : 0);
+        }
 
         public int GetSessionIds(Span<ushort> destination)
         {

@@ -52,27 +52,35 @@ namespace Liminal.Net.SyncVar
         void ClearDirty();
         bool IsDirty { get; }
         bool IsDisposed { get; }
+        ushort LocalSlot { get; set; }
 
         void AllocateSlots(int size);
+        bool TryInitializeSlabSlots(ReadOnlySpan<byte> initialBytes);
+        void AttachManager(SyncVarManager manager);
         void Clear();
         void ApplyClearFromRemote();
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
         bool TryExtractSnapshotData(out byte[] data, out uint version);
-        void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false);
+        bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0);
         void FirePendingEvents();
+        void InternalTeardown();
+        void ResetSession();
     }
 
-    public class SyncVar<T> : ISyncVarInternal, IDisposable
+    public class SyncVar<T> : ISyncVarInternal
     {
         private readonly SyncVarPermissions _permissions;
         private readonly SyncVarValueCell<T> _valueCell;
-        private readonly SyncVarWireBuffer _wireBuffer;
-        private readonly SyncVarManager _manager;
+        private volatile SyncVarWireBuffer _wireBuffer;
+        private volatile SyncVarManager _manager;
         private readonly byte[] _tokenBytes;
         private readonly object _writeLock = new();
+        private readonly object _permissionBroadcastLock = new();
+        private readonly object _registrationLock = new();
 
-        private int _isDirty = 0;
+        private volatile ushort _localSlot = ushort.MaxValue;
+        private int _fallbackDirty = 0;
 
         [ThreadStatic]
         private static ArrayBufferWriter<byte> _threadLocalWriter;
@@ -80,6 +88,12 @@ namespace Liminal.Net.SyncVar
         public event Action<T, T> OnValueChanged;
         public event Action<bool> OnAuthorityChanged;
         public event Action<bool> OnVisibilityScopeChanged;
+
+        public ushort LocalSlot
+        {
+            get => _localSlot;
+            set => _localSlot = value;
+        }
 
         public string Token { get; }
         public byte[] TokenBytes => _tokenBytes;
@@ -99,7 +113,19 @@ namespace Liminal.Net.SyncVar
         public SyncVarVisibilityState VisibilityState => _permissions.State;
         public bool IsVisible => _permissions.IsLocallyVisible;
         public bool HasAuthority => _permissions.HasAuthority;
-        public bool IsDirty => Volatile.Read(ref _isDirty) != 0;
+        public bool IsDirty
+        {
+            get
+            {
+                var mgr = _manager;
+                ushort slot = _localSlot;
+                if (mgr != null && slot != ushort.MaxValue)
+                {
+                    return mgr.DirtyBitset.IsDirty(slot);
+                }
+                return Volatile.Read(ref _fallbackDirty) != 0;
+            }
+        }
         public bool IsDisposed => _wireBuffer.IsDisposed;
 
         public bool IsAuthorized(ushort clientId) => _permissions.IsAuthorized(clientId);
@@ -154,7 +180,7 @@ namespace Liminal.Net.SyncVar
             _valueCell = new SyncVarValueCell<T>(initialValue);
             _wireBuffer = new SyncVarWireBuffer(_manager?.Slab);
 
-            _manager.RegisterSyncVar(this);
+            _manager?.RegisterSyncVar(this);
         }
 
         public void SetLocallyVisible(bool isVisible)
@@ -181,22 +207,58 @@ namespace Liminal.Net.SyncVar
         public bool TryMarkDirty()
         {
             if (IsDisposed || !HasAuthority) return false;
-            if (Interlocked.Exchange(ref _isDirty, 1) != 0) return false;
-            if (IsDisposed || !HasAuthority)
+            var mgr = _manager;
+            ushort slot = _localSlot;
+            if (mgr != null && slot != ushort.MaxValue)
             {
-                Volatile.Write(ref _isDirty, 0);
-                return false;
+                mgr.DirtyBitset.SetDirty(slot);
+                return true;
             }
+
+            Volatile.Write(ref _fallbackDirty, 1);
             return true;
         }
 
         public void ClearDirty()
         {
-            Volatile.Write(ref _isDirty, 0);
+            var mgr = _manager;
+            ushort slot = _localSlot;
+            if (mgr != null && slot != ushort.MaxValue)
+            {
+                mgr.DirtyBitset.ClearDirty(slot);
+            }
+            Volatile.Write(ref _fallbackDirty, 0);
+        }
+
+        internal void AttachManager(SyncVarManager manager)
+        {
+            if (manager == null) return;
+            _manager = manager;
+            _permissions.UpdateManager(manager);
+            _wireBuffer.UpdateSlab(manager.Slab);
+        }
+
+        void ISyncVarInternal.AttachManager(SyncVarManager manager) => AttachManager(manager);
+
+        bool ISyncVarInternal.TryInitializeSlabSlots(ReadOnlySpan<byte> initialBytes)
+        {
+            var mgr = _manager;
+            var slab = mgr?.Slab;
+            if (slab != null)
+            {
+                _wireBuffer.UpdateSlab(slab);
+            }
+            return _wireBuffer.AllocateAndWriteInitial(initialBytes);
         }
 
         void ISyncVarInternal.AllocateSlots(int size)
         {
+            var mgr = _manager;
+            var slab = mgr?.Slab;
+            if (slab != null)
+            {
+                _wireBuffer.UpdateSlab(slab);
+            }
             _wireBuffer.AllocateInitialSlots(size);
         }
 
@@ -205,56 +267,128 @@ namespace Liminal.Net.SyncVar
             MessagePackSerializer.Serialize(writer, Value, options);
         }
 
+        public void Reattach(SyncVarManager manager = null)
+        {
+            if (IsDisposed) return;
+            lock (_registrationLock)
+            {
+                if (IsDisposed) return;
+                var mgr = manager ?? SyncVarManager.GetManagerForRegistration();
+                if (mgr != null && !mgr.IsTornDown)
+                {
+                    _manager = mgr;
+                    _permissions.UpdateManager(mgr);
+                    _wireBuffer.UpdateSlab(mgr.Slab);
+                    mgr.RegisterSyncVar(this);
+                }
+            }
+        }
+
         private void WriteFromOwningThread(T newValue, bool force = false)
         {
             if (IsDisposed) return;
 
-            if (!HasAuthority)
+            var currentMgr = _manager;
+            if (currentMgr != null && currentMgr.IsTornDown)
             {
-                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
-                ushort myId = netManager?.localID ?? 0;
-                LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
+                currentMgr = null;
+            }
+
+            var activeMgr = currentMgr ?? SyncVarManager.GetManagerForRegistration();
+
+            if (activeMgr == null)
+            {
+                T oldValue;
+                bool fireChanged;
+                lock (_writeLock)
+                {
+                    if (IsDisposed) return;
+                    if (!_valueCell.TryUpdate(newValue, force, deferEvent: false, out oldValue, out fireChanged, out _))
+                    {
+                        return;
+                    }
+                }
+
+                if (fireChanged)
+                {
+                    OnValueChanged?.Invoke(oldValue, newValue);
+                }
                 return;
             }
 
-            T oldValue;
-            bool fireChanged;
+            if (IsDisposed) return;
+
+            if (_manager != activeMgr || _localSlot == ushort.MaxValue)
+            {
+                if (IsDisposed) return;
+                lock (_registrationLock)
+                {
+                    if (IsDisposed) return;
+                    if (_manager != activeMgr || _localSlot == ushort.MaxValue)
+                    {
+                        if (activeMgr.TryGetSyncVar(Token, out var existing) && !ReferenceEquals(existing, this))
+                        {
+                            return;
+                        }
+                        _manager = activeMgr;
+                        _permissions.UpdateManager(activeMgr);
+                        _wireBuffer.UpdateSlab(activeMgr.Slab);
+                        activeMgr.RegisterSyncVar(this);
+                    }
+                }
+            }
+
+            if (IsDisposed || !HasAuthority)
+            {
+                if (!HasAuthority && !IsDisposed)
+                {
+                    var netManager = activeMgr.AttachedManager ?? LiminalNetworkManager.Instance;
+                    ushort myId = netManager?.localID ?? 0;
+                    LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
+                }
+                return;
+            }
+
+            T oldValueWithNetwork;
+            bool fireChangedWithNetwork;
 
             lock (_writeLock)
             {
                 if (IsDisposed || !HasAuthority) return;
 
+                if (!_valueCell.TryPrepareUpdate(newValue, force, out uint nextVersion))
+                {
+                    return;
+                }
+
                 _threadLocalWriter ??= new ArrayBufferWriter<byte>(256);
                 _threadLocalWriter.Clear();
-                MessagePackSerializer.Serialize(_threadLocalWriter, newValue, _manager.SerializerOptions);
+                MessagePackSerializer.Serialize(_threadLocalWriter, newValue, activeMgr.SerializerOptions);
 
-                if (!_valueCell.TryUpdate(newValue, force, deferEvent: false, out oldValue, out fireChanged, out uint newVersion))
+                if (!_wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, nextVersion, force))
                 {
                     return;
                 }
 
-                if (!_wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, newVersion, force))
-                {
-                    return;
-                }
+                _valueCell.CommitUpdate(newValue, nextVersion, deferEvent: false, out oldValueWithNetwork, out fireChangedWithNetwork);
 
                 if (TryMarkDirty())
                 {
-                    _manager?.EnqueueDirty(this);
+                    activeMgr.EnqueueDirty(this);
                 }
             }
 
-            if (fireChanged)
+            if (fireChangedWithNetwork)
             {
-                OnValueChanged?.Invoke(oldValue, newValue);
+                OnValueChanged?.Invoke(oldValueWithNetwork, newValue);
             }
         }
 
-        public void ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false)
+        public bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0)
         {
-            if (IsDisposed) return;
+            if (IsDisposed) return false;
             uint currentVer = _valueCell.Version;
-            if (!force && newVersion <= currentVer && currentVer != 0) return;
+            if (!force && newVersion <= currentVer && currentVer != 0) return false;
 
             T deserialized = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
             T oldValue;
@@ -262,11 +396,16 @@ namespace Liminal.Net.SyncVar
 
             lock (_writeLock)
             {
-                if (IsDisposed) return;
+                if (IsDisposed) return false;
+
+                if (senderId != 0 && !_permissions.IsAuthorized(senderId))
+                {
+                    return false;
+                }
 
                 if (!_valueCell.TryApplyRemote(deserialized, newVersion, force, deferEvent, out oldValue, out fireEvent))
                 {
-                    return;
+                    return false;
                 }
 
                 if (incomingBytes.IsSingleSegment)
@@ -294,6 +433,8 @@ namespace Liminal.Net.SyncVar
             {
                 OnValueChanged?.Invoke(oldValue, deserialized);
             }
+
+            return true;
         }
 
         public bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version)
@@ -341,104 +482,143 @@ namespace Liminal.Net.SyncVar
 
         public void SetAuthIds(params ushort[] clientIds)
         {
-            if (!_permissions.SetAuthIds(clientIds, out ushort[] previousAuthorities, out bool fireEvent, out bool currentAuth))
-            {
-                return;
-            }
+            ushort[] newAuths;
+            ushort[] previousAuthorities;
+            bool fireEvent;
+            bool currentAuth;
 
-            if (!currentAuth)
+            lock (_permissionBroadcastLock)
             {
-                ClearDirty();
+                lock (_writeLock)
+                {
+                    if (!_permissions.SetAuthIds(clientIds, out previousAuthorities, out fireEvent, out currentAuth))
+                    {
+                        return;
+                    }
+
+                    if (!currentAuth)
+                    {
+                        ClearDirty();
+                    }
+                }
+
+                newAuths = _permissions.Authorities;
+                BroadcastAuthIfServer(newAuths);
+
+                var mgr = _manager;
+                if (Visibility == SyncVarVisibility.OwnerOnly && mgr != null)
+                {
+                    for (int i = 0; i < newAuths.Length; i++)
+                    {
+                        ushort id = newAuths[i];
+                        if (IsVisibleTo(id))
+                        {
+                            mgr.SendSyncVarToClient(this, id);
+                        }
+                    }
+
+                    for (int i = 0; i < previousAuthorities.Length; i++)
+                    {
+                        ushort id = previousAuthorities[i];
+                        if (!IsVisibleTo(id))
+                        {
+                            mgr.SendEvictionToClient(this, id);
+                        }
+                    }
+                }
             }
 
             if (fireEvent)
             {
                 OnAuthorityChanged?.Invoke(currentAuth);
-            }
-
-            var newAuths = _permissions.Authorities;
-            BroadcastAuthIfServer(newAuths);
-
-            if (Visibility == SyncVarVisibility.OwnerOnly && _manager != null)
-            {
-                for (int i = 0; i < newAuths.Length; i++)
-                {
-                    ushort id = newAuths[i];
-                    if (IsVisibleTo(id))
-                    {
-                        _manager.SendSyncVarToClient(this, id);
-                    }
-                }
-
-                for (int i = 0; i < previousAuthorities.Length; i++)
-                {
-                    ushort id = previousAuthorities[i];
-                    if (!IsVisibleTo(id))
-                    {
-                        _manager.SendEvictionToClient(this, id);
-                    }
-                }
             }
         }
 
         public void AddAuthority(ushort clientId)
         {
-            if (!_permissions.AddAuthority(clientId, out ushort[] next, out bool fireEvent, out bool currentAuth))
+            bool fireEvent;
+            bool currentAuth;
+            ushort[] next;
+
+            lock (_permissionBroadcastLock)
             {
-                return;
+                lock (_writeLock)
+                {
+                    if (!_permissions.AddAuthority(clientId, out next, out fireEvent, out currentAuth))
+                    {
+                        return;
+                    }
+                }
+
+                if (next != null)
+                {
+                    BroadcastAuthIfServer(next);
+                }
+
+                if (Visibility == SyncVarVisibility.OwnerOnly && IsVisibleTo(clientId))
+                {
+                    _manager?.SendSyncVarToClient(this, clientId);
+                }
             }
 
             if (fireEvent)
             {
                 OnAuthorityChanged?.Invoke(currentAuth);
-            }
-
-            if (next != null)
-            {
-                BroadcastAuthIfServer(next);
-            }
-
-            if (Visibility == SyncVarVisibility.OwnerOnly && IsVisibleTo(clientId))
-            {
-                _manager?.SendSyncVarToClient(this, clientId);
             }
         }
 
         public void RemoveAuthority(ushort clientId)
         {
-            if (!_permissions.RemoveAuthority(clientId, out ushort[] next, out bool fireEvent, out bool currentAuth))
-            {
-                return;
-            }
+            bool fireEvent;
+            bool currentAuth;
+            ushort[] next;
 
-            if (!currentAuth)
+            lock (_permissionBroadcastLock)
             {
-                ClearDirty();
+                lock (_writeLock)
+                {
+                    if (!_permissions.RemoveAuthority(clientId, out next, out fireEvent, out currentAuth))
+                    {
+                        return;
+                    }
+
+                    if (!currentAuth)
+                    {
+                        ClearDirty();
+                    }
+                }
+
+                if (next != null)
+                {
+                    BroadcastAuthIfServer(next);
+                }
+
+                if (Visibility == SyncVarVisibility.OwnerOnly && !IsVisibleTo(clientId))
+                {
+                    _manager?.SendEvictionToClient(this, clientId);
+                }
             }
 
             if (fireEvent)
             {
                 OnAuthorityChanged?.Invoke(currentAuth);
             }
-
-            if (next != null)
-            {
-                BroadcastAuthIfServer(next);
-            }
-
-            if (Visibility == SyncVarVisibility.OwnerOnly && !IsVisibleTo(clientId))
-            {
-                _manager?.SendEvictionToClient(this, clientId);
-            }
         }
 
         public void ApplyAuthUpdateFromRemote(ushort[] newAuthIds, bool deferEvent = false)
         {
-            _permissions.ApplyAuthUpdateFromRemote(newAuthIds, deferEvent, out bool fireEvent, out bool currentAuth);
-            if (!currentAuth)
+            bool fireEvent;
+            bool currentAuth;
+
+            lock (_writeLock)
             {
-                ClearDirty();
+                _permissions.ApplyAuthUpdateFromRemote(newAuthIds, deferEvent, out fireEvent, out currentAuth);
+                if (!currentAuth)
+                {
+                    ClearDirty();
+                }
             }
+
             if (fireEvent)
             {
                 OnAuthorityChanged?.Invoke(currentAuth);
@@ -447,31 +627,35 @@ namespace Liminal.Net.SyncVar
 
         public void SetExclusionIds(params ushort[] clientIds)
         {
-            if (!_permissions.SetExclusionIds(clientIds, out var newlyExcluded, out var newlyUnexcluded))
+            lock (_permissionBroadcastLock)
             {
-                return;
-            }
-
-            if (newlyExcluded != null && _manager != null)
-            {
-                for (int i = 0; i < newlyExcluded.Count; i++)
+                if (!_permissions.SetExclusionIds(clientIds, out var newlyExcluded, out var newlyUnexcluded))
                 {
-                    ushort id = newlyExcluded[i];
-                    if (!IsVisibleTo(id))
+                    return;
+                }
+
+                var mgr = _manager;
+                if (newlyExcluded != null && mgr != null)
+                {
+                    for (int i = 0; i < newlyExcluded.Count; i++)
                     {
-                        _manager.SendEvictionToClient(this, id);
+                        ushort id = newlyExcluded[i];
+                        if (!IsVisibleTo(id))
+                        {
+                            mgr.SendEvictionToClient(this, id);
+                        }
                     }
                 }
-            }
 
-            if (newlyUnexcluded != null && _manager != null)
-            {
-                for (int i = 0; i < newlyUnexcluded.Count; i++)
+                if (newlyUnexcluded != null && mgr != null)
                 {
-                    ushort id = newlyUnexcluded[i];
-                    if (IsVisibleTo(id))
+                    for (int i = 0; i < newlyUnexcluded.Count; i++)
                     {
-                        _manager.SendSyncVarToClient(this, id);
+                        ushort id = newlyUnexcluded[i];
+                        if (IsVisibleTo(id))
+                        {
+                            mgr.SendSyncVarToClient(this, id);
+                        }
                     }
                 }
             }
@@ -481,64 +665,75 @@ namespace Liminal.Net.SyncVar
 
         public void AddExclusion(ushort clientId)
         {
-            if (_permissions.AddExclusion(clientId, out bool added))
+            lock (_permissionBroadcastLock)
             {
-                if (added && !IsVisibleTo(clientId))
+                if (_permissions.AddExclusion(clientId, out bool added))
                 {
-                    _manager?.SendEvictionToClient(this, clientId);
+                    if (added && !IsVisibleTo(clientId))
+                    {
+                        _manager?.SendEvictionToClient(this, clientId);
+                    }
                 }
             }
         }
 
         public void RemoveExclusion(ushort clientId)
         {
-            if (_permissions.RemoveExclusion(clientId, out bool removed))
+            lock (_permissionBroadcastLock)
             {
-                if (removed && IsVisibleTo(clientId))
+                if (_permissions.RemoveExclusion(clientId, out bool removed))
                 {
-                    _manager?.SendSyncVarToClient(this, clientId);
+                    if (removed && IsVisibleTo(clientId))
+                    {
+                        _manager?.SendSyncVarToClient(this, clientId);
+                    }
                 }
             }
         }
 
         public void SetVisibility(SyncVarVisibility visibility)
         {
-            if (!_permissions.SetVisibility(visibility, out bool changed, out var previousState, out var newState))
+            lock (_permissionBroadcastLock)
             {
-                return;
-            }
-
-            if (changed)
-            {
-                if (TryMarkDirty())
+                if (!_permissions.SetVisibility(visibility, out bool changed, out var previousState, out var newState))
                 {
-                    _manager?.EnqueueDirty(this);
+                    return;
                 }
 
-                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
-                if (netManager != null && netManager.SessionManager != null &&
-                    (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
+                if (changed)
                 {
-                    int maxClients = netManager.Transport.Config.MaxConnectionCount + 2;
-                    Span<ushort> allSessions = stackalloc ushort[maxClients];
-                    int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
-
-                    for (int s = 0; s < totalSessions; s++)
+                    if (TryMarkDirty())
                     {
-                        ushort sid = allSessions[s];
-                        if (sid == ILiminalTransport.SERVER_ID && netManager.Role == NetworkRole.Host)
-                            continue;
+                        _manager?.EnqueueDirty(this);
+                    }
 
-                        bool wasVisible = previousState.IsVisibleTo(sid, netManager);
-                        bool isNowVisible = newState.IsVisibleTo(sid, netManager);
+                    var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
+                    if (netManager != null && netManager.SessionManager != null &&
+                        (netManager.Role == NetworkRole.Server || netManager.Role == NetworkRole.Host || netManager.Transport?.IsServer == true))
+                    {
+                        int active = netManager.SessionManager.GetActiveSessionCount();
+                        int maxConfig = (netManager.Transport?.Config?.MaxConnectionCount ?? netManager.Config?.MaxConnectionCount ?? 10) + 4;
+                        int maxClients = Math.Max(active + 4, maxConfig);
+                        Span<ushort> allSessions = stackalloc ushort[maxClients];
+                        int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
 
-                        if (wasVisible && !isNowVisible)
+                        for (int s = 0; s < totalSessions; s++)
                         {
-                            _manager?.SendEvictionToClient(this, sid);
-                        }
-                        else if (!wasVisible && isNowVisible)
-                        {
-                            _manager?.SendSyncVarToClient(this, sid);
+                            ushort sid = allSessions[s];
+                            if (sid == ILiminalTransport.SERVER_ID && netManager.Role == NetworkRole.Host)
+                                continue;
+
+                            bool wasVisible = previousState.IsVisibleTo(sid, netManager);
+                            bool isNowVisible = newState.IsVisibleTo(sid, netManager);
+
+                            if (wasVisible && !isNowVisible)
+                            {
+                                _manager?.SendEvictionToClient(this, sid);
+                            }
+                            else if (!wasVisible && isNowVisible)
+                            {
+                                _manager?.SendSyncVarToClient(this, sid);
+                            }
                         }
                     }
                 }
@@ -547,31 +742,35 @@ namespace Liminal.Net.SyncVar
 
         public void SetObserverIds(params ushort[] clientIds)
         {
-            if (!_permissions.SetObserverIds(clientIds, out var newlyAdded, out var newlyRemoved))
+            lock (_permissionBroadcastLock)
             {
-                return;
-            }
-
-            if (newlyAdded != null && _manager != null)
-            {
-                for (int i = 0; i < newlyAdded.Count; i++)
+                if (!_permissions.SetObserverIds(clientIds, out var newlyAdded, out var newlyRemoved))
                 {
-                    ushort id = newlyAdded[i];
-                    if (IsVisibleTo(id))
+                    return;
+                }
+
+                var mgr = _manager;
+                if (newlyAdded != null && mgr != null)
+                {
+                    for (int i = 0; i < newlyAdded.Count; i++)
                     {
-                        _manager.SendSyncVarToClient(this, id);
+                        ushort id = newlyAdded[i];
+                        if (IsVisibleTo(id))
+                        {
+                            mgr.SendSyncVarToClient(this, id);
+                        }
                     }
                 }
-            }
 
-            if (newlyRemoved != null && _manager != null)
-            {
-                for (int i = 0; i < newlyRemoved.Count; i++)
+                if (newlyRemoved != null && mgr != null)
                 {
-                    ushort id = newlyRemoved[i];
-                    if (!IsVisibleTo(id))
+                    for (int i = 0; i < newlyRemoved.Count; i++)
                     {
-                        _manager.SendEvictionToClient(this, id);
+                        ushort id = newlyRemoved[i];
+                        if (!IsVisibleTo(id))
+                        {
+                            mgr.SendEvictionToClient(this, id);
+                        }
                     }
                 }
             }
@@ -581,22 +780,28 @@ namespace Liminal.Net.SyncVar
 
         public void AddObserver(ushort clientId)
         {
-            if (_permissions.AddObserver(clientId, out bool added))
+            lock (_permissionBroadcastLock)
             {
-                if (added && IsVisibleTo(clientId))
+                if (_permissions.AddObserver(clientId, out bool added))
                 {
-                    _manager?.SendSyncVarToClient(this, clientId);
+                    if (added && IsVisibleTo(clientId))
+                    {
+                        _manager?.SendSyncVarToClient(this, clientId);
+                    }
                 }
             }
         }
 
         public void RemoveObserver(ushort clientId)
         {
-            if (_permissions.RemoveObserver(clientId, out bool removed))
+            lock (_permissionBroadcastLock)
             {
-                if (removed && !IsVisibleTo(clientId))
+                if (_permissions.RemoveObserver(clientId, out bool removed))
                 {
-                    _manager?.SendEvictionToClient(this, clientId);
+                    if (removed && !IsVisibleTo(clientId))
+                    {
+                        _manager?.SendEvictionToClient(this, clientId);
+                    }
                 }
             }
         }
@@ -660,18 +865,42 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void Dispose()
+        internal void InternalTeardown()
         {
             Unregister();
+            _localSlot = ushort.MaxValue;
             SetLocallyVisible(false);
             lock (_writeLock)
             {
                 _permissions.ClearPendingAuth();
+                _permissions.UpdateManager(null);
                 _valueCell.ClearPendingValue();
                 _wireBuffer.Dispose();
+                _wireBuffer.UpdateSlab(null);
                 ClearDirty();
+                Volatile.Write(ref _manager, null);
             }
         }
+
+        void ISyncVarInternal.InternalTeardown() => InternalTeardown();
+
+        internal void ResetSession()
+        {
+            _localSlot = ushort.MaxValue;
+            SetLocallyVisible(false);
+            lock (_writeLock)
+            {
+                _permissions.ClearPendingAuth();
+                _permissions.UpdateManager(null);
+                _valueCell.ClearPendingValue();
+                _wireBuffer.Clear();
+                _wireBuffer.UpdateSlab(null);
+                ClearDirty();
+                Volatile.Write(ref _manager, null);
+            }
+        }
+
+        void ISyncVarInternal.ResetSession() => ResetSession();
 
         private void Unregister()
         {

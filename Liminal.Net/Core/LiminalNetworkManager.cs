@@ -4,6 +4,7 @@ using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
 using System;
 using System.Diagnostics;
+using System.Net;
 using System.Threading;
 
 namespace Liminal.Net.Core
@@ -31,11 +32,23 @@ namespace Liminal.Net.Core
     public class LiminalNetworkManager
     {
         #region Singleton
-        public static LiminalNetworkManager Instance;
+        public static volatile LiminalNetworkManager Instance;
         #endregion
 
-        public NetworkRole Role { get; private set; } = NetworkRole.None;
-        public NetworkLifecycleState LifecycleState { get; private set; } = NetworkLifecycleState.Stopped;
+        private volatile int _role = (int)NetworkRole.None;
+        private volatile int _lifecycleState = (int)NetworkLifecycleState.Stopped;
+
+        public NetworkRole Role
+        {
+            get => (NetworkRole)Volatile.Read(ref _role);
+            private set => Volatile.Write(ref _role, (int)value);
+        }
+
+        public NetworkLifecycleState LifecycleState
+        {
+            get => (NetworkLifecycleState)Volatile.Read(ref _lifecycleState);
+            private set => Volatile.Write(ref _lifecycleState, (int)value);
+        }
 
         private Action<NetworkLifecycleState> _onLifecycleStateChanged;
         public event Action<NetworkLifecycleState> OnLifecycleStateChanged
@@ -105,6 +118,8 @@ namespace Liminal.Net.Core
 
         private readonly ILiminalTransport _transport;
         public ILiminalTransport Transport => _transport;
+        public EndPoint? LocalEndpoint => _transport?.LocalEndpoint;
+        public int BoundPort => (_transport?.LocalEndpoint as IPEndPoint)?.Port ?? 0;
 
         private readonly LiminalNetworkConfig _config;
         public LiminalNetworkConfig Config => _config;
@@ -294,7 +309,7 @@ namespace Liminal.Net.Core
         {
             _eventHub.RaiseManagerPreInitialize();
 
-            ShutdownSystems();
+            ShutdownSystems(isShutdown: false);
 
             LiminalLogger.Log("[Manager] Initializing Network Systems...");
 
@@ -332,9 +347,12 @@ namespace Liminal.Net.Core
             _eventHub.RaiseDisconnectResolved(id, reason, message);
         }
 
-        private void ShutdownSystems()
+        private void ShutdownSystems(bool isShutdown = false)
         {
-            _eventHub.RaiseManagerShutdown();
+            if (isShutdown)
+            {
+                _eventHub.RaiseManagerShutdown();
+            }
             _eventHub.UnbindCoreSystems();
 
             if (_ticker != null)
@@ -514,24 +532,36 @@ namespace Liminal.Net.Core
             }
         }
 
+        private int _isDisconnecting;
+
         public void Disconnect()
         {
             if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
 
-            LifecycleState = NetworkLifecycleState.Stopping;
-            Role = NetworkRole.None;
+            if (Interlocked.Exchange(ref _isDisconnecting, 1) == 1)
+                return;
 
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+            try
+            {
+                LifecycleState = NetworkLifecycleState.Stopping;
+                Role = NetworkRole.None;
 
-            _transport.Disconnect();
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
-            ShutdownSystems();
+                _transport.Disconnect();
 
-            LifecycleState = NetworkLifecycleState.Stopped;
+                ShutdownSystems(isShutdown: false);
 
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                LifecycleState = NetworkLifecycleState.Stopped;
 
-            LiminalLogger.Log("[Manager] Network State Disconnected.");
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+
+                LiminalLogger.Log("[Manager] Network State Disconnected.");
+            }
+            finally
+            {
+                Volatile.Write(ref _isDisconnecting, 0);
+            }
         }
         private int _isShuttingDown;
 
@@ -552,7 +582,7 @@ namespace Liminal.Net.Core
 
                 _transport.Shutdown();
 
-                ShutdownSystems();
+                ShutdownSystems(isShutdown: true);
 
                 LifecycleState = NetworkLifecycleState.Stopped;
 

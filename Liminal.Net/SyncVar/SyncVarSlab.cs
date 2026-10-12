@@ -242,6 +242,27 @@ namespace Liminal.Net.SyncVar
             Volatile.Write(ref _allocatedBytes, snapshot.Length);
         }
 
+        public void Reset()
+        {
+            for (int i = 1; i < MaxPages; i++)
+            {
+                _pages[i] = null;
+            }
+            if (_pages[0] == null)
+            {
+                _pages[0] = new byte[PageSize];
+            }
+            else
+            {
+                Array.Clear(_pages[0], 0, _pages[0].Length);
+            }
+            for (int i = 0; i < _tierCount; i++)
+            {
+                _tierPools[i]?.Clear();
+            }
+            Volatile.Write(ref _allocatedBytes, 0);
+        }
+
         public void Dispose()
         {
             for (int i = 0; i < MaxPages; i++)

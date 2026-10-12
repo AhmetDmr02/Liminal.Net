@@ -210,5 +210,51 @@ namespace Liminal.Net.Tests
             // Non-sticky packet was dropped because no one was listening when it arrived
             Assert.That(callCount, Is.EqualTo(0));
         }
+
+        [Test]
+        public void StickyPacket_SteadyStateDispatch_CausesZeroGCAllocations()
+        {
+            ushort counterId = LiminalPacketLibrary.GetId<TestStickyCounterPacket>();
+            var packet = new TestStickyCounterPacket { Counter = 1 };
+            byte[] rawBytes = MessagePackSerializer.Serialize(packet);
+
+            _interpreter.Dispatch(counterId, 1, rawBytes);
+            _interpreter.TryGetSticky<TestStickyCounterPacket>(out _);
+
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            for (int i = 0; i < 50; i++)
+            {
+                _interpreter.Dispatch(counterId, 1, rawBytes);
+                _interpreter.TryGetSticky<TestStickyCounterPacket>(out _);
+            }
+
+            long allocAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.That(allocAfter - allocBefore, Is.EqualTo(0), "Steady-state sticky dispatch and TryGetSticky caused GC allocations.");
+        }
+
+        [Test]
+        public void StickyPacket_SteadyStateDispatchWithSubscriber_CausesZeroGCAllocations()
+        {
+            ushort counterId = LiminalPacketLibrary.GetId<TestStickyCounterPacket>();
+            var packet = new TestStickyCounterPacket { Counter = 1 };
+            byte[] rawBytes = MessagePackSerializer.Serialize(packet);
+
+            int callbackCount = 0;
+            object sub = new object();
+            _interpreter.Subscribe<TestStickyCounterPacket>((pkt, s) => { callbackCount++; }, sub);
+
+            _interpreter.Dispatch(counterId, 1, rawBytes);
+
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            for (int i = 0; i < 50; i++)
+            {
+                _interpreter.Dispatch(counterId, 1, rawBytes);
+            }
+
+            long allocAfter = GC.GetAllocatedBytesForCurrentThread();
+            Assert.That(allocAfter - allocBefore, Is.EqualTo(0), "Sticky dispatch with subscriber caused GC allocations.");
+        }
     }
 }

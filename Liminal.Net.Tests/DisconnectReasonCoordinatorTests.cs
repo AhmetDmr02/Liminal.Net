@@ -700,6 +700,79 @@ namespace Liminal.Net.Tests
             Assert.That(client.IsConnected, Is.True);
         }
 
+        [Test]
+        public void DisconnectReasonCoordinator_ClientReconnected_FiresOnResolvedOnSecondDisconnect()
+        {
+            var transport = new MockTransport();
+            var config = new LiminalNetworkConfig { ClientIdResolver = new BaseResolver() };
+            transport.InitializeTransport(config);
+            var netManager = new LiminalNetworkManager(transport, config);
+            var coordinator = netManager.DisconnectCoordinator;
+
+            int resolvedCount = 0;
+            ushort lastResolvedId = 0;
+            DisconnectReason lastReason = DisconnectReason.Unknown;
+
+            coordinator.OnResolved += (id, reason, msg) =>
+            {
+                resolvedCount++;
+                lastResolvedId = id;
+                lastReason = reason;
+            };
+
+            ushort clientId = 42;
+
+            // First connection and disconnection
+            transport.TriggerClientConnected(clientId);
+            transport.TriggerClientDisconnected(clientId);
+
+            Assert.That(resolvedCount, Is.EqualTo(1));
+            Assert.That(lastResolvedId, Is.EqualTo(clientId));
+            Assert.That(lastReason, Is.EqualTo(DisconnectReason.ConnectionLost));
+
+            // Reconnection and second disconnection
+            transport.TriggerClientConnected(clientId);
+            transport.TriggerClientDisconnected(clientId);
+
+            Assert.That(resolvedCount, Is.EqualTo(2), "Second disconnect was ignored due to stale _alreadyFired state!");
+            Assert.That(lastResolvedId, Is.EqualTo(clientId));
+        }
+
+        [Test]
+        public void DisconnectReasonCoordinator_LocalClientReconnected_FiresOnResolvedOnSecondDisconnect()
+        {
+            var transport = new MockTransport();
+            var config = new LiminalNetworkConfig { ClientIdResolver = new BaseResolver() };
+            transport.InitializeTransport(config);
+            var netManager = new LiminalNetworkManager(transport, config);
+            var coordinator = netManager.DisconnectCoordinator;
+
+            int resolvedCount = 0;
+            ushort lastResolvedId = 0;
+
+            coordinator.OnResolved += (id, reason, msg) =>
+            {
+                resolvedCount++;
+                lastResolvedId = id;
+            };
+
+            ushort localId = 1;
+
+            // First connection and disconnection
+            transport.TriggerLocalClientConnected(localId);
+            transport.TriggerLocalClientDisconnected(localId);
+
+            Assert.That(resolvedCount, Is.EqualTo(1));
+            Assert.That(lastResolvedId, Is.EqualTo(localId));
+
+            // Reconnection and second disconnection
+            transport.TriggerLocalClientConnected(localId);
+            transport.TriggerLocalClientDisconnected(localId);
+
+            Assert.That(resolvedCount, Is.EqualTo(2), "Second local disconnect was ignored due to stale _alreadyFired state!");
+            Assert.That(lastResolvedId, Is.EqualTo(localId));
+        }
+
         #endregion
 
         #region Supporting Types for Test 48

@@ -9,7 +9,7 @@ namespace Liminal.Net.SyncVar.Internal
     internal sealed class SyncVarPermissions
     {
         private readonly object _lock = new();
-        private readonly SyncVarManager _manager;
+        private volatile SyncVarManager _manager;
         private readonly string _token;
 
         private SyncVarVisibilityState _state;
@@ -35,6 +35,14 @@ namespace Liminal.Net.SyncVar.Internal
             };
 
             _isLocallyVisible = (netManager != null && netManager.Role == NetworkRole.Client) ? 0 : 1;
+        }
+
+        public void UpdateManager(SyncVarManager manager)
+        {
+            lock (_lock)
+            {
+                _manager = manager;
+            }
         }
 
         public SyncVarVisibilityState State => Volatile.Read(ref _state);

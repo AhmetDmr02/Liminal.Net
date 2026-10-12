@@ -45,20 +45,30 @@ namespace Liminal.Net.Core
             _interpreter.Subscribe<DisconnectNoticePacket>(HandleNoticePacket, this);
             _interpreter.Subscribe<DisconnectAckPacket>(HandleAckPacket, this);
 
+            _transport.OnClientConnected += HandleClientConnected;
+            _transport.OnLocalClientConnected += HandleLocalClientConnected;
             _transport.OnClientDisconnected += HandleDisconnected;
             _transport.OnClientKicked += HandleDisconnected;
             _transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
+        }
+
+        private void HandleClientConnected(ushort clientId)
+        {
+            _alreadyFired.TryRemove(clientId, out _);
+            _resolved.TryRemove(clientId, out _);
+        }
+
+        private void HandleLocalClientConnected(ushort localId)
+        {
+            _alreadyFired.TryRemove(localId, out _);
+            _resolved.TryRemove(localId, out _);
         }
 
         private void HandleLocalClientDisconnected(ushort localId)
         {
             // If the client never received a specific reason from the server,
             // resolve under its local ID as ConnectionLost.
-            if (!_resolved.ContainsKey(localId))
-            {
-                _resolved[localId] = (DisconnectReason.ConnectionLost, "Connection to server was lost.");
-            }
-
+            _resolved.TryAdd(localId, (DisconnectReason.ConnectionLost, "Connection to server was lost."));
             HandleDisconnected(localId);
         }
 
@@ -174,19 +184,49 @@ namespace Liminal.Net.Core
             _resolved[clientId] = (reason, message);
         }
 
-        private void HandleTransportReason(ushort id, DisconnectReason reason, string msg)
+        public bool TryGetResolvedReason(ushort id, out DisconnectReason reason, out string message)
         {
-            if (_resolved.TryGetValue(id, out var existing))
+            if (_resolved.TryGetValue(id, out var entry))
             {
-                if (existing.Reason != DisconnectReason.Unknown &&
-                    existing.Reason != DisconnectReason.ConnectionLost &&
-                    reason == DisconnectReason.Kicked)
+                reason = entry.Reason;
+                message = entry.Message;
+                return true;
+            }
+            reason = DisconnectReason.Unknown;
+            message = null;
+            return false;
+        }
+
+        internal void HandleTransportReason(ushort id, DisconnectReason reason, string msg)
+        {
+            while (true)
+            {
+                if (_resolved.TryGetValue(id, out var existing))
                 {
-                    return;
+                    if (existing.Reason != DisconnectReason.Unknown &&
+                        existing.Reason != DisconnectReason.ConnectionLost)
+                    {
+                        return;
+                    }
+
+                    if (reason == DisconnectReason.Unknown || reason == DisconnectReason.ConnectionLost)
+                    {
+                        return;
+                    }
+
+                    if (_resolved.TryUpdate(id, (reason, msg), existing))
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    if (_resolved.TryAdd(id, (reason, msg)))
+                    {
+                        return;
+                    }
                 }
             }
-
-            _resolved[id] = (reason, msg);
         }
 
         private void HandleNoticePacket(DisconnectNoticePacket packet, ushort sender)
@@ -267,6 +307,8 @@ namespace Liminal.Net.Core
                 if (_diagnostics != null)
                     _diagnostics.OnTransportDisconnectReason -= HandleTransportReason;
 
+                _transport.OnClientConnected -= HandleClientConnected;
+                _transport.OnLocalClientConnected -= HandleLocalClientConnected;
                 _transport.OnClientDisconnected -= HandleDisconnected;
                 _transport.OnClientKicked -= HandleDisconnected;
                 _transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;

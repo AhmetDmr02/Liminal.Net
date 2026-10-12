@@ -21,9 +21,7 @@ namespace Liminal.Net.Tests.Coyote
     [TestFixture]
     public class ConnectionHandshakePromotionGapCoyoteTests
     {
-        private static int _portCounter = 8900;
-
-        private static LiminalNetworkConfig CreateConfig(int port)
+        private static LiminalNetworkConfig CreateConfig(int port = 0)
         {
             return new LiminalNetworkConfig
             {
@@ -67,8 +65,7 @@ namespace Liminal.Net.Tests.Coyote
         [CoyoteTest]
         public static async Task Coyote_PromoteClient_SessionMustExistBeforeReceiveLoopReadsInboundData()
         {
-            int port = Interlocked.Increment(ref _portCounter);
-            var config = CreateConfig(port);
+            var config = CreateConfig();
             var transport = new TcpTransport();
             var server = new LiminalNetworkManager(transport, config);
             transport.SetConnectedForTesting(isConnected: true, isServer: true);
@@ -140,14 +137,11 @@ namespace Liminal.Net.Tests.Coyote
         [CoyoteTest]
         public static async Task Coyote_HandshakeGap_ServerSessionMustExistWhenLocalClientConnectedFires()
         {
-            int port = Interlocked.Increment(ref _portCounter);
-            var serverConfig = CreateConfig(port);
-            var clientConfig = CreateConfig(port);
+            var server = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
+            var client = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
 
-            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig);
-            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
-
-            server.StartServer("127.0.0.1", port);
+            server.StartServer("127.0.0.1", 0);
+            int port = server.BoundPort;
 
             ushort localAssignedId = 0;
             var clientConnectedGate = new TaskCompletionSource<ushort>();
@@ -196,14 +190,11 @@ namespace Liminal.Net.Tests.Coyote
         [CoyoteTest]
         public static async Task Coyote_HandshakeGap_ServerToClientPacketDroppedIfSentImmediatelyOnLocalConnect()
         {
-            int port = Interlocked.Increment(ref _portCounter);
-            var serverConfig = CreateConfig(port);
-            var clientConfig = CreateConfig(port);
+            var server = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
+            var client = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
 
-            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig);
-            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
-
-            server.StartServer("127.0.0.1", port);
+            server.StartServer("127.0.0.1", 0);
+            int port = server.BoundPort;
 
             var clientReceivedPacket = new TaskCompletionSource<string>();
 

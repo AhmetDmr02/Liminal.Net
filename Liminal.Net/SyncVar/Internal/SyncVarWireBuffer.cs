@@ -5,7 +5,7 @@ namespace Liminal.Net.SyncVar.Internal
 {
     internal sealed class SyncVarWireBuffer : IDisposable
     {
-        private readonly SyncVarSlab _slab;
+        private volatile SyncVarSlab _slab;
         private readonly object _writeLock = new();
 
         private readonly (int PageIndex, int PageOffset)[] _slots = new (int, int)[2];
@@ -24,6 +24,51 @@ namespace Liminal.Net.SyncVar.Internal
             _slab = slab;
             _slots[0] = (-1, -1);
             _slots[1] = (-1, -1);
+        }
+
+        public void UpdateSlab(SyncVarSlab slab)
+        {
+            lock (_writeLock)
+            {
+                if (Volatile.Read(ref _isDisposed) != 0) return;
+
+                Volatile.Write(ref _isClearing, 1);
+                Thread.MemoryBarrier();
+
+                var spinner = new SpinWait();
+                while (Volatile.Read(ref _readers0) > 0 || Volatile.Read(ref _readers1) > 0)
+                {
+                    spinner.SpinOnce();
+                }
+
+                if (_slab != slab)
+                {
+                    if (_slab != null)
+                    {
+                        if (_slotCapacities[0] > 0 && _slots[0].PageIndex >= 0)
+                        {
+                            _slab.FreeSlot(_slots[0].PageIndex, _slots[0].PageOffset, _slotCapacities[0]);
+                        }
+                        if (_slotCapacities[1] > 0 && _slots[1].PageIndex >= 0)
+                        {
+                            _slab.FreeSlot(_slots[1].PageIndex, _slots[1].PageOffset, _slotCapacities[1]);
+                        }
+                    }
+
+                    _slots[0] = (-1, -1);
+                    _slots[1] = (-1, -1);
+                    _slotCapacities[0] = 0;
+                    _slotCapacities[1] = 0;
+                    _slotLengths[0] = 0;
+                    _slotLengths[1] = 0;
+                    _slotVersions[0] = 0;
+                    _slotVersions[1] = 0;
+                    Volatile.Write(ref _frontIndex, -1);
+                    _slab = slab;
+                }
+
+                Volatile.Write(ref _isClearing, 0);
+            }
         }
 
         public bool IsDisposed => Volatile.Read(ref _isDisposed) != 0;
@@ -69,6 +114,38 @@ namespace Liminal.Net.SyncVar.Internal
                 _slotCapacities[1] = actual1;
                 _slotLengths[1] = size;
                 Volatile.Write(ref _frontIndex, 0);
+            }
+        }
+
+        public bool AllocateAndWriteInitial(ReadOnlySpan<byte> initialBytes)
+        {
+            if (_slab == null) return false;
+
+            lock (_writeLock)
+            {
+                if (Volatile.Read(ref _isDisposed) != 0) return false;
+
+                if (_slots[0].PageIndex >= 0)
+                {
+                    return true;
+                }
+
+                int size = initialBytes.Length;
+                _slots[0] = _slab.AllocateSlot(size, out int actual0);
+                _slotCapacities[0] = actual0;
+                _slotLengths[0] = size;
+                _slots[1] = _slab.AllocateSlot(size, out int actual1);
+                _slotCapacities[1] = actual1;
+                _slotLengths[1] = size;
+
+                if (_slots[0].PageIndex < 0 || _slots[0].PageOffset < 0)
+                {
+                    return false;
+                }
+
+                initialBytes.CopyTo(_slab.GetSpan(_slots[0].PageIndex, _slots[0].PageOffset, size));
+                Volatile.Write(ref _frontIndex, 0);
+                return true;
             }
         }
 
@@ -212,7 +289,12 @@ namespace Liminal.Net.SyncVar.Internal
 
         public ReadOnlySpan<byte> GetSpan(int pageIndex, int pageOffset, int length)
         {
-            return _slab.GetSpan(pageIndex, pageOffset, length);
+            var slab = _slab;
+            if (slab == null || pageIndex < 0 || pageOffset < 0 || length <= 0)
+            {
+                return ReadOnlySpan<byte>.Empty;
+            }
+            return slab.GetSpan(pageIndex, pageOffset, length);
         }
 
         public void Clear()
@@ -232,11 +314,11 @@ namespace Liminal.Net.SyncVar.Internal
                     spinner.SpinOnce();
                 }
 
-                if (_slotCapacities[0] > 0 && _slots[0].PageIndex >= 0)
+                if (_slotCapacities[0] > 0 && _slots[0].PageIndex >= 0 && _slab != null)
                 {
                     _slab.FreeSlot(_slots[0].PageIndex, _slots[0].PageOffset, _slotCapacities[0]);
                 }
-                if (_slotCapacities[1] > 0 && _slots[1].PageIndex >= 0)
+                if (_slotCapacities[1] > 0 && _slots[1].PageIndex >= 0 && _slab != null)
                 {
                     _slab.FreeSlot(_slots[1].PageIndex, _slots[1].PageOffset, _slotCapacities[1]);
                 }
@@ -257,8 +339,6 @@ namespace Liminal.Net.SyncVar.Internal
 
         public void Dispose()
         {
-            if (_slab == null) return;
-
             lock (_writeLock)
             {
                 if (Volatile.Read(ref _isDisposed) != 0) return;
@@ -271,13 +351,16 @@ namespace Liminal.Net.SyncVar.Internal
                     spinner.SpinOnce();
                 }
 
-                if (_slotCapacities[0] > 0 && _slots[0].PageIndex >= 0)
+                if (_slab != null)
                 {
-                    _slab.FreeSlot(_slots[0].PageIndex, _slots[0].PageOffset, _slotCapacities[0]);
-                }
-                if (_slotCapacities[1] > 0 && _slots[1].PageIndex >= 0)
-                {
-                    _slab.FreeSlot(_slots[1].PageIndex, _slots[1].PageOffset, _slotCapacities[1]);
+                    if (_slotCapacities[0] > 0 && _slots[0].PageIndex >= 0)
+                    {
+                        _slab.FreeSlot(_slots[0].PageIndex, _slots[0].PageOffset, _slotCapacities[0]);
+                    }
+                    if (_slotCapacities[1] > 0 && _slots[1].PageIndex >= 0)
+                    {
+                        _slab.FreeSlot(_slots[1].PageIndex, _slots[1].PageOffset, _slotCapacities[1]);
+                    }
                 }
 
                 _slots[0] = (-1, -1);

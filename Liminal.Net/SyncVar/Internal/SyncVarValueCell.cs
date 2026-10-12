@@ -84,22 +84,31 @@ namespace Liminal.Net.SyncVar.Internal
             }
         }
 
-        public bool TryUpdate(T newValue, bool force, bool deferEvent, out T oldValue, out bool fireEvent, out uint newVersion)
+        public bool TryPrepareUpdate(T newValue, bool force, out uint nextVersion)
         {
             lock (_lock)
             {
                 int currentFront = Volatile.Read(ref _frontIndex);
                 if (!force && EqualityComparer<T>.Default.Equals(_values[currentFront], newValue))
                 {
-                    oldValue = default;
-                    fireEvent = false;
-                    newVersion = Volatile.Read(ref _version);
+                    nextVersion = Volatile.Read(ref _version);
                     return false;
                 }
 
+                nextVersion = Volatile.Read(ref _version) + 1;
+                return true;
+            }
+        }
+
+        public void CommitUpdate(T newValue, uint newVersion, bool deferEvent, out T oldValue, out bool fireEvent)
+        {
+            lock (_lock)
+            {
+                int currentFront = Volatile.Read(ref _frontIndex);
                 int back = 1 - currentFront;
+
+                Interlocked.Increment(ref _valueSeq);
                 _values[back] = newValue;
-                newVersion = Volatile.Read(ref _version) + 1;
 
                 if (_hasPendingValueChanged)
                 {
@@ -125,10 +134,24 @@ namespace Liminal.Net.SyncVar.Internal
                     fireEvent = true;
                 }
 
-                Interlocked.Increment(ref _valueSeq);
                 Volatile.Write(ref _frontIndex, back);
                 Volatile.Write(ref _version, newVersion);
                 Interlocked.Increment(ref _valueSeq);
+            }
+        }
+
+        public bool TryUpdate(T newValue, bool force, bool deferEvent, out T oldValue, out bool fireEvent, out uint newVersion)
+        {
+            lock (_lock)
+            {
+                if (!TryPrepareUpdate(newValue, force, out newVersion))
+                {
+                    oldValue = default;
+                    fireEvent = false;
+                    return false;
+                }
+
+                CommitUpdate(newValue, newVersion, deferEvent, out oldValue, out fireEvent);
                 return true;
             }
         }
@@ -147,6 +170,8 @@ namespace Liminal.Net.SyncVar.Internal
 
                 int currentFront = Volatile.Read(ref _frontIndex);
                 int back = 1 - currentFront;
+
+                Interlocked.Increment(ref _valueSeq);
                 _values[back] = deserialized;
 
                 if (_hasPendingValueChanged)
@@ -173,7 +198,6 @@ namespace Liminal.Net.SyncVar.Internal
                     fireEvent = true;
                 }
 
-                Interlocked.Increment(ref _valueSeq);
                 Volatile.Write(ref _frontIndex, back);
                 Volatile.Write(ref _version, newVersion);
                 Interlocked.Increment(ref _valueSeq);

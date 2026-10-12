@@ -111,6 +111,45 @@ namespace Liminal.Net.Tests
                 "RACE OCCURRED: Client 2 lost its outbound queue due to Client 1's concurrent eviction!");
         }
 
+        [Microsoft.Coyote.SystematicTesting.Test]
+        public static async Task Coyote_CollidingId_Teardown_FixedVerification()
+        {
+            var registry = new TransportSocketRegistry();
+            const ushort targetId = 42;
+
+            int generationCounter = 0;
+            var startGate = new TaskCompletionSource<bool>();
+
+            var client1Handle = registry.PromoteClient(targetId, Interlocked.Increment(ref generationCounter), out _);
+
+            var promoteClient2Task = Task.Run(async () =>
+            {
+                await Task.Yield();
+                registry.PromoteClient(targetId, Interlocked.Increment(ref generationCounter), out var evicted);
+
+                if (evicted.HasValue)
+                {
+                    startGate.TrySetResult(true);
+                }
+            });
+
+            var client1TeardownTask = Task.Run(async () =>
+            {
+                await startGate.Task;
+                await Task.Yield();
+
+                registry.TeardownSocket_Fixed(client1Handle);
+            });
+
+            await Task.WhenAll(promoteClient2Task, client1TeardownTask);
+
+            Specification.Assert(registry.ActiveSocketCount == 1,
+                $"RACE OCCURRED: Active socket count was {registry.ActiveSocketCount}, expected 1! Client 1's teardown deleted Client 2's socket.");
+
+            Specification.Assert(registry.HasOutboundQueue(targetId),
+                "RACE OCCURRED: Client 2 lost its outbound queue due to Client 1's concurrent eviction!");
+        }
+
         private class TcpTransportEngine
         {
             public class ClientHandle
@@ -488,6 +527,68 @@ namespace Liminal.Net.Tests
                     try { clientSockets[i].Close(); } catch { }
                     try { serverSockets[i].Close(); } catch { }
                 }
+            }
+        }
+
+        [Microsoft.Coyote.SystematicTesting.Test]
+        public static async Task Coyote_TcpTransport_PromoteLocalClientRacesWithShutdown()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                ClientIdResolver = new BaseResolver(),
+                SendResponseTimeout = 1,
+                MaxPacketCount = 100
+            };
+
+            var transport = new TcpTransport();
+            transport.InitializeTransport(config);
+            transport.SetConnectedForTesting(isConnected: false, isServer: false, isClient: true);
+
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+            TcpClient clientSocket;
+            TcpClient serverSocket;
+            try
+            {
+                clientSocket = new TcpClient();
+                clientSocket.Connect(IPAddress.Loopback, port);
+                serverSocket = listener.AcceptTcpClient();
+            }
+            finally
+            {
+                listener.Stop();
+            }
+
+            try
+            {
+                var t1 = Task.Run(async () =>
+                {
+                    await Task.Yield();
+                    transport.PromoteLocalClient(1, clientSocket);
+                });
+
+                var t2 = Task.Run(async () =>
+                {
+                    await Task.Yield();
+                    transport.Shutdown();
+                });
+
+                await Task.WhenAll(t1, t2);
+
+                Specification.Assert(!transport.IsConnected,
+                    "TcpTransport remained connected after concurrent Shutdown!");
+                Specification.Assert(transport.ConnectedClientCount == 0,
+                    $"TcpTransport leaked socket count {transport.ConnectedClientCount} after concurrent Shutdown!");
+                Specification.Assert(!transport._sendQueues.ContainsKey(ILiminalTransport.SERVER_ID),
+                    "TcpTransport leaked send queue for SERVER_ID after concurrent Shutdown!");
+            }
+            finally
+            {
+                transport.Shutdown();
+                try { clientSocket.Close(); } catch { }
+                try { serverSocket.Close(); } catch { }
             }
         }
     }

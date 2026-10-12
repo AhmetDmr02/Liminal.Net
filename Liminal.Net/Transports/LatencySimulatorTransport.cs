@@ -140,6 +140,9 @@ namespace Liminal.Net.Transports
                 DelayedPacket packet = default;
                 bool hasPacket = false;
 
+                long targetTimestamp = 0;
+                bool needsSpin = false;
+
                 lock (_sendLock)
                 {
                     while (_sendQueue.Count == 0 && !token.IsCancellationRequested)
@@ -166,26 +169,29 @@ namespace Liminal.Net.Transports
                             {
                                 Monitor.Wait(_sendLock, (int)(waitMs - 15));
                             }
+                            else
+                            {
+                                targetTimestamp = deliverAt;
+                                needsSpin = true;
+                            }
                         }
                     }
                 }
 
-                if (!hasPacket && _sendQueue.TryPeek(out _, out long targetTimestamp))
+                if (!hasPacket && needsSpin)
                 {
                     if (Stopwatch.GetTimestamp() < targetTimestamp)
                     {
                         Thread.SpinWait(20);
                         continue;
                     }
-                    else
+
+                    lock (_sendLock)
                     {
-                        lock (_sendLock)
+                        if (_sendQueue.TryPeek(out _, out long deliverAt) && Stopwatch.GetTimestamp() >= deliverAt)
                         {
-                            if (_sendQueue.Count > 0 && Stopwatch.GetTimestamp() >= targetTimestamp)
-                            {
-                                packet = _sendQueue.Dequeue();
-                                hasPacket = true;
-                            }
+                            packet = _sendQueue.Dequeue();
+                            hasPacket = true;
                         }
                     }
                 }

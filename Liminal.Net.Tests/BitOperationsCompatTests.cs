@@ -97,5 +97,65 @@ namespace Liminal.Net.Tests
             Assert.That(bitset.TryConsumeBucket(0, out _), Is.False);
             Assert.That(bitset.TryConsumeBucket(1, out _), Is.False);
         }
+
+        [Test]
+        public void LockFreeDirtyBitset_ClearDirty_ClearsSpecificBitOnly()
+        {
+            var bitset = new LockFreeDirtyBitset(128);
+            bitset.SetDirty(5);
+            bitset.SetDirty(6);
+
+            Assert.That(bitset.IsDirty(5), Is.True);
+            Assert.That(bitset.IsDirty(6), Is.True);
+            Assert.That(bitset.CountDirtyBits(), Is.EqualTo(2));
+
+            bitset.ClearDirty(5);
+
+            Assert.That(bitset.IsDirty(5), Is.False);
+            Assert.That(bitset.IsDirty(6), Is.True);
+            Assert.That(bitset.CountDirtyBits(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void LockFreeSlotBitset_AllocateAndFree_RecyclesAccurately()
+        {
+            var slotBitset = new LockFreeSlotBitset(64);
+
+            Assert.That(slotBitset.TryAllocate(out ushort s0), Is.True);
+            Assert.That(s0, Is.EqualTo(0));
+            Assert.That(slotBitset.TryAllocate(out ushort s1), Is.True);
+            Assert.That(s1, Is.EqualTo(1));
+            Assert.That(slotBitset.CountAllocated(), Is.EqualTo(2));
+
+            slotBitset.Free(s0);
+            Assert.That(slotBitset.IsAllocated(s0), Is.False);
+            Assert.That(slotBitset.IsAllocated(s1), Is.True);
+            Assert.That(slotBitset.CountAllocated(), Is.EqualTo(1));
+
+            Assert.That(slotBitset.TryAllocate(out ushort sReused), Is.True);
+            Assert.That(sReused, Is.EqualTo(0));
+        }
+
+        [Test]
+        public void LockFreeSlotBitset_CapacityExceeded_ReturnsFalse()
+        {
+            var slotBitset = new LockFreeSlotBitset(3);
+
+            Assert.That(slotBitset.TryAllocate(out _), Is.True);
+            Assert.That(slotBitset.TryAllocate(out _), Is.True);
+            Assert.That(slotBitset.TryAllocate(out _), Is.True);
+
+            Assert.That(slotBitset.TryAllocate(out ushort overflow), Is.False);
+            Assert.That(overflow, Is.EqualTo(ushort.MaxValue));
+        }
+
+        [Test]
+        public void BitOperationsCompat_PopCount_MatchesExpected()
+        {
+            Assert.That(BitOperationsCompat.PopCount(0UL), Is.EqualTo(0));
+            Assert.That(BitOperationsCompat.PopCount(1UL), Is.EqualTo(1));
+            Assert.That(BitOperationsCompat.PopCount(0b1011_0101UL), Is.EqualTo(5));
+            Assert.That(BitOperationsCompat.PopCount(0xFFFF_FFFF_FFFF_FFFFUL), Is.EqualTo(64));
+        }
     }
 }

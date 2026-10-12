@@ -296,5 +296,45 @@ namespace Liminal.Net.Tests.Coyote
                 netManager.Shutdown();
             }
         }
+
+        [CoyoteTest]
+        public static async Task Coyote_ClientRegistry_ConcurrentConnectDuringSnapshot_ZeroDroppedDeltas()
+        {
+            var serverConfig = CreateTestConfig();
+            var serverTransport = new MockTransport { IsServer = true };
+            var serverManager = new LiminalNetworkManager(serverTransport, serverConfig);
+            serverManager.StartServer(7777);
+
+            var clientConfig = CreateTestConfig();
+            var clientTransport = new MockTransport { IsServer = false };
+            var clientManager = new LiminalNetworkManager(clientTransport, clientConfig);
+            clientManager.StartClient("127.0.0.1", 7777);
+            clientTransport.TriggerLocalClientConnected(2);
+            var clientRegistry = clientManager.ClientRegistry;
+
+            serverManager.Interpreter.OnSendRequest += (senderId, targetId, packetId, payload, delivery) =>
+            {
+                if (targetId == 2)
+                {
+                    clientManager.Interpreter.Dispatch(packetId, ILiminalTransport.SERVER_ID, payload.ToArray());
+                }
+            };
+
+            try
+            {
+                var connectTask1 = Task.Run(() => serverTransport.TriggerClientConnected(2));
+                var connectTask2 = Task.Run(() => serverTransport.TriggerClientConnected(3));
+
+                await Task.WhenAll(connectTask1, connectTask2);
+
+                Specification.Assert(clientRegistry.ContainsClient(2), "Client 2 must contain Client 2 in its registry.");
+                Specification.Assert(clientRegistry.ContainsClient(3), "Client 2 must contain Client 3 in its registry.");
+            }
+            finally
+            {
+                serverManager.Shutdown();
+                clientManager.Shutdown();
+            }
+        }
     }
 }
