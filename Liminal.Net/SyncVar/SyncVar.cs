@@ -81,7 +81,6 @@ namespace Liminal.Net.SyncVar
 
         private volatile ushort _localSlot = ushort.MaxValue;
         private int _fallbackDirty = 0;
-        private int _isRegistering = 0;
 
         [ThreadStatic]
         private static ArrayBufferWriter<byte> _threadLocalWriter;
@@ -152,13 +151,6 @@ namespace Liminal.Net.SyncVar
                 {
                     EnsureRegistered();
                 }
-                if (!HasAuthority)
-                {
-                    var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
-                    ushort myId = netManager?.localID ?? 0;
-                    LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
-                    return;
-                }
 
                 WriteFromOwningThread(value, force: false);
             }
@@ -205,14 +197,6 @@ namespace Liminal.Net.SyncVar
 
         public void SetDirty()
         {
-            if (!HasAuthority)
-            {
-                var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
-                ushort myId = netManager?.localID ?? 0;
-                LiminalLogger.LogError($"[SyncVar] Unauthorized SetDirty blocked! Client {myId} does not have authority on '{Token}'.");
-                return;
-            }
-
             WriteFromOwningThread(Value, force: true);
         }
 
@@ -299,45 +283,37 @@ namespace Liminal.Net.SyncVar
         private void EnsureRegistered(SyncVarManager activeMgr = null)
         {
             if (IsDisposed) return;
-            if (Interlocked.CompareExchange(ref _isRegistering, 1, 0) != 0) return;
 
-            try
+            var mgr = activeMgr;
+            if (mgr == null)
             {
-                var mgr = activeMgr;
-                if (mgr == null)
+                var currentMgr = _manager;
+                if (currentMgr != null && currentMgr.IsTornDown)
                 {
-                    var currentMgr = _manager;
-                    if (currentMgr != null && currentMgr.IsTornDown)
-                    {
-                        currentMgr = null;
-                    }
-                    mgr = currentMgr ?? SyncVarManager.GetManagerForRegistration();
+                    currentMgr = null;
                 }
-
-                if (mgr == null || mgr.IsTornDown) return;
-
-                if (_manager != mgr || _localSlot == ushort.MaxValue)
-                {
-                    lock (_registrationLock)
-                    {
-                        if (IsDisposed) return;
-                        if (_manager != mgr || _localSlot == ushort.MaxValue)
-                        {
-                            if (mgr.TryGetSyncVar(Token, out var existing) && !ReferenceEquals(existing, this))
-                            {
-                                return;
-                            }
-                            _manager = mgr;
-                            _permissions.UpdateManager(mgr);
-                            _wireBuffer.UpdateSlab(mgr.Slab);
-                            mgr.RegisterSyncVar(this);
-                        }
-                    }
-                }
+                mgr = currentMgr ?? SyncVarManager.GetManagerForRegistration();
             }
-            finally
+
+            if (mgr == null || mgr.IsTornDown) return;
+
+            if (_manager != mgr || _localSlot == ushort.MaxValue)
             {
-                Volatile.Write(ref _isRegistering, 0);
+                lock (_registrationLock)
+                {
+                    if (IsDisposed) return;
+                    if (_manager != mgr || _localSlot == ushort.MaxValue)
+                    {
+                        if (mgr.TryGetSyncVar(Token, out var existing) && !ReferenceEquals(existing, this))
+                        {
+                            return;
+                        }
+                        _manager = mgr;
+                        _permissions.UpdateManager(mgr);
+                        _wireBuffer.UpdateSlab(mgr.Slab);
+                        mgr.RegisterSyncVar(this);
+                    }
+                }
             }
         }
 
@@ -373,48 +349,48 @@ namespace Liminal.Net.SyncVar
                 return;
             }
 
-            if (IsDisposed) return;
-
             EnsureRegistered(activeMgr);
 
-            if (IsDisposed || !HasAuthority)
-            {
-                if (!HasAuthority && !IsDisposed)
-                {
-                    var netManager = activeMgr.AttachedManager ?? LiminalNetworkManager.Instance;
-                    ushort myId = netManager?.localID ?? 0;
-                    LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
-                }
-                return;
-            }
-
-            T oldValueWithNetwork;
-            bool fireChangedWithNetwork;
+            T oldValueWithNetwork = default;
+            bool fireChangedWithNetwork = false;
+            bool unauthorized;
 
             lock (_writeLock)
             {
-                if (IsDisposed || !HasAuthority) return;
+                if (IsDisposed) return;
 
-                if (!_valueCell.TryPrepareUpdate(newValue, force, out uint nextVersion))
+                unauthorized = !HasAuthority;
+                if (!unauthorized)
                 {
-                    return;
+                    if (!_valueCell.TryPrepareUpdate(newValue, force, out uint nextVersion))
+                    {
+                        return;
+                    }
+
+                    _threadLocalWriter ??= new ArrayBufferWriter<byte>(256);
+                    _threadLocalWriter.Clear();
+                    MessagePackSerializer.Serialize(_threadLocalWriter, newValue, activeMgr.SerializerOptions);
+
+                    if (!_wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, nextVersion, force))
+                    {
+                        return;
+                    }
+
+                    _valueCell.CommitUpdate(newValue, nextVersion, deferEvent: false, out oldValueWithNetwork, out fireChangedWithNetwork);
+
+                    if (TryMarkDirty())
+                    {
+                        activeMgr.EnqueueDirty(this);
+                    }
                 }
+            }
 
-                _threadLocalWriter ??= new ArrayBufferWriter<byte>(256);
-                _threadLocalWriter.Clear();
-                MessagePackSerializer.Serialize(_threadLocalWriter, newValue, activeMgr.SerializerOptions);
-
-                if (!_wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, nextVersion, force))
-                {
-                    return;
-                }
-
-                _valueCell.CommitUpdate(newValue, nextVersion, deferEvent: false, out oldValueWithNetwork, out fireChangedWithNetwork);
-
-                if (TryMarkDirty())
-                {
-                    activeMgr.EnqueueDirty(this);
-                }
+            if (unauthorized)
+            {
+                var netManager = activeMgr.AttachedManager ?? LiminalNetworkManager.Instance;
+                ushort myId = netManager?.localID ?? 0;
+                LiminalLogger.LogError($"[SyncVar] Unauthorized write blocked! Client {myId} does not have authority to modify '{Token}'.");
+                return;
             }
 
             if (fireChangedWithNetwork)
@@ -926,11 +902,15 @@ namespace Liminal.Net.SyncVar
 
         internal void InternalTeardown()
         {
-            Unregister();
-            _localSlot = ushort.MaxValue;
-            SetLocallyVisible(false);
+            SyncVarManager previousManager;
+            ushort claimedSlot;
+
             lock (_writeLock)
             {
+                previousManager = _manager;
+                claimedSlot = _localSlot;
+                _localSlot = ushort.MaxValue;
+                SetLocallyVisible(false);
                 _permissions.ClearPendingAuth();
                 _permissions.UpdateManager(null);
                 _valueCell.ClearPendingValue();
@@ -939,16 +919,18 @@ namespace Liminal.Net.SyncVar
                 ClearDirty();
                 Volatile.Write(ref _manager, null);
             }
+
+            previousManager?.UnregisterClaimedSyncVar(this, claimedSlot);
         }
 
         void ISyncVarInternal.InternalTeardown() => InternalTeardown();
 
         internal void ResetSession()
         {
-            _localSlot = ushort.MaxValue;
-            SetLocallyVisible(false);
             lock (_writeLock)
             {
+                _localSlot = ushort.MaxValue;
+                SetLocallyVisible(false);
                 _permissions.ClearPendingAuth();
                 _valueCell.ResetSessionState();
                 _wireBuffer.Clear();
@@ -958,11 +940,6 @@ namespace Liminal.Net.SyncVar
         }
 
         void ISyncVarInternal.ResetSession() => ResetSession();
-
-        private void Unregister()
-        {
-            _manager?.UnregisterSyncVar(this);
-        }
 
         private void BroadcastAuthIfServer(ushort[] next)
         {

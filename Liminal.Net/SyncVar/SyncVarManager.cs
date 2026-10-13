@@ -267,11 +267,47 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        internal bool UnregisterClaimedSyncVar(ISyncVarInternal syncVar, ushort claimedSlot)
+        {
+            string token = syncVar.Token;
+            lock (_unboundLock)
+            {
+                if (!_tokenRegistry.TryGet(token, out var current) || !ReferenceEquals(current, syncVar))
+                {
+                    return false;
+                }
+
+                if (_unboundCache.Remove(token, out var entry))
+                {
+                    _unboundOrder.Remove(entry.Node);
+                }
+                _unboundAuth.Remove(token);
+                _tokenRegistry.TryRemove(token, out _);
+
+                if (claimedSlot != ushort.MaxValue && ReferenceEquals(Volatile.Read(ref _localRegistry[claimedSlot]), syncVar))
+                {
+                    DirtyBitset.ClearDirty(claimedSlot);
+                    Volatile.Write(ref _localRegistry[claimedSlot], null);
+                    _slotBitset.Free(claimedSlot);
+                }
+                return true;
+            }
+        }
+
         private void HandleClientDisconnected(ushort clientId)
         {
-            foreach (var pending in _pendingClearAcks.Values)
+            foreach (var kvp in _pendingClearAcks)
             {
-                pending.TryRemove(clientId, out _);
+                var pending = kvp.Value;
+                lock (pending)
+                {
+                    pending.TryRemove(clientId, out _);
+                    if (pending.IsEmpty)
+                    {
+                        ((ICollection<KeyValuePair<string, ConcurrentDictionary<ushort, byte>>>)_pendingClearAcks)
+                            .Remove(new KeyValuePair<string, ConcurrentDictionary<ushort, byte>>(kvp.Key, pending));
+                    }
+                }
             }
         }
 
@@ -678,12 +714,16 @@ namespace Liminal.Net.SyncVar
             int totalSessions = netManager.SessionManager.GetSessionIds(allSessions);
 
             var pending = _pendingClearAcks.GetOrAdd(token, _ => new ConcurrentDictionary<ushort, byte>());
-            for (int i = 0; i < totalSessions; i++)
+            lock (pending)
             {
-                ushort sid = allSessions[i];
-                if (sid != ILiminalTransport.SERVER_ID)
+                _pendingClearAcks[token] = pending;
+                for (int i = 0; i < totalSessions; i++)
                 {
-                    pending[sid] = 1;
+                    ushort sid = allSessions[i];
+                    if (sid != ILiminalTransport.SERVER_ID)
+                    {
+                        pending[sid] = 1;
+                    }
                 }
             }
         }
@@ -692,7 +732,15 @@ namespace Liminal.Net.SyncVar
         {
             if (_pendingClearAcks.TryGetValue(token, out var pending))
             {
-                pending.TryRemove(clientId, out _);
+                lock (pending)
+                {
+                    pending.TryRemove(clientId, out _);
+                    if (pending.IsEmpty)
+                    {
+                        ((ICollection<KeyValuePair<string, ConcurrentDictionary<ushort, byte>>>)_pendingClearAcks)
+                            .Remove(new KeyValuePair<string, ConcurrentDictionary<ushort, byte>>(token, pending));
+                    }
+                }
             }
         }
 
@@ -1084,10 +1132,14 @@ namespace Liminal.Net.SyncVar
                     }
                     else
                     {
-                        pending.TryRemove(senderId, out _);
-                        if (pending.IsEmpty)
+                        lock (pending)
                         {
-                            ((ICollection<KeyValuePair<string, ConcurrentDictionary<ushort, byte>>>)_pendingClearAcks).Remove(new KeyValuePair<string, ConcurrentDictionary<ushort, byte>>(syncVar.Token, pending));
+                            pending.TryRemove(senderId, out _);
+                            if (pending.IsEmpty)
+                            {
+                                ((ICollection<KeyValuePair<string, ConcurrentDictionary<ushort, byte>>>)_pendingClearAcks)
+                                    .Remove(new KeyValuePair<string, ConcurrentDictionary<ushort, byte>>(syncVar.Token, pending));
+                            }
                         }
                     }
                 }

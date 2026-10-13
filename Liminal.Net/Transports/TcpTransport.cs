@@ -1270,8 +1270,6 @@ namespace Liminal.Net.Transports
 
         public void SendWirePing(ushort targetId)
         {
-            if (!_sendQueues.ContainsKey(targetId)) return;
-
             long now = Stopwatch.GetTimestamp();
             uint seq;
 
@@ -1302,21 +1300,32 @@ namespace Liminal.Net.Transports
             SendInternal(pingPayload, targetId, TransportFlags.WirePing);
         }
 
-        private double _serverCountdownSnapshotMs;
-        private long _serverCountdownReceivedTicks;
+        private sealed class ServerCountdownSnapshot
+        {
+            public readonly double SnapshotMs;
+            public readonly long ReceivedTicks;
+
+            public ServerCountdownSnapshot(double snapshotMs, long receivedTicks)
+            {
+                SnapshotMs = snapshotMs;
+                ReceivedTicks = receivedTicks;
+            }
+        }
+
+        private ServerCountdownSnapshot _serverCountdownSnapshot;
 
         public double ServerCountdownMs
         {
             get
             {
-                long receivedAt = Volatile.Read(ref _serverCountdownReceivedTicks);
-                if (receivedAt == 0) return 0.0;
+                var snapshot = Volatile.Read(ref _serverCountdownSnapshot);
+                if (snapshot == null || snapshot.ReceivedTicks == 0) return 0.0;
 
-                long elapsedTicks = Stopwatch.GetTimestamp() - receivedAt;
+                long elapsedTicks = Stopwatch.GetTimestamp() - snapshot.ReceivedTicks;
                 double elapsedMs = (elapsedTicks * 1000.0) / Stopwatch.Frequency;
 
                 double tickIntervalMs = 1000.0 / (_config?.TickRate ?? 20);
-                double liveCountdown = (Volatile.Read(ref _serverCountdownSnapshotMs) - elapsedMs) % tickIntervalMs;
+                double liveCountdown = (snapshot.SnapshotMs - elapsedMs) % tickIntervalMs;
                 if (liveCountdown < 0) liveCountdown += tickIntervalMs;
 
                 return liveCountdown;
@@ -1353,8 +1362,7 @@ namespace Liminal.Net.Transports
             double adjustedCountdown = (serverRemainingMs - owtMs) % tickIntervalMs;
             if (adjustedCountdown < 0) adjustedCountdown += tickIntervalMs;
 
-            Volatile.Write(ref _serverCountdownSnapshotMs, adjustedCountdown);
-            Volatile.Write(ref _serverCountdownReceivedTicks, now);
+            Volatile.Write(ref _serverCountdownSnapshot, new ServerCountdownSnapshot(adjustedCountdown, now));
         }
         #endregion
 

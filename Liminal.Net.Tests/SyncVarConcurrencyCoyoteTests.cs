@@ -4626,5 +4626,129 @@ namespace Liminal.Net.Tests.Coyote
             Specification.Assert(manager.Role == NetworkRole.None,
                 $"Manager role must end in None, but was {manager.Role}.");
         }
+
+        [Test]
+        public static async Task Coyote_SyncVar_ConcurrentEnsureRegistered_ZeroDroppedSlotsOrDirtyLoss()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            // SyncVar created unbound before active network manager exists
+            var syncVar = new SyncVar<int>("TestVar_EnsureReg", 0);
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            manager.StartServer("127.0.0.1", 7777);
+
+            var task1 = Task.Run(() =>
+            {
+                int _ = syncVar.Value;
+            });
+
+            var task2 = Task.Run(() =>
+            {
+                syncVar.Value = 200;
+            });
+
+            await Task.WhenAll(task1, task2);
+
+            ushort slot = syncVar.LocalSlot;
+            Specification.Assert(slot != ushort.MaxValue,
+                $"SyncVar LocalSlot must be valid after writes, but was {slot}.");
+            Specification.Assert(manager.SyncVarManager.DirtyBitset.IsDirty(slot),
+                $"SyncVar slot {slot} must be marked dirty in DirtyBitset after successful writes.");
+
+            manager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_SlotRecyclingVsInFlightWrite_ZeroStaleDirtyMutation()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            manager.StartServer("127.0.0.1", 7777);
+
+            var syncVar1 = new SyncVar<int>("Recycle_Var1", 10);
+            syncVar1.Value = 10;
+            ushort slot1 = syncVar1.LocalSlot;
+            manager.SyncVarManager.DirtyBitset.ClearDirty(slot1);
+
+            var writeTask = Task.Run(() =>
+            {
+                syncVar1.Value = 99;
+            });
+
+            var teardownTask = Task.Run(() =>
+            {
+                ((ISyncVarInternal)syncVar1).InternalTeardown();
+            });
+
+            await Task.WhenAll(writeTask, teardownTask);
+
+            var syncVar2 = new SyncVar<int>("Recycle_Var2", 20);
+            syncVar2.Value = 20;
+            ushort slot2 = syncVar2.LocalSlot;
+            manager.SyncVarManager.DirtyBitset.ClearDirty(slot2);
+
+            Specification.Assert(!manager.SyncVarManager.DirtyBitset.IsDirty(slot2),
+                $"Recycled slot {slot2} was marked dirty by torn-down SyncVar!");
+
+            manager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_RegisterWithCachedDataVsTeardown_NoLockInversionDeadlock()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            manager.StartServer("127.0.0.1", 7777);
+            var syncVarManager = manager.SyncVarManager;
+
+            var syncVar = new SyncVar<int>("Deadlock_Var", 0, syncVarManager);
+            syncVarManager.UnregisterSyncVar(syncVar);
+
+            var storeUnboundData = typeof(SyncVarManager).GetMethod(
+                "StoreUnboundData",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            storeUnboundData.Invoke(syncVarManager, new object[] { "Deadlock_Var", 5u, MessagePackSerializer.Serialize(42) });
+
+            var registerTask = Task.Run(() =>
+            {
+                syncVarManager.RegisterSyncVar(syncVar);
+            });
+
+            var teardownTask = Task.Run(() =>
+            {
+                ((ISyncVarInternal)syncVar).InternalTeardown();
+            });
+
+            await Task.WhenAll(registerTask, teardownTask);
+
+            manager.Shutdown();
+        }
     }
 }

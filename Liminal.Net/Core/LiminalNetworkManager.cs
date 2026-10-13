@@ -304,11 +304,12 @@ namespace Liminal.Net.Core
                 if (Volatile.Read(ref _isDisconnecting) != 0 || Volatile.Read(ref _isShuttingDown) != 0)
                     return;
 
-                Role = NetworkRole.None;
-                LifecycleState = NetworkLifecycleState.Stopping;
+                if (LifecycleState != NetworkLifecycleState.Stopped)
+                {
+                    LifecycleState = NetworkLifecycleState.Stopping;
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                }
             }
-
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
         }
 
         private void InitializeSystems()
@@ -584,7 +585,6 @@ namespace Liminal.Net.Core
             bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
             bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
             LifecycleState = NetworkLifecycleState.Stopping;
-            Role = NetworkRole.None;
 
             if (!alreadyStopping)
             {
@@ -597,6 +597,7 @@ namespace Liminal.Net.Core
 
                 ShutdownSystems();
 
+                Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;
 
                 LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
@@ -609,6 +610,7 @@ namespace Liminal.Net.Core
             catch (Exception ex)
             {
                 LiminalLogger.LogError($"[Manager] Error during session teardown: {ex.Message}");
+                Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;
             }
         }
@@ -630,7 +632,6 @@ namespace Liminal.Net.Core
             Volatile.Write(ref _isShuttingDown, 1);
             bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped || _transport.IsConnected;
             LifecycleState = NetworkLifecycleState.Stopping;
-            Role = NetworkRole.None;
 
             LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
@@ -646,6 +647,7 @@ namespace Liminal.Net.Core
 
                 _eventHub.Clear();
 
+                Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;
 
                 LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
@@ -658,6 +660,7 @@ namespace Liminal.Net.Core
             catch (Exception ex)
             {
                 LiminalLogger.LogError($"[Manager] Error during Shutdown: {ex.Message}");
+                Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;
             }
             finally
