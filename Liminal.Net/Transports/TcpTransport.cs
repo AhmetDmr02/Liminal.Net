@@ -689,6 +689,18 @@ namespace Liminal.Net.Transports
             catch (OperationCanceledException)
             {
                 try { client.Close(); } catch { }
+                if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                {
+                    lock (_connectionLifecycleLock)
+                    {
+                        if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                        {
+                            _localClientId = 0;
+                        }
+                    }
+                    LiminalLogger.LogError("[Transport] Connection timed out.");
+                    Shutdown();
+                }
             }
             catch (Exception ex)
             {

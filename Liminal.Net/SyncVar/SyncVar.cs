@@ -81,6 +81,7 @@ namespace Liminal.Net.SyncVar
 
         private volatile ushort _localSlot = ushort.MaxValue;
         private int _fallbackDirty = 0;
+        private int _isRegistering = 0;
 
         [ThreadStatic]
         private static ArrayBufferWriter<byte> _threadLocalWriter;
@@ -136,10 +137,21 @@ namespace Liminal.Net.SyncVar
 
         public T Value
         {
-            get => _valueCell.Value;
+            get
+            {
+                if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+                {
+                    EnsureRegistered();
+                }
+                return _valueCell.Value;
+            }
             set
             {
                 if (IsDisposed) return;
+                if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+                {
+                    EnsureRegistered();
+                }
                 if (!HasAuthority)
                 {
                     var netManager = _manager?.AttachedManager ?? LiminalNetworkManager.Instance;
@@ -264,7 +276,7 @@ namespace Liminal.Net.SyncVar
 
         public void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options)
         {
-            MessagePackSerializer.Serialize(writer, Value, options);
+            MessagePackSerializer.Serialize(writer, _valueCell.Value, options);
         }
 
         public void Reattach(SyncVarManager manager = null)
@@ -281,6 +293,51 @@ namespace Liminal.Net.SyncVar
                     _wireBuffer.UpdateSlab(mgr.Slab);
                     mgr.RegisterSyncVar(this);
                 }
+            }
+        }
+
+        private void EnsureRegistered(SyncVarManager activeMgr = null)
+        {
+            if (IsDisposed) return;
+            if (Interlocked.CompareExchange(ref _isRegistering, 1, 0) != 0) return;
+
+            try
+            {
+                var mgr = activeMgr;
+                if (mgr == null)
+                {
+                    var currentMgr = _manager;
+                    if (currentMgr != null && currentMgr.IsTornDown)
+                    {
+                        currentMgr = null;
+                    }
+                    mgr = currentMgr ?? SyncVarManager.GetManagerForRegistration();
+                }
+
+                if (mgr == null || mgr.IsTornDown) return;
+
+                if (_manager != mgr || _localSlot == ushort.MaxValue)
+                {
+                    lock (_registrationLock)
+                    {
+                        if (IsDisposed) return;
+                        if (_manager != mgr || _localSlot == ushort.MaxValue)
+                        {
+                            if (mgr.TryGetSyncVar(Token, out var existing) && !ReferenceEquals(existing, this))
+                            {
+                                return;
+                            }
+                            _manager = mgr;
+                            _permissions.UpdateManager(mgr);
+                            _wireBuffer.UpdateSlab(mgr.Slab);
+                            mgr.RegisterSyncVar(this);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref _isRegistering, 0);
             }
         }
 
@@ -318,25 +375,7 @@ namespace Liminal.Net.SyncVar
 
             if (IsDisposed) return;
 
-            if (_manager != activeMgr || _localSlot == ushort.MaxValue)
-            {
-                if (IsDisposed) return;
-                lock (_registrationLock)
-                {
-                    if (IsDisposed) return;
-                    if (_manager != activeMgr || _localSlot == ushort.MaxValue)
-                    {
-                        if (activeMgr.TryGetSyncVar(Token, out var existing) && !ReferenceEquals(existing, this))
-                        {
-                            return;
-                        }
-                        _manager = activeMgr;
-                        _permissions.UpdateManager(activeMgr);
-                        _wireBuffer.UpdateSlab(activeMgr.Slab);
-                        activeMgr.RegisterSyncVar(this);
-                    }
-                }
-            }
+            EnsureRegistered(activeMgr);
 
             if (IsDisposed || !HasAuthority)
             {
@@ -387,6 +426,10 @@ namespace Liminal.Net.SyncVar
         public bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0)
         {
             if (IsDisposed) return false;
+            if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+            {
+                EnsureRegistered();
+            }
             uint currentVer = _valueCell.Version;
             if (!force && newVersion < currentVer && currentVer != 0) return false;
 
@@ -445,6 +488,11 @@ namespace Liminal.Net.SyncVar
 
         public bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version)
         {
+            if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+            {
+                EnsureRegistered();
+            }
+
             if (!_wireBuffer.TryBeginRead(out int slotIndex, out int page, out int offset, out int length, out version))
             {
                 return false;
@@ -468,6 +516,11 @@ namespace Liminal.Net.SyncVar
 
         public bool TryExtractSnapshotData(out byte[] data, out uint version)
         {
+            if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+            {
+                EnsureRegistered();
+            }
+
             if (!_wireBuffer.TryBeginRead(out int slotIndex, out int page, out int offset, out int length, out version))
             {
                 data = Array.Empty<byte>();
@@ -897,12 +950,10 @@ namespace Liminal.Net.SyncVar
             lock (_writeLock)
             {
                 _permissions.ClearPendingAuth();
-                _permissions.UpdateManager(null);
-                _valueCell.ClearPendingValue();
+                _valueCell.ResetSessionState();
                 _wireBuffer.Clear();
                 _wireBuffer.UpdateSlab(null);
                 ClearDirty();
-                Volatile.Write(ref _manager, null);
             }
         }
 

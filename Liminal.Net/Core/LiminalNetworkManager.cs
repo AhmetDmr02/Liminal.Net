@@ -268,10 +268,14 @@ namespace Liminal.Net.Core
 
         private void HandleTransportShutdown()
         {
-            if (_isShuttingDown != 0) return;
-            LiminalLogger.Log("[Manager] Transport reported shutdown. Resetting state...");
-            ResetLifecycleState();
-            Shutdown();
+            lock (_teardownLock)
+            {
+                if (Volatile.Read(ref _isDisconnecting) != 0) return;
+                if (Volatile.Read(ref _isShuttingDown) != 0) return;
+                if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
+
+                ShutdownInternal();
+            }
         }
 
         private void HandlePreLocalClientConnected(ushort clientId)
@@ -309,7 +313,7 @@ namespace Liminal.Net.Core
         {
             _eventHub.RaiseManagerPreInitialize();
 
-            ShutdownSystems(isShutdown: false);
+            ShutdownSystems();
 
             LiminalLogger.Log("[Manager] Initializing Network Systems...");
 
@@ -347,12 +351,8 @@ namespace Liminal.Net.Core
             _eventHub.RaiseDisconnectResolved(id, reason, message);
         }
 
-        private void ShutdownSystems(bool isShutdown = false)
+        private void ShutdownSystems()
         {
-            if (isShutdown)
-            {
-                _eventHub.RaiseManagerShutdown();
-            }
             _eventHub.UnbindCoreSystems();
 
             if (_ticker != null)
@@ -386,7 +386,6 @@ namespace Liminal.Net.Core
             //SessionManager = null;
             ClientRegistry?.Reset();
             SyncVarManager?.DetachFromManager();
-            SyncVarManager = null;
 
             _config.ClientIdResolver?.ResetResolver();
         }
@@ -399,53 +398,58 @@ namespace Liminal.Net.Core
 
         public bool StartHost(string host, int port)
         {
-            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            lock (_teardownLock)
             {
-                LiminalLogger.LogWarning($"[Manager] Cannot StartHost: Manager is in state '{LifecycleState}' (Role: {Role}).");
-                return false;
-            }
+                if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+                {
+                    LiminalLogger.LogWarning($"[Manager] Cannot StartHost: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                    return false;
+                }
 
-            LifecycleState = NetworkLifecycleState.StartingHost;
-            Role = NetworkRole.Host;
+                LifecycleState = NetworkLifecycleState.StartingHost;
+                Role = NetworkRole.Host;
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                if (DisconnectCoordinator == null)
+                {
+                    InitializeSystems();
+                }
 
-            InitializeSystems();
+                LiminalLogger.Log("[Manager] Starting Host Mode...");
 
-            LiminalLogger.Log("[Manager] Starting Host Mode...");
+                string serverBindHost = host;
+                string clientConnectHost = host;
 
-            string serverBindHost = host;
-            string clientConnectHost = host;
+                bool isWildcard = string.IsNullOrWhiteSpace(host) || host == "0.0.0.0" || host == "::" || host == "::0";
+                if (!isWildcard && System.Net.IPAddress.TryParse(host, out var parsedAddr))
+                {
+                    isWildcard = parsedAddr.Equals(System.Net.IPAddress.Any) || parsedAddr.Equals(System.Net.IPAddress.IPv6Any);
+                }
 
-            bool isWildcard = string.IsNullOrWhiteSpace(host) || host == "0.0.0.0" || host == "::" || host == "::0";
-            if (!isWildcard && System.Net.IPAddress.TryParse(host, out var parsedAddr))
-            {
-                isWildcard = parsedAddr.Equals(System.Net.IPAddress.Any) || parsedAddr.Equals(System.Net.IPAddress.IPv6Any);
-            }
+                if (isWildcard)
+                {
+                    serverBindHost = host;
+                    clientConnectHost = (host == "::" || host == "::0" || (System.Net.IPAddress.TryParse(host, out var addr) && addr.Equals(System.Net.IPAddress.IPv6Any))) ? "::1" : "127.0.0.1";
+                }
 
-            if (isWildcard)
-            {
-                serverBindHost = host;
-                clientConnectHost = (host == "::" || host == "::0" || (System.Net.IPAddress.TryParse(host, out var addr) && addr.Equals(System.Net.IPAddress.IPv6Any))) ? "::1" : "127.0.0.1";
-            }
+                try
+                {
+                    _transport.StartServer(serverBindHost, port);
+                    _transport.StartClient(clientConnectHost, port);
 
-            try
-            {
-                _transport.StartServer(serverBindHost, port);
-                _transport.StartClient(clientConnectHost, port);
+                    _ticker.OnTick += HostTick;
+                    _ticker.Start();
 
-                _ticker.OnTick += HostTick;
-                _ticker.Start();
-
-                string displayBind = (isWildcard && System.Net.Sockets.Socket.OSSupportsIPv6) ? $"[::]:{port} (DualMode IPv4/IPv6)" : $"{serverBindHost}:{port}";
-                LiminalLogger.Log($"[Manager] Host running on {displayBind} (client connected via {clientConnectHost}) local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
-                return true;
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Manager] StartHost failed: {ex.Message}");
-                Shutdown();
-                throw;
+                    string displayBind = (isWildcard && System.Net.Sockets.Socket.OSSupportsIPv6) ? $"[::]:{port} (DualMode IPv4/IPv6)" : $"{serverBindHost}:{port}";
+                    LiminalLogger.Log($"[Manager] Host running on {displayBind} (client connected via {clientConnectHost}) local id = {_transport.LocalClientId}, isServer = {_transport.IsServer}, isClient = {_transport.IsClient}");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Manager] StartHost failed: {ex.Message}");
+                    ShutdownInternal();
+                    throw;
+                }
             }
         }
 
@@ -455,40 +459,45 @@ namespace Liminal.Net.Core
 
         public bool StartServer(string ip, int port)
         {
-            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            lock (_teardownLock)
             {
-                LiminalLogger.LogWarning($"[Manager] Cannot StartServer: Manager is in state '{LifecycleState}' (Role: {Role}).");
-                return false;
-            }
+                if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+                {
+                    LiminalLogger.LogWarning($"[Manager] Cannot StartServer: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                    return false;
+                }
 
-            LifecycleState = NetworkLifecycleState.StartingServer;
-            Role = NetworkRole.Server;
-
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
-            InitializeSystems();
-
-            LiminalLogger.Log($"[Manager] Starting Dedicated Server on {ip}:{port}");
-
-            try
-            {
-                _transport.StartServer(ip, port);
-
-                LifecycleState = NetworkLifecycleState.ServerActive;
-
+                LifecycleState = NetworkLifecycleState.StartingServer;
+                Role = NetworkRole.Server;
                 LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
-                _ticker.OnTick += ServerTick;
-                _ticker.Start();
+                if (DisconnectCoordinator == null)
+                {
+                    InitializeSystems();
+                }
 
-                LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Manager] StartServer failed: {ex.Message}");
-                Shutdown();
-                throw;
+                LiminalLogger.Log($"[Manager] Starting Dedicated Server on {ip}:{port}");
+
+                try
+                {
+                    _transport.StartServer(ip, port);
+
+                    LifecycleState = NetworkLifecycleState.ServerActive;
+
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+
+                    _ticker.OnTick += ServerTick;
+                    _ticker.Start();
+
+                    LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Manager] StartServer failed: {ex.Message}");
+                    ShutdownInternal();
+                    throw;
+                }
             }
         }
 
@@ -500,89 +509,116 @@ namespace Liminal.Net.Core
 
         public bool StartClient(string ip, int port)
         {
-            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            lock (_teardownLock)
             {
-                LiminalLogger.LogWarning($"[Manager] Cannot StartClient: Manager is in state '{LifecycleState}' (Role: {Role}).");
-                return false;
-            }
+                if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+                {
+                    LiminalLogger.LogWarning($"[Manager] Cannot StartClient: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                    return false;
+                }
 
-            LifecycleState = NetworkLifecycleState.Connecting;
+                LifecycleState = NetworkLifecycleState.Connecting;
+                Role = NetworkRole.Client;
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                if (DisconnectCoordinator == null)
+                {
+                    InitializeSystems();
+                }
 
-            Role = NetworkRole.Client;
+                LiminalLogger.Log($"[Manager] Starting Client connecting to {ip}:{port}");
 
-            InitializeSystems();
+                try
+                {
+                    _transport.StartClient(ip, port);
 
-            LiminalLogger.Log($"[Manager] Starting Client connecting to {ip}:{port}");
-
-            try
-            {
-                _transport.StartClient(ip, port);
-
-                _ticker.OnTick += ClientBackgroundTick;
-                _ticker.Start();
-                return true;
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Manager] StartClient failed: {ex.Message}");
-                Shutdown();
-                throw;
+                    _ticker.OnTick += ClientBackgroundTick;
+                    _ticker.Start();
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Manager] StartClient failed: {ex.Message}");
+                    ShutdownInternal();
+                    throw;
+                }
             }
         }
 
+        private readonly object _teardownLock = new();
         private int _isDisconnecting;
+        private int _isShuttingDown;
 
         public void Disconnect()
         {
-            if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
-
-            if (Interlocked.Exchange(ref _isDisconnecting, 1) == 1)
-                return;
-
-            try
+            lock (_teardownLock)
             {
-                LifecycleState = NetworkLifecycleState.Stopping;
-                Role = NetworkRole.None;
+                if (LifecycleState == NetworkLifecycleState.Stopping) return;
+                if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
 
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                Volatile.Write(ref _isDisconnecting, 1);
+                try
+                {
+                    LifecycleState = NetworkLifecycleState.Stopping;
+                    Role = NetworkRole.None;
 
-                _transport.Disconnect();
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
-                ShutdownSystems(isShutdown: false);
+                    _ticker?.Stop();
+                    _transport.Disconnect();
 
-                LifecycleState = NetworkLifecycleState.Stopped;
+                    ShutdownSystems();
 
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                    LifecycleState = NetworkLifecycleState.Stopped;
 
-                LiminalLogger.Log("[Manager] Network State Disconnected.");
-            }
-            finally
-            {
-                Volatile.Write(ref _isDisconnecting, 0);
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+
+                    LiminalLogger.Log("[Manager] Network State Disconnected.");
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Manager] Error during Disconnect: {ex.Message}");
+                    LifecycleState = NetworkLifecycleState.Stopped;
+                }
+                finally
+                {
+                    Volatile.Write(ref _isDisconnecting, 0);
+                }
             }
         }
-        private int _isShuttingDown;
 
         public void Shutdown()
         {
-            if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
-                return;
+            lock (_teardownLock)
+            {
+                if (LifecycleState == NetworkLifecycleState.Stopping) return;
+                if (Volatile.Read(ref _isDisconnecting) != 0) return;
+                if (Volatile.Read(ref _isShuttingDown) != 0) return;
+
+                ShutdownInternal();
+            }
+        }
+
+        private void ShutdownInternal()
+        {
+            Volatile.Write(ref _isShuttingDown, 1);
+            bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped || _transport.IsConnected;
+            LifecycleState = NetworkLifecycleState.Stopping;
+            Role = NetworkRole.None;
+
+            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
 
             try
             {
-                bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
-                LifecycleState = NetworkLifecycleState.Stopping;
-                Role = NetworkRole.None;
-
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
                 _ticker?.Stop();
 
                 _transport.Shutdown();
 
-                ShutdownSystems(isShutdown: true);
+                _eventHub.RaiseManagerShutdown();
+
+                ShutdownSystems();
+
+                _eventHub.Clear();
 
                 LifecycleState = NetworkLifecycleState.Stopped;
 
@@ -593,9 +629,14 @@ namespace Liminal.Net.Core
                     LiminalLogger.Log("[Manager] Network State Reset.");
                 }
             }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] Error during Shutdown: {ex.Message}");
+                LifecycleState = NetworkLifecycleState.Stopped;
+            }
             finally
             {
-                Interlocked.Exchange(ref _isShuttingDown, 0);
+                Volatile.Write(ref _isShuttingDown, 0);
             }
         }
         #endregion

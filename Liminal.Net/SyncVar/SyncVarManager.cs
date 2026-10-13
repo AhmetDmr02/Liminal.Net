@@ -161,13 +161,24 @@ namespace Liminal.Net.SyncVar
             catch { }
 
             _attachedManager = null;
-            ResetPendingState();
+            ResetSessionState();
         }
 
         public void Reattach(LiminalNetworkManager manager)
         {
             ResetPendingState();
             AttachToManager(manager);
+
+            var allVars = new List<ISyncVarInternal>();
+            _tokenRegistry.GetAll(allVars);
+            for (int i = 0; i < allVars.Count; i++)
+            {
+                var v = allVars[i];
+                if (v.LocalSlot == ushort.MaxValue)
+                {
+                    RegisterSyncVar(v);
+                }
+            }
         }
 
         public void ResetPendingState()
@@ -190,6 +201,26 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        public void ResetSessionState()
+        {
+            ResetPendingState();
+
+            var allVars = new List<ISyncVarInternal>();
+            _tokenRegistry.GetAll(allVars);
+            for (int i = 0; i < allVars.Count; i++)
+            {
+                allVars[i].ResetSession();
+            }
+
+            for (int i = 0; i < _localRegistry.Length; i++)
+            {
+                Volatile.Write(ref _localRegistry[i], null);
+            }
+            _slotBitset.Clear();
+
+            Slab?.Reset();
+        }
+
         public void FullTeardown()
         {
             var spinner = new SpinWait();
@@ -200,24 +231,8 @@ namespace Liminal.Net.SyncVar
                 spinner.SpinOnce();
             }
 
-            ResetPendingState();
+            ResetSessionState();
             Interlocked.CompareExchange(ref _lastCreatedManager, null, this);
-
-            var allVars = new List<ISyncVarInternal>();
-            _tokenRegistry.GetAll(allVars);
-            for (int i = 0; i < allVars.Count; i++)
-            {
-                allVars[i].ResetSession();
-            }
-            _tokenRegistry.Clear();
-
-            for (int i = 0; i < _localRegistry.Length; i++)
-            {
-                Volatile.Write(ref _localRegistry[i], null);
-            }
-            _slotBitset.Clear();
-
-            Slab?.Reset();
         }
 
         public bool UnregisterSyncVar(ISyncVarInternal syncVar)
@@ -434,20 +449,35 @@ namespace Liminal.Net.SyncVar
         {
             if (_tokenRegistry.TryGet(token, out var existing))
             {
-                return (SyncVar<T>)existing;
+                var sv = (SyncVar<T>)existing;
+                if (sv.LocalSlot == ushort.MaxValue)
+                {
+                    RegisterSyncVar(sv);
+                }
+                return sv;
             }
 
             lock (_bindLock)
             {
                 if (_tokenRegistry.TryGet(token, out existing))
                 {
-                    return (SyncVar<T>)existing;
+                    var sv = (SyncVar<T>)existing;
+                    if (sv.LocalSlot == ushort.MaxValue)
+                    {
+                        RegisterSyncVar(sv);
+                    }
+                    return sv;
                 }
 
                 var created = new SyncVar<T>(token, defaultValue, this);
                 if (_tokenRegistry.TryGet(token, out existing) && !ReferenceEquals(existing, created))
                 {
-                    return (SyncVar<T>)existing;
+                    var sv = (SyncVar<T>)existing;
+                    if (sv.LocalSlot == ushort.MaxValue)
+                    {
+                        RegisterSyncVar(sv);
+                    }
+                    return sv;
                 }
 
                 return created;
@@ -462,6 +492,10 @@ namespace Liminal.Net.SyncVar
             if (_tokenRegistry.TryGet(token, out var existing))
             {
                 var sv = (SyncVar<T>)existing;
+                if (sv.LocalSlot == ushort.MaxValue)
+                {
+                    RegisterSyncVar(sv);
+                }
                 if (_attachedManager == null || _attachedManager.Role != NetworkRole.Client)
                 {
                     sv.SetVisibility(visibility);
@@ -474,6 +508,10 @@ namespace Liminal.Net.SyncVar
                 if (_tokenRegistry.TryGet(token, out existing))
                 {
                     var sv = (SyncVar<T>)existing;
+                    if (sv.LocalSlot == ushort.MaxValue)
+                    {
+                        RegisterSyncVar(sv);
+                    }
                     if (_attachedManager == null || _attachedManager.Role != NetworkRole.Client)
                     {
                         sv.SetVisibility(visibility);
@@ -485,6 +523,10 @@ namespace Liminal.Net.SyncVar
                 if (_tokenRegistry.TryGet(token, out existing) && !ReferenceEquals(existing, created))
                 {
                     var sv = (SyncVar<T>)existing;
+                    if (sv.LocalSlot == ushort.MaxValue)
+                    {
+                        RegisterSyncVar(sv);
+                    }
                     if (_attachedManager == null || _attachedManager.Role != NetworkRole.Client)
                     {
                         sv.SetVisibility(visibility);

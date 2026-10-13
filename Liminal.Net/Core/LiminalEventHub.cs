@@ -173,18 +173,18 @@ namespace Liminal.Net.Core
         #region Staged Transport Event Handlers
         private void HandleTransportClientConnected(ushort clientId)
         {
-            if (_disposed || _sessionManager == null) return;
+            if (_disposed) return;
 
-            _sessionManager.HandleClientConnected(clientId);
+            _sessionManager?.HandleClientConnected(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onClientConnected, clientId);
         }
 
         private void HandleTransportLocalClientConnected(ushort clientId)
         {
-            if (_disposed || _sessionManager == null) return;
+            if (_disposed) return;
 
-            _sessionManager.HandleLocalConnection(clientId);
+            _sessionManager?.HandleLocalConnection(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientConnected, clientId);
 
@@ -195,21 +195,21 @@ namespace Liminal.Net.Core
 
         private void HandleTransportClientDisconnected(ushort clientId)
         {
-            if (_disposed || _sessionManager == null) return;
+            if (_disposed) return;
 
-            _sessionManager.HandleClientDisconnected(clientId);
+            _sessionManager?.HandleClientDisconnected(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onClientDisconnected, clientId);
         }
 
         private void HandleTransportLocalClientDisconnected(ushort clientId)
         {
-            if (_disposed || _sessionManager == null) return;
+            if (_disposed) return;
 
             LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientDisconnected, clientId);
 
-            _sessionManager.HandleClientDisconnected(clientId);
-            _sessionManager.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
+            _sessionManager?.HandleClientDisconnected(clientId);
+            _sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
 
             LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, clientId);
         }

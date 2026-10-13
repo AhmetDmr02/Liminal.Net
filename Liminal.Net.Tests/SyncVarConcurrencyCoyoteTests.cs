@@ -4091,6 +4091,7 @@ namespace Liminal.Net.Tests.Coyote
 
             await Task.WhenAll(taskBind, taskAttach);
 
+            Specification.Assert(taskException == null, $"Unexpected taskException in bind/attach: {taskException}");
             Specification.Assert(boundInstance != null, "Bound instance must not be null.");
             Specification.Assert(boundInstance.LocalSlot != ushort.MaxValue,
                 $"Bind<T> returned an unregistered orphan instance! LocalSlot is {boundInstance.LocalSlot}");
@@ -4255,8 +4256,6 @@ namespace Liminal.Net.Tests.Coyote
 
             await Task.WhenAll(taskBind, taskNetwork);
 
-            netManager.Shutdown();
-
             Specification.Assert(taskException == null, $"Unexpected exception: {taskException}");
             Specification.Assert(boundVar != null, "Bound variable must not be null.");
 
@@ -4264,6 +4263,8 @@ namespace Liminal.Net.Tests.Coyote
                 $"SyncVar was downgraded to version {boundVar.Version}! Expected version 10.");
             Specification.Assert(boundVar.Value == "FreshNetwork",
                 $"SyncVar value was downgraded to '{boundVar.Value}'! Expected 'FreshNetwork'.");
+
+            netManager.Shutdown();
         }
 
         [Test]
@@ -4436,12 +4437,194 @@ namespace Liminal.Net.Tests.Coyote
 
             await taskReconcile;
 
-            clientManager.Shutdown();
-
             Specification.Assert(taskException == null, $"Unexpected exception: {taskException}");
             Specification.Assert(clientVar.Version == 6, $"Client version should remain 6, was {clientVar.Version}");
             Specification.Assert(clientVar.Value == "ServerValue",
                 $"Client desynchronized! Retained rejected local value '{clientVar.Value}', expected server value 'ServerValue'.");
+
+            clientManager.Shutdown();
+        }
+
+        [Test]
+        public static async Task Coyote_SyncVar_DisconnectReconnect_ConcurrentGetterSetterSlabReset()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var hostManager = new LiminalNetworkManager(transport, config);
+            var syncVarManager = hostManager.SyncVarManager;
+
+            var syncVar = new SyncVar<int>("coyote_lifecycle_health", 100, syncVarManager);
+
+            int observedReadErrors = 0;
+            int observedWriteErrors = 0;
+            int lifecycleErrors = 0;
+
+            var taskWriter = Task.Run(() =>
+            {
+                for (int i = 1; i <= 15; i++)
+                {
+                    try
+                    {
+                        syncVar.Value = i * 10;
+                    }
+                    catch (Exception)
+                    {
+                        Interlocked.Increment(ref observedWriteErrors);
+                    }
+                }
+            });
+
+            var taskReader = Task.Run(() =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    try
+                    {
+                        int val = syncVar.Value;
+                        if (val < 0)
+                        {
+                            Interlocked.Increment(ref observedReadErrors);
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        Interlocked.Increment(ref observedReadErrors);
+                    }
+                }
+            });
+
+            var taskLifecycle = Task.Run(() =>
+            {
+                try
+                {
+                    syncVarManager.DetachFromManager();
+                    syncVarManager.Reattach(hostManager);
+                    syncVar.Value = 999;
+                }
+                catch (Exception)
+                {
+                    Interlocked.Increment(ref lifecycleErrors);
+                }
+            });
+
+            await Task.WhenAll(taskWriter, taskReader, taskLifecycle);
+
+            hostManager.Shutdown();
+
+            Specification.Assert(observedReadErrors == 0, $"Encountered {observedReadErrors} read errors during concurrent lifecycle reset.");
+            Specification.Assert(observedWriteErrors == 0, $"Encountered {observedWriteErrors} write errors during concurrent lifecycle reset.");
+            Specification.Assert(lifecycleErrors == 0, $"Encountered {lifecycleErrors} lifecycle errors during concurrent reattach.");
+            Specification.Assert(syncVar.Value >= 0, "SyncVar value became corrupted or negative.");
+        }
+
+        [Test]
+        public static async Task Coyote_NetworkManager_ConcurrentLifecycleTransitions_ZeroTOCTOUOrZombieState()
+        {
+            var config = new LiminalNetworkConfig
+            {
+                TickRate = 60,
+                MaxPacketSizePerBatch = 4096,
+                SyncVarMaxPageSize = 4096,
+                SyncVarMaxPageCount = 16,
+                ClientIdResolver = new BaseResolver()
+            };
+
+            var transport = new MockTransport();
+            var manager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+
+            // Phase 1: Verify TOCTOU elimination across concurrent Start* callers
+            int startSuccessCount = 0;
+
+            var taskStartHost = Task.Run(() =>
+            {
+                if (manager.StartHost())
+                {
+                    Interlocked.Increment(ref startSuccessCount);
+                }
+            });
+
+            var taskStartServer = Task.Run(() =>
+            {
+                if (manager.StartServer("127.0.0.1", 7777))
+                {
+                    Interlocked.Increment(ref startSuccessCount);
+                }
+            });
+
+            var taskStartClient = Task.Run(() =>
+            {
+                if (manager.StartClient("127.0.0.1", 7777))
+                {
+                    Interlocked.Increment(ref startSuccessCount);
+                }
+            });
+
+            await Task.WhenAll(taskStartHost, taskStartServer, taskStartClient);
+
+            Specification.Assert(Volatile.Read(ref startSuccessCount) == 1,
+                $"TOCTOU violation! Exactly 1 concurrent Start* call must succeed, but {startSuccessCount} succeeded.");
+            Specification.Assert(manager.LifecycleState != NetworkLifecycleState.Stopped,
+                "Manager must not be in Stopped state after successful start.");
+            Specification.Assert(manager.Role != NetworkRole.None,
+                "Manager role must not be None after successful start.");
+
+            // Phase 2: Concurrent background transport shutdown vs game thread reconnect
+            int unexpectedExceptions = 0;
+
+            var taskBackgroundDrop = Task.Run(() =>
+            {
+                try
+                {
+                    transport.TriggerShutdown();
+                }
+                catch (Exception)
+                {
+                    Interlocked.Increment(ref unexpectedExceptions);
+                }
+            });
+
+            var taskGameReconnect = Task.Run(() =>
+            {
+                try
+                {
+                    manager.StartClient("127.0.0.1", 8888);
+                }
+                catch (Exception)
+                {
+                    Interlocked.Increment(ref unexpectedExceptions);
+                }
+            });
+
+            var taskNormalDisconnect = Task.Run(() =>
+            {
+                try
+                {
+                    manager.Disconnect();
+                }
+                catch (Exception)
+                {
+                    Interlocked.Increment(ref unexpectedExceptions);
+                }
+            });
+
+            await Task.WhenAll(taskBackgroundDrop, taskGameReconnect, taskNormalDisconnect);
+
+            manager.Shutdown();
+
+            Specification.Assert(unexpectedExceptions == 0,
+                $"Encountered {unexpectedExceptions} unexpected exceptions during concurrent shutdown/reconnect.");
+            Specification.Assert(manager.LifecycleState == NetworkLifecycleState.Stopped,
+                $"Manager must end in Stopped state, but was {manager.LifecycleState}.");
+            Specification.Assert(manager.Role == NetworkRole.None,
+                $"Manager role must end in None, but was {manager.Role}.");
         }
     }
 }

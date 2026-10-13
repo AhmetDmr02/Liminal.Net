@@ -54,7 +54,7 @@ namespace Liminal.Net.Tests
             _serverManager?.Shutdown();
         }
 
-        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)
+        private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true, uint connectionTimeout = 15)
         {
             var config = new LiminalNetworkConfig
             {
@@ -64,7 +64,7 @@ namespace Liminal.Net.Tests
                 MaxPacketSizePerBatch = 4096,
                 ClientIdResolver = new BaseResolver(),
                 HandshakeTimeout = 15,
-                ConnectionTimeout = 15
+                ConnectionTimeout = connectionTimeout
             };
             var client = new LiminalNetworkManager(new TcpTransport(), config, telemetryConfig);
             _clientManagers.Add(client);
@@ -99,7 +99,7 @@ namespace Liminal.Net.Tests
         [Test]
         public void Test02_ClientConnect_WithoutServer_FailsGracefully()
         {
-            var client = CreateAndStartClient(waitForConnect: false);
+            var client = CreateAndStartClient(waitForConnect: false, connectionTimeout: 2);
 
             bool connected = false;
             client.Events.OnLocalClientConnected += _ => connected = true;

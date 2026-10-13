@@ -61,7 +61,7 @@ namespace Liminal.Net.Core
             {
                 Name = "Liminal Network Ticker",
                 IsBackground = true,
-                Priority = ThreadPriority.Highest
+                Priority = ThreadPriority.AboveNormal
             };
             _tickThread.Start();
         }
@@ -94,11 +94,8 @@ namespace Liminal.Net.Core
 
                 if (currentTicks >= nextTick)
                 {
-                    // Consume any pending slew adjustment
                     long currentSlew = Interlocked.Exchange(ref _slewAdjustmentTicks, 0);
 
-                    // Advance to next boundary BEFORE invoking OnTick
-                    // so OnTick sees the upcoming tick's deadline
                     nextTick += (nominalTickTicks + currentSlew);
                     Volatile.Write(ref _nextTickTimestamp, nextTick);
 
@@ -125,7 +122,6 @@ namespace Liminal.Net.Core
                     if (msRemaining > 16) Thread.Sleep(1);
                     else Thread.SpinWait(10);
                 }
-
             }
 
 

@@ -88,7 +88,7 @@ namespace Liminal.Net.Tests
 
         public void StartServer(string ip, int port) => OnServerStarted?.Invoke();
         public void StartClient(string ip, int port) { }
-        public void Disconnect() { }
+        public void Disconnect() => OnShutdown?.Invoke();
         public void Shutdown() => OnShutdown?.Invoke();
 
         public void Send(Span<byte> data, ushort clientId, TransportFlags flags)

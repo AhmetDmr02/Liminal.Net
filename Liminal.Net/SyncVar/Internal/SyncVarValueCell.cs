@@ -265,5 +265,18 @@ namespace Liminal.Net.SyncVar.Internal
                 _pendingNewValue = default;
             }
         }
+
+        public void ResetSessionState()
+        {
+            lock (_lock)
+            {
+                Interlocked.Increment(ref _valueSeq);
+                Volatile.Write(ref _version, 0);
+                Interlocked.Increment(ref _valueSeq);
+                _hasPendingValueChanged = false;
+                _pendingOldValue = default;
+                _pendingNewValue = default;
+            }
+        }
     }
 }

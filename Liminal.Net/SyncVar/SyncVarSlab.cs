@@ -63,6 +63,7 @@ namespace Liminal.Net.SyncVar
 
         private readonly byte[][] _pages;
         private int _allocatedBytes;
+        public int AllocatedBytes => Volatile.Read(ref _allocatedBytes);
 
         private readonly BoundedSlotPool[] _tierPools;
         private readonly int _tierCount;
