@@ -272,9 +272,9 @@ namespace Liminal.Net.Core
             {
                 if (Volatile.Read(ref _isDisconnecting) != 0) return;
                 if (Volatile.Read(ref _isShuttingDown) != 0) return;
-                if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
+                if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped && DisconnectCoordinator == null) return;
 
-                ShutdownInternal();
+                TeardownSession();
             }
         }
 
@@ -299,13 +299,15 @@ namespace Liminal.Net.Core
 
         private void HandlePreLocalClientDisconnected(ushort clientId)
         {
-            ResetLifecycleState();
-        }
+            lock (_teardownLock)
+            {
+                if (Volatile.Read(ref _isDisconnecting) != 0 || Volatile.Read(ref _isShuttingDown) != 0)
+                    return;
 
-        private void ResetLifecycleState()
-        {
-            Role = NetworkRole.None;
-            LifecycleState = NetworkLifecycleState.Stopped;
+                Role = NetworkRole.None;
+                LifecycleState = NetworkLifecycleState.Stopping;
+            }
+
             LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
         }
 
@@ -373,8 +375,8 @@ namespace Liminal.Net.Core
 
             if (DisconnectCoordinator != null)
             {
-                DisconnectCoordinator.OnResolved -= HandleDisconnectResolved;
                 DisconnectCoordinator.Dispose();
+                DisconnectCoordinator.OnResolved -= HandleDisconnectResolved;
                 DisconnectCoordinator = null;
             }
 
@@ -559,21 +561,10 @@ namespace Liminal.Net.Core
                 Volatile.Write(ref _isDisconnecting, 1);
                 try
                 {
-                    LifecycleState = NetworkLifecycleState.Stopping;
-                    Role = NetworkRole.None;
-
-                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
                     _ticker?.Stop();
                     _transport.Disconnect();
 
-                    ShutdownSystems();
-
-                    LifecycleState = NetworkLifecycleState.Stopped;
-
-                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
-                    LiminalLogger.Log("[Manager] Network State Disconnected.");
+                    TeardownSession();
                 }
                 catch (Exception ex)
                 {
@@ -584,6 +575,41 @@ namespace Liminal.Net.Core
                 {
                     Volatile.Write(ref _isDisconnecting, 0);
                 }
+            }
+        }
+
+        private void TeardownSession()
+        {
+            // Must be called while holding _teardownLock
+            bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
+            bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
+            LifecycleState = NetworkLifecycleState.Stopping;
+            Role = NetworkRole.None;
+
+            if (!alreadyStopping)
+            {
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+            }
+
+            try
+            {
+                _ticker?.Stop();
+
+                ShutdownSystems();
+
+                LifecycleState = NetworkLifecycleState.Stopped;
+
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+
+                if (wasActive)
+                {
+                    LiminalLogger.Log("[Manager] Network State Disconnected.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] Error during session teardown: {ex.Message}");
+                LifecycleState = NetworkLifecycleState.Stopped;
             }
         }
 

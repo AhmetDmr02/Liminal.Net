@@ -209,6 +209,16 @@ namespace Liminal.Net.Tests
 
             Assert.That(SpinWait.SpinUntil(() => clientSawDisconnect, 2000), Is.True, "Client did not detect being kicked.");
             Assert.That(SpinWait.SpinUntil(() => !client.Transport.IsConnected, 2000), Is.True, "Client transport remained marked as connected.");
+
+            Assert.That(SpinWait.SpinUntil(() => client.Role == NetworkRole.None, 2000), Is.True);
+            Assert.That(client.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
+            Assert.That(client.DisconnectCoordinator, Is.Null, "DisconnectCoordinator was not cleaned up on unexpected disconnect.");
+
+            // Verify clean reconnect
+            bool reconnected = false;
+            client.Events.OnLocalClientConnected += _ => reconnected = true;
+            Assert.That(client.StartClient("127.0.0.1", _currentTestPort), Is.True);
+            Assert.That(SpinWait.SpinUntil(() => reconnected, 3000), Is.True, "Client failed to reconnect after unexpected disconnect.");
         }
 
         [Test]
