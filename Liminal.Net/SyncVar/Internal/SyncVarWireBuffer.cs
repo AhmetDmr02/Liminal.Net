@@ -3,6 +3,14 @@ using System.Threading;
 
 namespace Liminal.Net.SyncVar.Internal
 {
+    internal enum WireWriteResult
+    {
+        Written,
+        NoSlab,
+        Stale,
+        Disposed
+    }
+
     internal sealed class SyncVarWireBuffer : IDisposable
     {
         private volatile SyncVarSlab _slab;
@@ -96,21 +104,20 @@ namespace Liminal.Net.SyncVar.Internal
 
         public void AllocateInitialSlots(int size)
         {
-            if (_slab == null) return;
-
             lock (_writeLock)
             {
-                if (Volatile.Read(ref _isDisposed) != 0) return;
+                var slab = _slab;
+                if (slab == null || Volatile.Read(ref _isDisposed) != 0) return;
 
                 if (_slots[0].PageIndex >= 0)
                 {
                     return;
                 }
 
-                _slots[0] = _slab.AllocateSlot(size, out int actual0);
+                _slots[0] = slab.AllocateSlot(size, out int actual0);
                 _slotCapacities[0] = actual0;
                 _slotLengths[0] = size;
-                _slots[1] = _slab.AllocateSlot(size, out int actual1);
+                _slots[1] = slab.AllocateSlot(size, out int actual1);
                 _slotCapacities[1] = actual1;
                 _slotLengths[1] = size;
                 Volatile.Write(ref _frontIndex, 0);
@@ -119,11 +126,10 @@ namespace Liminal.Net.SyncVar.Internal
 
         public bool AllocateAndWriteInitial(ReadOnlySpan<byte> initialBytes)
         {
-            if (_slab == null) return false;
-
             lock (_writeLock)
             {
-                if (Volatile.Read(ref _isDisposed) != 0) return false;
+                var slab = _slab;
+                if (slab == null || Volatile.Read(ref _isDisposed) != 0) return false;
 
                 if (_slots[0].PageIndex >= 0)
                 {
@@ -131,10 +137,10 @@ namespace Liminal.Net.SyncVar.Internal
                 }
 
                 int size = initialBytes.Length;
-                _slots[0] = _slab.AllocateSlot(size, out int actual0);
+                _slots[0] = slab.AllocateSlot(size, out int actual0);
                 _slotCapacities[0] = actual0;
                 _slotLengths[0] = size;
-                _slots[1] = _slab.AllocateSlot(size, out int actual1);
+                _slots[1] = slab.AllocateSlot(size, out int actual1);
                 _slotCapacities[1] = actual1;
                 _slotLengths[1] = size;
 
@@ -143,24 +149,24 @@ namespace Liminal.Net.SyncVar.Internal
                     return false;
                 }
 
-                initialBytes.CopyTo(_slab.GetSpan(_slots[0].PageIndex, _slots[0].PageOffset, size));
+                initialBytes.CopyTo(slab.GetSpan(_slots[0].PageIndex, _slots[0].PageOffset, size));
                 Volatile.Write(ref _frontIndex, 0);
                 return true;
             }
         }
 
-        public bool WriteBytes(ReadOnlySpan<byte> bytes, uint version, bool force = false)
+        public WireWriteResult WriteBytes(ReadOnlySpan<byte> bytes, uint version, bool force = false)
         {
-            if (_slab == null) return false;
-
             lock (_writeLock)
             {
-                if (Volatile.Read(ref _isDisposed) != 0) return false;
+                var slab = _slab;
+                if (Volatile.Read(ref _isDisposed) != 0) return WireWriteResult.Disposed;
+                if (slab == null) return WireWriteResult.NoSlab;
 
                 int currentFront = Volatile.Read(ref _frontIndex);
                 if (!force && currentFront >= 0 && version < _slotVersions[currentFront])
                 {
-                    return false;
+                    return WireWriteResult.Stale;
                 }
 
                 int backIndex = (currentFront == -1 || currentFront == 1) ? 0 : 1;
@@ -187,22 +193,22 @@ namespace Liminal.Net.SyncVar.Internal
                     int oldCap = _slotCapacities[backIndex];
                     var oldSlot = _slots[backIndex];
 
-                    _slots[backIndex] = _slab.AllocateSlot(length, out int actualCapacity);
+                    _slots[backIndex] = slab.AllocateSlot(length, out int actualCapacity);
                     _slotCapacities[backIndex] = actualCapacity;
 
                     if (oldCap > 0 && oldSlot.PageIndex >= 0)
                     {
-                        _slab.FreeSlot(oldSlot.PageIndex, oldSlot.PageOffset, oldCap);
+                        slab.FreeSlot(oldSlot.PageIndex, oldSlot.PageOffset, oldCap);
                     }
                 }
 
                 var (page, offset) = _slots[backIndex];
-                bytes.CopyTo(_slab.GetSpan(page, offset, length));
+                bytes.CopyTo(slab.GetSpan(page, offset, length));
 
                 _slotLengths[backIndex] = length;
                 _slotVersions[backIndex] = version;
                 Volatile.Write(ref _frontIndex, backIndex);
-                return true;
+                return WireWriteResult.Written;
             }
         }
 
@@ -299,11 +305,9 @@ namespace Liminal.Net.SyncVar.Internal
 
         public void Clear()
         {
-            if (_slab == null) return;
-
             lock (_writeLock)
             {
-                if (Volatile.Read(ref _isDisposed) != 0) return;
+                if (_slab == null || Volatile.Read(ref _isDisposed) != 0) return;
 
                 Volatile.Write(ref _isClearing, 1);
                 Thread.MemoryBarrier();

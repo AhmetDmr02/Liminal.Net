@@ -398,11 +398,13 @@ namespace Liminal.Net.Tests
             byte[] chunk = new byte[6 + effectiveMaxPayload];
             BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(0, 2), 1);
             BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(2, 2), 0);
-            BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(4, 2), 10);
+            //20 * 989b goes over the 4096b * 4 recovery cap, 10 fragments didnt and only passed because of the timeout
+            BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(4, 2), 20);
 
             fragmentor.IngestFragment(chunk, senderId: 37);
 
-            Assert.That(SpinWait.SpinUntil(() => mockTransport.KickedClients.Contains(37), 2000), Is.True);
+            Assert.That(mockTransport.KickedClients.Contains(37), Is.True);
+            Assert.That(fragmentor.OutstandingAssemblyBuffers, Is.Zero);
         }
 
         #endregion
@@ -426,7 +428,12 @@ namespace Liminal.Net.Tests
 
             fragmentor.IngestFragment(chunk0, senderId: 40);
 
-            Assert.That(SpinWait.SpinUntil(() => mockTransport.KickedClients.Contains(40), 3000), Is.True);
+            Assert.That(SpinWait.SpinUntil(() =>
+            {
+                fragmentor.PruneStaleAssemblies();
+                return mockTransport.KickedClients.Contains(40);
+            }, 3000), Is.True);
+            Assert.That(fragmentor.OutstandingAssemblyBuffers, Is.Zero);
         }
 
         [Test]

@@ -832,6 +832,15 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => c2Var.Value == 777, 2000), Is.True);
         }
 
+        //Server to client syncvar packets only get accepted on a connected client so put the manager there first
+        private static void ConnectAsMockClient(LiminalNetworkManager manager, MockTransport transport)
+        {
+            transport.IsServer = false;
+            manager.StartClient("127.0.0.1", 7777);
+            transport.TriggerLocalClientConnected(transport.LocalClientId);
+            Assert.That(manager.IsConnected, Is.True, "Mock client failed to reach the Connected state.");
+        }
+
         [Test]
         public void Test27_Lifecycle_UnboundCapacity_CalculatesGenerouslyAndEvictsOldest()
         {
@@ -853,8 +862,9 @@ namespace Liminal.Net.Tests
             Assert.That(smallManager.MaxUnboundCapacity, Is.EqualTo(2048));
 
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
             var attachedSyncManager = netManager.SyncVarManager;
+            ConnectAsMockClient(netManager, transport);
 
             for (int i = 0; i < 100; i++)
             {
@@ -884,7 +894,8 @@ namespace Liminal.Net.Tests
         public void Test28_Lifecycle_ResetPendingState_ClearsDirtyQueueAndUnboundCache()
         {
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, new LiminalNetworkConfig());
+            var config = new LiminalNetworkConfig();
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
             var manager = netManager.SyncVarManager;
 
             var v1 = new SyncVar<int>("reset_test_var", 42, manager);
@@ -892,6 +903,8 @@ namespace Liminal.Net.Tests
 
             Assert.That(manager.DirtyQueueCount, Is.GreaterThan(0));
             Assert.That(v1.IsDirty, Is.True);
+
+            ConnectAsMockClient(netManager, transport);
 
             var buffer = new ArrayBufferWriter<byte>();
             var writer = new MessagePackWriter(buffer);
@@ -1013,7 +1026,7 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void Test32_OfflineModifiedWithAuthority_PreservedAndSyncedToServerOnConnect()
+        public void Test32_OfflineModifiedWithAuthority_ServerValueArrivesFirst_ResentFromAuthorityHook()
         {
             string token = $"offline_auth_{Guid.NewGuid():N}";
             var serverVar = new SyncVar<int>(token, 50);
@@ -1041,6 +1054,16 @@ namespace Liminal.Net.Tests
             clientVar.Value = 777;
             Assert.That(clientVar.Value, Is.EqualTo(777));
 
+            //Server state lands on connect then authority gets announced, game resends its offline change from the auth hook
+            int offlineValue = clientVar.Value;
+            int valueWhenGranted = -1;
+            clientVar.OnAuthorityChanged += granted =>
+            {
+                if (!granted) return;
+                valueWhenGranted = clientVar.Value;
+                clientVar.Value = offlineValue;
+            };
+
             bool connected = false;
             client.Events.OnLocalClientConnected += _ => connected = true;
             client.StartClient("127.0.0.1", _currentTestPort);
@@ -1048,7 +1071,8 @@ namespace Liminal.Net.Tests
             Assert.That(SpinWait.SpinUntil(() => connected, 2000), Is.True, "Client failed to connect.");
 
             Assert.That(SpinWait.SpinUntil(() => serverVar.Value == 777 && clientVar.Value == 777, 2000), Is.True,
-                "Authorized offline client mutation was not synced to server.");
+                "The offline change re-sent from OnAuthorityChanged did not reach the server.");
+            Assert.That(valueWhenGranted, Is.EqualTo(50), "Authority was announced before the server's value was applied.");
             Assert.That(clientVar.HasAuthority, Is.True);
         }
 
@@ -1753,13 +1777,19 @@ namespace Liminal.Net.Tests
             Assert.That(syncVar2.LocalSlot, Is.EqualTo(ushort.MaxValue));
             Assert.That(syncVar3.LocalSlot, Is.EqualTo(ushort.MaxValue));
 
-            // Start new server session and verify clean slot allocation from 0
+            //Old syncvars are still referenced so the new manager adopts them on a fresh slab
             _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
             _serverManager.StartServer("127.0.0.1", _currentTestPort + 1);
 
             var newSessionVar = new SyncVar<int>("new_session_token", 555, _serverManager.SyncVarManager);
-            Assert.That(newSessionVar.LocalSlot, Is.EqualTo(0), "New session did not start at slot 0; session state bled into subsequent host.");
-            Assert.That(_serverManager.SyncVarManager.SlotBitset.CountAllocated(), Is.EqualTo(1));
+            var newManager = _serverManager.SyncVarManager;
+            Assert.That(newManager.SlotBitset.CountAllocated(), Is.EqualTo(4), "Only the three adopted SyncVars and the new one may hold slots.");
+            Assert.That(newManager.UnboundCacheCount, Is.EqualTo(0));
+            Assert.That(new[] { syncVar1.LocalSlot, syncVar2.LocalSlot, syncVar3.LocalSlot, newSessionVar.LocalSlot }, Is.Unique);
+            Assert.That(syncVar1.TryExtractSnapshotData(out var bytes1, out _), Is.True);
+            Assert.That(MessagePack.MessagePackSerializer.Deserialize<int>(bytes1), Is.EqualTo(100));
+            Assert.That(newSessionVar.TryExtractSnapshotData(out var bytesNew, out _), Is.True);
+            Assert.That(MessagePack.MessagePackSerializer.Deserialize<int>(bytesNew), Is.EqualTo(555));
         }
 
         [Test]
@@ -1797,7 +1827,8 @@ namespace Liminal.Net.Tests
             var client1Var = client1.SyncVarManager.Bind<int>(token);
             Assert.That(SpinWait.SpinUntil(() => client1Var.Value == 100, 2000), Is.True);
 
-            // Shut down everything
+            //Unregister the client copy so the new server in this same process doesnt adopt it
+            client1.SyncVarManager.UnregisterSyncVar(client1Var);
             client1.Shutdown();
             _serverManager.Shutdown();
 

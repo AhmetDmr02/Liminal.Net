@@ -1,5 +1,6 @@
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
+using Liminal.Net.SyncVar.Internal;
 using MessagePack;
 using System;
 using System.Buffers;
@@ -22,19 +23,35 @@ namespace Liminal.Net.SyncVar
         {
             if (netManager == null) throw new ArgumentNullException(nameof(netManager));
 
+            SyncVarManager result;
             lock (_managerMapLock)
             {
                 if (_managerMap.TryGetValue(netManager, out var existing))
                 {
-                    existing.Reattach(netManager);
-                    Volatile.Write(ref _lastCreatedManager, existing);
-                    return existing;
+                    existing.ResetPendingState();
+                    existing.AttachToManager(netManager);
+                    result = existing;
                 }
+                else
+                {
+                    result = new SyncVarManager(netManager, config);
+                    _managerMap.Add(netManager, result);
+                }
+                Volatile.Write(ref _lastCreatedManager, result);
+            }
 
-                var newManager = new SyncVarManager(netManager, config);
-                _managerMap.Add(netManager, newManager);
-                Volatile.Write(ref _lastCreatedManager, newManager);
-                return newManager;
+            result.AdoptOrphans();
+            return result;
+        }
+
+        //Newest first so the most recently created one wins when tokens collide
+        internal void AdoptOrphans()
+        {
+            var all = new List<ISyncVarInternal>();
+            SyncVarDirectory.Snapshot(all);
+            for (int i = all.Count - 1; i >= 0; i--)
+            {
+                all[i].Adopt(this);
             }
         }
 
@@ -168,17 +185,7 @@ namespace Liminal.Net.SyncVar
         {
             ResetPendingState();
             AttachToManager(manager);
-
-            var allVars = new List<ISyncVarInternal>();
-            _tokenRegistry.GetAll(allVars);
-            for (int i = 0; i < allVars.Count; i++)
-            {
-                var v = allVars[i];
-                if (v.LocalSlot == ushort.MaxValue)
-                {
-                    RegisterSyncVar(v);
-                }
-            }
+            AdoptOrphans();
         }
 
         public void ResetPendingState()
@@ -268,6 +275,7 @@ namespace Liminal.Net.SyncVar
         public bool UnregisterSyncVar(string token)
         {
             if (string.IsNullOrEmpty(token)) return false;
+            ISyncVarInternal unregistered = null;
             lock (_unboundLock)
             {
                 if (_unboundCache.Remove(token, out var entry))
@@ -277,17 +285,42 @@ namespace Liminal.Net.SyncVar
                 _unboundAuth.Remove(token);
                 if (_tokenRegistry.TryRemove(token, out var syncVar))
                 {
-                    ushort slot = syncVar.LocalSlot;
-                    if (slot != ushort.MaxValue)
-                    {
-                        DirtyBitset.ClearDirty(slot);
-                        Volatile.Write(ref _localRegistry[slot], null);
-                        _slotBitset.Free(slot);
-                        syncVar.LocalSlot = ushort.MaxValue;
-                    }
-                    return true;
+                    FreeSlotLocked(syncVar);
+                    syncVar.DetachFromSlab();
+                    syncVar.ExcludedFromAdoption = true;
+                    unregistered = syncVar;
                 }
-                return false;
+            }
+
+            if (unregistered == null) return false;
+            unregistered.RefreshClientAuthority();
+            return true;
+        }
+
+        //Called under syncvar's registration lock when another manager takes it from this torn down one
+        //detach under _unboundLock so it cant free slab memory after Slab.Reset reused it
+        internal void ReleaseSyncVar(ISyncVarInternal syncVar)
+        {
+            string token = syncVar.Token;
+            lock (_unboundLock)
+            {
+                if (_tokenRegistry.TryGet(token, out var current) && ReferenceEquals(current, syncVar))
+                {
+                    _tokenRegistry.TryRemove(token, out _);
+                }
+                FreeSlotLocked(syncVar);
+                syncVar.DetachFromSlab();
+            }
+        }
+
+        private void FreeSlotLocked(ISyncVarInternal syncVar)
+        {
+            ushort slot = syncVar.LocalSlot;
+            if (slot != ushort.MaxValue && ReferenceEquals(Volatile.Read(ref _localRegistry[slot]), syncVar))
+            {
+                DirtyBitset.ClearDirty(slot);
+                Volatile.Write(ref _localRegistry[slot], null);
+                _slotBitset.Free(slot);
             }
         }
 
@@ -414,10 +447,16 @@ namespace Liminal.Net.SyncVar
         public void RegisterSyncVar(ISyncVarInternal syncVar)
         {
             if (syncVar == null) throw new ArgumentNullException(nameof(syncVar));
+            RegisterSyncVarDeferred(syncVar, warnOnConflict: true, replaceAdopted: false);
+            syncVar.FirePendingEvents();
+        }
 
+        //No events here, caller fires them after releasing its locks
+        internal bool RegisterSyncVarDeferred(ISyncVarInternal syncVar, bool warnOnConflict, bool replaceAdopted, bool forAdoption = false)
+        {
             if (Volatile.Read(ref _lifecycleGate) == 2 || syncVar.IsDisposed)
             {
-                return;
+                return false;
             }
 
             UnboundEntry entry = null;
@@ -427,19 +466,37 @@ namespace Liminal.Net.SyncVar
             {
                 if (Volatile.Read(ref _lifecycleGate) == 2 || syncVar.IsDisposed)
                 {
-                    return;
+                    return false;
+                }
+
+                if (forAdoption && syncVar.ExcludedFromAdoption)
+                {
+                    return false;
                 }
 
                 if (syncVar.LocalSlot != ushort.MaxValue && _slotBitset.IsAllocated(syncVar.LocalSlot) && Volatile.Read(ref _localRegistry[syncVar.LocalSlot]) == syncVar)
                 {
                     _tokenRegistry.TryAdd(syncVar);
-                    return;
+                    return false;
                 }
 
                 if (_tokenRegistry.TryGet(syncVar.Token, out var existingRegistered) && !ReferenceEquals(existingRegistered, syncVar))
                 {
-                    LiminalLogger.LogWarning($"[SyncVarManager] SyncVar with token '{syncVar.Token}' is already registered.");
-                    return;
+                    //Adopted one might be a leftover the game doesnt use anymore so a newly constructed one replaces it
+                    if (!replaceAdopted || !existingRegistered.JoinedByAdoption)
+                    {
+                        if (warnOnConflict)
+                        {
+                            LiminalLogger.LogWarning($"[SyncVarManager] SyncVar with token '{syncVar.Token}' is already registered.");
+                        }
+                        return false;
+                    }
+
+                    LiminalLogger.LogWarning($"[SyncVarManager] SyncVar '{syncVar.Token}' replaces an adopted SyncVar with the same token.");
+                    _tokenRegistry.TryRemove(syncVar.Token, out _);
+                    FreeSlotLocked(existingRegistered);
+                    existingRegistered.DetachFromSlab();
+                    existingRegistered.ExcludedFromAdoption = true;
                 }
 
                 syncVar.AttachManager(this);
@@ -457,7 +514,7 @@ namespace Liminal.Net.SyncVar
                 if (!syncVar.TryInitializeSlabSlots(writer.WrittenSpan))
                 {
                     _slotBitset.Free(slot);
-                    return;
+                    return false;
                 }
                 Interlocked.Add(ref _totalAllocatedBytes, size * 2);
 
@@ -487,11 +544,12 @@ namespace Liminal.Net.SyncVar
                 if (!syncVar.TryPublishSlot(slot))
                 {
                     _slotBitset.Free(slot);
-                    return;
+                    return false;
                 }
 
                 _tokenRegistry.TryAdd(syncVar);
                 Volatile.Write(ref _localRegistry[slot], syncVar);
+                syncVar.ExcludedFromAdoption = false;
 
                 var netManager = _attachedManager;
                 if (syncVar.IsDirty || (netManager != null && netManager.Role != NetworkRole.Client && netManager.Role != NetworkRole.None))
@@ -500,7 +558,7 @@ namespace Liminal.Net.SyncVar
                 }
             }
 
-            syncVar.FirePendingEvents();
+            return true;
         }
 
         public SyncVar<T> Bind<T>(string token, T defaultValue = default)
@@ -1057,10 +1115,26 @@ namespace Liminal.Net.SyncVar
             else netManager.Interpreter.SendCommandAsServer(targets, packet);
         }
 
-        private void HandleBatchDelta(SyncVarSlabBatchPacket packet, ushort senderId)
+        //Host gets these from itself over loopback (sender = its localID), dedicated server never accepts them or any client could rewrite server state
+        private bool IsFromAuthoritativeServer(ushort senderId)
         {
             var netManager = _attachedManager;
-            if (netManager != null && netManager.Role == NetworkRole.Client && !netManager.IsConnected) return;
+            if (netManager == null) return false;
+
+            switch (netManager.Role)
+            {
+                case NetworkRole.Client:
+                    return netManager.IsConnected && senderId == ILiminalTransport.SERVER_ID;
+                case NetworkRole.Host:
+                    return senderId == ILiminalTransport.SERVER_ID || senderId == netManager.localID;
+                default:
+                    return false;
+            }
+        }
+
+        private void HandleBatchDelta(SyncVarSlabBatchPacket packet, ushort senderId)
+        {
+            if (!IsFromAuthoritativeServer(senderId)) return;
 
             if (packet.Payload.IsEmpty) return;
 
@@ -1132,13 +1206,14 @@ namespace Liminal.Net.SyncVar
                 if (!TryGetSyncVar(tokenSpan, out var syncVar))
                 {
                     string token = System.Text.Encoding.UTF8.GetString(tokenSpan);
-                    LiminalLogger.LogError($"[SyncVarManager] Client {senderId} attempted to write to non-existent SyncVar '{token}'. Dropped.");
+                    LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} wrote to unknown SyncVar '{token}'. Dropped; client authority revoked.", LiminalLogger.LogLevel.Detailed);
+                    SendAuthToClient(token, Array.Empty<ushort>(), senderId);
                     continue;
                 }
 
                 if (!syncVar.IsAuthorized(senderId))
                 {
-                    LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify Var '{syncVar.Token}'. Dropped.");
+                    RejectUnauthorizedWrite(syncVar, senderId);
                     continue;
                 }
 
@@ -1166,28 +1241,43 @@ namespace Liminal.Net.SyncVar
                     }
                 }
 
-                if (syncVar.ApplyRemoteBytes(rawSlice, version, SerializerOptions, force: false, deferEvent: false, senderId: senderId))
+                if (syncVar.ApplyClientWrite(rawSlice, senderId, SerializerOptions) == ClientWriteResult.Unauthorized)
                 {
-                    if (syncVar.TryMarkDirty())
-                    {
-                        EnqueueDirty(syncVar);
-                    }
-                }
-                else if (!syncVar.IsAuthorized(senderId))
-                {
-                    LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify Var '{syncVar.Token}'. Dropped.");
-                }
-                else
-                {
-                    SendSyncVarToClient(syncVar, senderId);
+                    RejectUnauthorizedWrite(syncVar, senderId);
                 }
             }
         }
 
-        private void HandleAuthUpdate(SyncVarAuthUpdatePacket packet, ushort senderId)
+        //Correct the client, no authority and if it can see the syncvar also the server value and version
+        private void RejectUnauthorizedWrite(ISyncVarInternal syncVar, ushort senderId)
+        {
+            LiminalLogger.LogWarning($"[SyncVarManager] Client {senderId} unauthorized to modify '{syncVar.Token}'. Dropped; client corrected.", LiminalLogger.LogLevel.Detailed);
+            if (syncVar.IsVisibleTo(senderId))
+            {
+                SendSyncVarToClient(syncVar, senderId);
+            }
+            else
+            {
+                SendAuthToClient(syncVar.Token, Array.Empty<ushort>(), senderId);
+            }
+        }
+
+        private void SendAuthToClient(string token, ushort[] authIds, ushort clientId)
         {
             var netManager = _attachedManager;
-            if (netManager != null && netManager.Role == NetworkRole.Client && !netManager.IsConnected) return;
+            if (netManager == null || netManager.Role == NetworkRole.Client || !netManager.CanSend)
+                return;
+
+            var packet = new SyncVarAuthUpdatePacket { Token = token, AuthIds = authIds };
+            if (netManager.Role == NetworkRole.Host && clientId == netManager.localID)
+                netManager.Interpreter.SendCommandAsClient(clientId, packet);
+            else
+                netManager.Interpreter.SendCommandAsServer(clientId, packet);
+        }
+
+        private void HandleAuthUpdate(SyncVarAuthUpdatePacket packet, ushort senderId)
+        {
+            if (!IsFromAuthoritativeServer(senderId)) return;
 
             if (TryGetSyncVar(packet.Token, out var syncVar))
             {
@@ -1233,8 +1323,7 @@ namespace Liminal.Net.SyncVar
 
         private void HandleSnapshot(SyncVarSnapshotPacket packet, ushort senderId)
         {
-            var netManager = _attachedManager;
-            if (netManager != null && netManager.Role == NetworkRole.Client && !netManager.IsConnected) return;
+            if (!IsFromAuthoritativeServer(senderId)) return;
 
             Volatile.Write(ref _hasReceivedInitialSnapshot, 1);
             if (packet.Entries == null || packet.Entries.Count == 0) return;
@@ -1244,21 +1333,14 @@ namespace Liminal.Net.SyncVar
                 var entry = packet.Entries[i];
                 if (TryGetSyncVar(entry.Token, out var syncVar))
                 {
+                    //Snapshot is server state on connect and on every (re)grant, client takes it as is with the version
+                    //value goes in before authority so OnAuthorityChanged(true) handlers build on the server value
                     syncVar.SetLocallyVisible(true);
-                    syncVar.ApplyAuthUpdateFromRemote(entry.AuthIds);
                     if (entry.Data != null && entry.Data.Length > 0)
                     {
-                        bool force = !syncVar.HasAuthority;
-                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force);
+                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force: true);
                     }
-
-                    if (syncVar.HasAuthority && syncVar.Version > entry.Version)
-                    {
-                        if (syncVar.TryMarkDirty())
-                        {
-                            EnqueueDirty(syncVar);
-                        }
-                    }
+                    syncVar.ApplyAuthUpdateFromRemote(entry.AuthIds);
                 }
                 else
                 {
@@ -1276,9 +1358,7 @@ namespace Liminal.Net.SyncVar
 
         private void HandleEviction(SyncVarEvictPacket packet, ushort senderId)
         {
-            var netManager = _attachedManager;
-            if (netManager != null && netManager.Role == NetworkRole.Client && (!netManager.IsConnected || senderId != ILiminalTransport.SERVER_ID))
-                return;
+            if (!IsFromAuthoritativeServer(senderId)) return;
 
             ReadOnlySpan<byte> tokenSpan = packet.TokenBytes.Length > 0 ? packet.TokenBytes.Span : System.Text.Encoding.UTF8.GetBytes(packet.Token);
 
@@ -1302,8 +1382,7 @@ namespace Liminal.Net.SyncVar
         private void HandleClear(SyncVarClearPacket packet, ushort senderId)
         {
             var netManager = _attachedManager;
-            if (netManager != null && netManager.Role == NetworkRole.Client && (!netManager.IsConnected || senderId != ILiminalTransport.SERVER_ID))
-                return;
+            if (!IsFromAuthoritativeServer(senderId)) return;
 
             ReadOnlySpan<byte> tokenSpan = packet.TokenBytes.Length > 0 ? packet.TokenBytes.Span : System.Text.Encoding.UTF8.GetBytes(packet.Token);
 

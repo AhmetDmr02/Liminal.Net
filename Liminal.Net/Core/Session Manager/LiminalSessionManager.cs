@@ -174,7 +174,8 @@ namespace Liminal.Net.Core
                         {
                             int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedBatch.Slice(offset, 4));
 
-                            if (totalLen < 2 || offset + 4 + totalLen > processedBatch.Length)
+                            //totalLen comes from the wire and offset + 4 + totalLen can overflow so check it with subtraction
+                            if (totalLen < 2 || totalLen > processedBatch.Length - offset - 4)
                                 break;
 
                             if (session.InboundPacketCount >= _config.MaxPacketCount || !session.TryReserveInboundPacketUnreliable(_config.MaxPacketCount))
@@ -275,7 +276,7 @@ namespace Liminal.Net.Core
                     {
                         int totalLen = BinaryPrimitives.ReadInt32LittleEndian(processedReliableBatch.Slice(relOffset, 4));
 
-                        if (totalLen < 2 || relOffset + 4 + totalLen > processedReliableBatch.Length)
+                        if (totalLen < 2 || totalLen > processedReliableBatch.Length - relOffset - 4)
                             break;
 
                         if (session.InboundPacketCount >= GetInboundPacketLimit(session))
@@ -812,6 +813,8 @@ namespace Liminal.Net.Core
 
             try
             {
+                _fragmentor.PruneStaleAssemblies();
+
                 while (!_loopbackQueue.IsEmpty &&
                        _loopbackQueue.TryDequeue(out var loopbackItem))
                 {

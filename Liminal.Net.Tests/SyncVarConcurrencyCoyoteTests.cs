@@ -35,6 +35,12 @@ namespace Liminal.Net.Tests.Coyote
 
     public static class SyncVarConcurrencyCoyoteTests
     {
+        //Server to client syncvar packets only get accepted on a connected client or host, host is what these tests were written for
+        private static void StartAsMockHost(LiminalNetworkManager netManager)
+        {
+            Specification.Assert(netManager.StartHost("127.0.0.1", 7777), "Mock host failed to start.");
+        }
+
         [Test]
         public static async Task Coyote_SyncVar_WorkerWritesAndTickerFlush_ZeroDeadlockOrTearing()
         {
@@ -556,7 +562,8 @@ namespace Liminal.Net.Tests.Coyote
             };
 
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            StartAsMockHost(netManager);
             var syncVarManager = netManager.SyncVarManager;
 
             const int count = 10;
@@ -713,7 +720,8 @@ namespace Liminal.Net.Tests.Coyote
             };
 
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            StartAsMockHost(netManager);
             var syncVarManager = netManager.SyncVarManager;
 
             const int count = 10;
@@ -931,7 +939,8 @@ namespace Liminal.Net.Tests.Coyote
             };
 
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            StartAsMockHost(netManager);
             var syncVarManager = netManager.SyncVarManager;
 
             const string token = "auth_stomp_token";
@@ -989,7 +998,8 @@ namespace Liminal.Net.Tests.Coyote
             };
 
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            StartAsMockHost(netManager);
             var syncVarManager = netManager.SyncVarManager;
 
             const int count = 10;
@@ -1327,7 +1337,8 @@ namespace Liminal.Net.Tests.Coyote
             };
 
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new Liminal.Net.Unity.LiminalUnityTicker(config));
+            StartAsMockHost(netManager);
             var syncVarManager = netManager.SyncVarManager;
 
             const int varCount = 5;
@@ -2145,13 +2156,15 @@ namespace Liminal.Net.Tests.Coyote
         public static async Task Coyote_Utf8TokenRegistry_ConcurrentLookupAndExpansion_Race()
         {
             const int count = 150;
+            string prefix = $"token_expansion_{Guid.NewGuid():N}";
             var taskA = Task.Run(async () =>
             {
                 for (int i = 0; i < count; i++)
                 {
-                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes($"token_expansion_a_{i}");
-                    string token = Utf8TokenRegistry.GetOrAddCachedToken(bytes);
-                    Specification.Assert(token == $"token_expansion_a_{i}", "Token string mismatch in registry.");
+                    string name = $"{prefix}_{i}";
+                    Utf8TokenRegistry.RegisterToken(name);
+                    string token = Utf8TokenRegistry.GetCachedOrDecodeToken(System.Text.Encoding.UTF8.GetBytes(name));
+                    Specification.Assert(ReferenceEquals(token, name), "A registered token is not served from the cache.");
                     await Task.Yield();
                 }
             });
@@ -2160,9 +2173,9 @@ namespace Liminal.Net.Tests.Coyote
             {
                 for (int i = 0; i < count; i++)
                 {
-                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes($"token_expansion_b_{i}");
-                    string token = Utf8TokenRegistry.GetOrAddCachedToken(bytes);
-                    Specification.Assert(token == $"token_expansion_b_{i}", "Token string mismatch in registry.");
+                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes($"{prefix}_{i}");
+                    string token = Utf8TokenRegistry.GetCachedOrDecodeToken(bytes);
+                    Specification.Assert(token == $"{prefix}_{i}", "Token string mismatch while the cache grows.");
                     await Task.Yield();
                 }
             });
@@ -2689,11 +2702,11 @@ namespace Liminal.Net.Tests.Coyote
                 byte[] dataVer10 = new byte[] { 10, 10, 10, 10 };
                 byte[] dataVer5 = new byte[] { 5, 5, 5, 5 };
 
-                bool write10 = buffer.WriteBytes(dataVer10, 10);
-                Specification.Assert(write10, "Write version 10 should succeed.");
+                var write10 = buffer.WriteBytes(dataVer10, 10);
+                Specification.Assert(write10 == WireWriteResult.Written, "Write version 10 should succeed.");
 
-                bool write5 = buffer.WriteBytes(dataVer5, 5);
-                Specification.Assert(!write5, "Out of order write version 5 should be rejected.");
+                var write5 = buffer.WriteBytes(dataVer5, 5);
+                Specification.Assert(write5 == WireWriteResult.Stale, "Out of order write version 5 should be rejected as stale.");
 
                 bool read = buffer.TryBeginRead(out int slotIndex, out int page, out int offset, out int length, out uint version);
                 Specification.Assert(read, "TryBeginRead must succeed.");
@@ -4221,7 +4234,7 @@ namespace Liminal.Net.Tests.Coyote
         }
 
         [Test]
-        public static async Task Coyote_SyncVar_ClientVersionCollision_ReconcilesToAuthoritativeServer()
+        public static async Task Coyote_SyncVar_ClientVersionCollision_AuthorityKeepsPendingWrite()
         {
             var config = new LiminalNetworkConfig
             {
@@ -4300,9 +4313,10 @@ namespace Liminal.Net.Tests.Coyote
             await taskReconcile;
 
             Specification.Assert(taskException == null, $"Unexpected exception: {taskException}");
+            //Server versions client writes itself and applies our in flight write after its own so we keep the newer local value
             Specification.Assert(clientVar.Version == 6, $"Client version should remain 6, was {clientVar.Version}");
-            Specification.Assert(clientVar.Value == "ServerValue",
-                $"Client desynchronized! Retained rejected local value '{clientVar.Value}', expected server value 'ServerValue'.");
+            Specification.Assert(clientVar.Value == "ClientValue",
+                $"A colliding server update replaced the client's pending write: client has '{clientVar.Value}'.");
 
             clientManager.Shutdown();
         }

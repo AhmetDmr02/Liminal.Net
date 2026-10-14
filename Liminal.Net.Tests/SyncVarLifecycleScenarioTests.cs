@@ -262,36 +262,31 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void ScenarioB_PathB_Lazy_NewManager_ServerPushBuffersIntoUnboundCache_DrainsOnValueAccess()
+        public void ScenarioB_PathB_NewManager_AdoptsPreExistingSyncVar_ReceivesServerPushWithoutTouch()
         {
-            string token = $"scenB_lazy_{Guid.NewGuid():N}";
+            string token = $"scenB_adopt_{Guid.NewGuid():N}";
             var preExistingMana = new SyncVar<int>(token, 10);
+            int seen = 0;
+            preExistingMana.OnValueChanged += (_, next) => Volatile.Write(ref seen, next);
 
+            //Client manager is created first so it adopts the syncvar instead of the in process server
             int sPort = Interlocked.Increment(ref _portCounter);
+            var client = CreateManager(sPort);
             var server = CreateManager(sPort);
             Assert.That(server.StartServer("127.0.0.1", sPort), Is.True);
 
-            // Server owns mana and writes 500
             var serverMana = new SyncVar<int>(token, 10, server.SyncVarManager);
             serverMana.Value = 500;
 
-            // Client manager created fresh
-            var client = CreateManager(sPort);
             bool connected = false;
             client.Events.OnLocalClientConnected += _ => connected = true;
             client.StartClient("127.0.0.1", sPort);
             Assert.That(SpinWait.SpinUntil(() => connected, 3000), Is.True);
 
-            // Wait for push to buffer into UnboundCache without reading preExistingMana.Value yet
-            Assert.That(SpinWait.SpinUntil(() => client.SyncVarManager.UnboundCacheCount > 0, 3000), Is.True,
-                "Server update was not buffered into client UnboundCache.");
-
-            // Touch .Value to drain cache
-            int drainedValue = preExistingMana.Value;
-
-            Assert.That(drainedValue, Is.EqualTo(500), "Pre-existing SyncVar did not drain buffered server value on .Value access.");
-            Assert.That(client.SyncVarManager.UnboundCacheCount, Is.EqualTo(0), "UnboundCache was not cleared after drain.");
-            Assert.That(preExistingMana.LocalSlot, Is.EqualTo(0));
+            Assert.That(SpinWait.SpinUntil(() => Volatile.Read(ref seen) == 500, 3000), Is.True,
+                "The adopted pre-existing SyncVar did not receive the server value without being touched.");
+            Assert.That(client.SyncVarManager.UnboundCacheCount, Is.EqualTo(0), "The value went to the unbound cache instead of the SyncVar.");
+            Assert.That(preExistingMana.Value, Is.EqualTo(500));
         }
 
         [Test]

@@ -66,9 +66,23 @@ namespace Liminal.Net.SyncVar
         bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0);
         bool ApplyCachedBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force);
         bool TryPublishSlot(ushort slot);
+        void DetachFromSlab();
+        bool JoinedByAdoption { get; }
+        bool ExcludedFromAdoption { get; set; }
+        void Adopt(SyncVarManager manager);
+        ClientWriteResult ApplyClientWrite(ReadOnlySequence<byte> incomingBytes, ushort senderId, MessagePackSerializerOptions options);
+        void RefreshClientAuthority();
         void FirePendingEvents();
         void InternalTeardown();
         void ResetSession();
+    }
+
+    public enum ClientWriteResult
+    {
+        Applied,
+        Unchanged,
+        Unauthorized,
+        Rejected
     }
 
     public class SyncVar<T> : ISyncVarInternal
@@ -84,6 +98,8 @@ namespace Liminal.Net.SyncVar
 
         private volatile ushort _localSlot = ushort.MaxValue;
         private int _fallbackDirty = 0;
+        private volatile bool _joinedByAdoption;
+        private volatile bool _excludedFromAdoption;
 
         private const int NoPendingVisibility = 0;
         private const int PendingHidden = 1;
@@ -188,13 +204,29 @@ namespace Liminal.Net.SyncVar
             }
             Utf8TokenRegistry.RegisterToken(token, _tokenBytes);
 
-            _manager = manager ?? SyncVarManager.GetManagerForRegistration();
+            _manager = manager;
 
             _permissions = new SyncVarPermissions(_manager, token, visibility);
             _valueCell = new SyncVarValueCell<T>(initialValue);
             _wireBuffer = new SyncVarWireBuffer(_manager?.Slab);
 
-            _manager?.RegisterSyncVar(this);
+            //Add to directory before joining so a manager created at the same time either sees us or we see it
+            SyncVarDirectory.Add(this);
+
+            var target = manager ?? SyncVarManager.GetManagerForRegistration();
+            if (target != null)
+            {
+                bool joined;
+                lock (_registrationLock)
+                {
+                    joined = TryJoinLocked(target, JoinReason.Construction);
+                }
+                FirePendingEvents();
+                if (joined)
+                {
+                    RefreshClientAuthority();
+                }
+            }
         }
 
         public void SetLocallyVisible(bool isVisible)
@@ -284,6 +316,13 @@ namespace Liminal.Net.SyncVar
             MessagePackSerializer.Serialize(writer, _valueCell.Value, options);
         }
 
+        private enum JoinReason
+        {
+            Construction,
+            Use,
+            Adoption
+        }
+
         private void EnsureRegistered(SyncVarManager activeMgr = null)
         {
             if (IsDisposed) return;
@@ -303,22 +342,112 @@ namespace Liminal.Net.SyncVar
 
             if (_manager != mgr || _localSlot == ushort.MaxValue)
             {
+                bool joined;
                 lock (_registrationLock)
                 {
-                    if (IsDisposed) return;
-                    if (_manager != mgr || _localSlot == ushort.MaxValue)
-                    {
-                        if (mgr.TryGetSyncVar(Token, out var existing) && !ReferenceEquals(existing, this))
-                        {
-                            return;
-                        }
-                        _manager = mgr;
-                        _permissions.UpdateManager(mgr);
-                        _wireBuffer.UpdateSlab(mgr.Slab);
-                        mgr.RegisterSyncVar(this);
-                    }
+                    joined = TryJoinLocked(mgr, JoinReason.Use);
+                }
+                if (joined)
+                {
+                    FirePendingEvents();
+                    RefreshClientAuthority();
                 }
             }
+        }
+
+        bool ISyncVarInternal.JoinedByAdoption => _joinedByAdoption;
+
+        //Only written under owning manager's _unboundLock
+        bool ISyncVarInternal.ExcludedFromAdoption
+        {
+            get => _excludedFromAdoption;
+            set => _excludedFromAdoption = value;
+        }
+
+        void ISyncVarInternal.Adopt(SyncVarManager manager)
+        {
+            if (manager == null) return;
+            bool joined;
+            lock (_registrationLock)
+            {
+                joined = TryJoinLocked(manager, JoinReason.Adoption);
+            }
+            if (joined)
+            {
+                FirePendingEvents();
+                RefreshClientAuthority();
+            }
+        }
+
+        //Server side, unregistered means authorized clients lose authority, registered again means they get value version and authority back
+        //under _permissionBroadcastLock so it cant get reordered with grants and revokes
+        void ISyncVarInternal.RefreshClientAuthority() => RefreshClientAuthority();
+
+        private void RefreshClientAuthority()
+        {
+            lock (_permissionBroadcastLock)
+            {
+                var mgr = _manager;
+                if (mgr == null) return;
+
+                var authorities = _permissions.Authorities;
+                if (authorities.Length == 0) return;
+
+                if (!IsDisposed && _localSlot != ushort.MaxValue)
+                {
+                    for (int i = 0; i < authorities.Length; i++)
+                    {
+                        if (IsVisibleTo(authorities[i]))
+                        {
+                            mgr.SendSyncVarToClient(this, authorities[i]);
+                        }
+                    }
+                }
+                else
+                {
+                    mgr.BroadcastAuthChange(Token, Array.Empty<ushort>());
+                }
+            }
+        }
+
+        //Only place a syncvar moves between managers, never takes it from a live manager
+        //torn down owner releases it first so its slab can be reused safely
+        private bool TryJoinLocked(SyncVarManager mgr, JoinReason reason)
+        {
+            if (IsDisposed || mgr.IsTornDown) return false;
+
+            var current = _manager;
+            bool sameManager = ReferenceEquals(current, mgr);
+            if (sameManager)
+            {
+                if (_localSlot != ushort.MaxValue) return false;
+            }
+            else if (current != null && !current.IsTornDown)
+            {
+                return false;
+            }
+
+            if (!sameManager)
+            {
+                current?.ReleaseSyncVar(this);
+                _manager = mgr;
+                _permissions.UpdateManager(mgr);
+                _wireBuffer.UpdateSlab(mgr.Slab);
+            }
+
+            if (reason == JoinReason.Construction)
+            {
+                _joinedByAdoption = false;
+            }
+            else if (reason == JoinReason.Adoption && !sameManager)
+            {
+                _joinedByAdoption = true;
+            }
+
+            return mgr.RegisterSyncVarDeferred(this,
+                warnOnConflict: reason == JoinReason.Construction,
+                replaceAdopted: reason == JoinReason.Construction,
+                forAdoption: reason == JoinReason.Adoption);
         }
 
         private void WriteFromOwningThread(T newValue, bool force = false)
@@ -353,19 +482,24 @@ namespace Liminal.Net.SyncVar
                 return;
             }
 
-            EnsureRegistered(activeMgr);
-
             T oldValueWithNetwork = default;
             bool fireChangedWithNetwork = false;
-            bool unauthorized;
+            bool unauthorized = false;
+            bool committed = false;
 
-            lock (_writeLock)
+            //Unregister and session resets detach the slab under _writeLock, a write landing after that registers again and retries once
+            //if that fails too the value stays local
+            for (int attempt = 0; attempt < 2 && !committed; attempt++)
             {
-                if (IsDisposed) return;
+                EnsureRegistered(activeMgr);
 
-                unauthorized = !HasAuthority;
-                if (!unauthorized)
+                lock (_writeLock)
                 {
+                    if (IsDisposed) return;
+
+                    unauthorized = !HasAuthority;
+                    if (unauthorized) break;
+
                     if (!_valueCell.TryPrepareUpdate(newValue, force, out uint nextVersion))
                     {
                         return;
@@ -375,16 +509,23 @@ namespace Liminal.Net.SyncVar
                     _threadLocalWriter.Clear();
                     MessagePackSerializer.Serialize(_threadLocalWriter, newValue, activeMgr.SerializerOptions);
 
-                    if (!_wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, nextVersion, force))
+                    var result = _wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, nextVersion, force);
+                    if (result == WireWriteResult.Stale || result == WireWriteResult.Disposed)
                     {
                         return;
                     }
 
-                    _valueCell.CommitUpdate(newValue, nextVersion, deferEvent: false, out oldValueWithNetwork, out fireChangedWithNetwork);
-
-                    if (TryMarkDirty())
+                    if (result == WireWriteResult.NoSlab && attempt == 0)
                     {
-                        activeMgr.EnqueueDirty(this);
+                        continue;
+                    }
+
+                    _valueCell.CommitUpdate(newValue, nextVersion, deferEvent: false, out oldValueWithNetwork, out fireChangedWithNetwork);
+                    committed = true;
+
+                    if (result == WireWriteResult.Written)
+                    {
+                        TryMarkDirty();
                     }
                 }
             }
@@ -424,6 +565,16 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        //Slab can get reset and reused before we register again so dont keep old slab coords, value stays in the value cell
+        void ISyncVarInternal.DetachFromSlab()
+        {
+            lock (_writeLock)
+            {
+                _localSlot = ushort.MaxValue;
+                _wireBuffer.UpdateSlab(null);
+            }
+        }
+
         bool ISyncVarInternal.ApplyCachedBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force)
         {
             if (IsDisposed) return false;
@@ -454,25 +605,20 @@ namespace Liminal.Net.SyncVar
                     return false;
                 }
 
+                //Server echoes our own writes back with its own versions, anything not newer than local is that echo
+                //or a server write our in flight writes will overwrite anyway so keep local
+                uint localVersion = _valueCell.Version;
+                if (!force && senderId == 0 && localVersion != 0 && newVersion <= localVersion && _permissions.HasAuthority)
+                {
+                    return false;
+                }
+
                 if (!_valueCell.TryApplyRemote(deserialized, newVersion, force, deferEvent, out oldValue, out fireEvent))
                 {
                     return false;
                 }
 
-                if (incomingBytes.IsSingleSegment)
-                {
-                    _wireBuffer.WriteBytes(incomingBytes.FirstSpan, newVersion, force);
-                }
-                else
-                {
-                    _threadLocalWriter ??= new ArrayBufferWriter<byte>(256);
-                    _threadLocalWriter.Clear();
-                    foreach (var mem in incomingBytes)
-                    {
-                        _threadLocalWriter.Write(mem.Span);
-                    }
-                    _wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, newVersion, force);
-                }
+                WriteWire(incomingBytes, newVersion, force);
 
                 if (force || (netManager != null && netManager.Role == NetworkRole.Client))
                 {
@@ -486,6 +632,55 @@ namespace Liminal.Net.SyncVar
             }
 
             return true;
+        }
+
+        private WireWriteResult WriteWire(ReadOnlySequence<byte> bytes, uint version, bool force)
+        {
+            if (bytes.IsSingleSegment)
+            {
+                return _wireBuffer.WriteBytes(bytes.FirstSpan, version, force);
+            }
+
+            _threadLocalWriter ??= new ArrayBufferWriter<byte>(256);
+            _threadLocalWriter.Clear();
+            foreach (var mem in bytes)
+            {
+                _threadLocalWriter.Write(mem.Span);
+            }
+            return _wireBuffer.WriteBytes(_threadLocalWriter.WrittenSpan, version, force);
+        }
+
+        //Server picks the version, a client chosen one could jump to uint.MaxValue and make every later write stale
+        ClientWriteResult ISyncVarInternal.ApplyClientWrite(ReadOnlySequence<byte> incomingBytes, ushort senderId, MessagePackSerializerOptions options)
+        {
+            if (IsDisposed) return ClientWriteResult.Rejected;
+
+            T value = MessagePackSerializer.Deserialize<T>(incomingBytes, options);
+            T oldValue;
+            bool fireEvent;
+
+            lock (_writeLock)
+            {
+                if (IsDisposed) return ClientWriteResult.Rejected;
+                if (!_permissions.IsAuthorized(senderId)) return ClientWriteResult.Unauthorized;
+
+                if (!_valueCell.TryPrepareUpdate(value, force: false, out uint nextVersion))
+                {
+                    return ClientWriteResult.Unchanged;
+                }
+
+                var result = WriteWire(incomingBytes, nextVersion, force: false);
+                if (result == WireWriteResult.Disposed) return ClientWriteResult.Rejected;
+
+                _valueCell.CommitUpdate(value, nextVersion, deferEvent: false, out oldValue, out fireEvent);
+                TryMarkDirty();
+            }
+
+            if (fireEvent)
+            {
+                OnValueChanged?.Invoke(oldValue, value);
+            }
+            return ClientWriteResult.Applied;
         }
 
         public bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version)
@@ -566,20 +761,24 @@ namespace Liminal.Net.SyncVar
                 }
 
                 newAuths = _permissions.Authorities;
-                BroadcastAuthIfServer(newAuths);
 
                 var mgr = _manager;
-                if (Visibility == SyncVarVisibility.OwnerOnly && mgr != null)
+                if (mgr != null)
                 {
                     for (int i = 0; i < newAuths.Length; i++)
                     {
                         ushort id = newAuths[i];
-                        if (IsVisibleTo(id))
+                        if (Array.IndexOf(previousAuthorities, id) < 0 && IsVisibleTo(id))
                         {
                             mgr.SendSyncVarToClient(this, id);
                         }
                     }
+                }
 
+                BroadcastAuthIfServer(newAuths);
+
+                if (Visibility == SyncVarVisibility.OwnerOnly && mgr != null)
+                {
                     for (int i = 0; i < previousAuthorities.Length; i++)
                     {
                         ushort id = previousAuthorities[i];
@@ -615,12 +814,11 @@ namespace Liminal.Net.SyncVar
 
                 if (next != null)
                 {
+                    if (IsVisibleTo(clientId))
+                    {
+                        _manager?.SendSyncVarToClient(this, clientId);
+                    }
                     BroadcastAuthIfServer(next);
-                }
-
-                if (Visibility == SyncVarVisibility.OwnerOnly && IsVisibleTo(clientId))
-                {
-                    _manager?.SendSyncVarToClient(this, clientId);
                 }
             }
 
@@ -962,6 +1160,14 @@ namespace Liminal.Net.SyncVar
             }
 
             previousManager?.UnregisterClaimedSyncVar(this, claimedSlot);
+
+            if (previousManager != null && _permissions.Authorities.Length > 0)
+            {
+                lock (_permissionBroadcastLock)
+                {
+                    previousManager.BroadcastAuthChange(Token, Array.Empty<ushort>());
+                }
+            }
 
             if (visibilityChanged)
             {

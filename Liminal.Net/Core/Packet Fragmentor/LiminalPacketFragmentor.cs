@@ -6,8 +6,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
 
 namespace Liminal.Net.Core
 {
@@ -15,12 +13,14 @@ namespace Liminal.Net.Core
     {
         public const int FragmentHeaderSize = 6; // ReliableSeq(2) + FragmentIndex(2) + TotalFragments(2)
 
+        //Normal sender finishes one fragmented batch before starting the next one, more than this is abuse
+        internal const int MaxPendingAssembliesPerPeer = 8;
+
         private readonly ILiminalTransport _transport;
         private readonly LiminalNetworkConfig _config;
         private readonly int _mtu;
         private readonly int _transportHeaderSize;
         private readonly ArrayPool<byte> _assemblyPool;
-        private readonly ArrayPool<byte> _fragmentPool;
         private readonly int _maxAssemblySize;
         private readonly long _assemblyTimeoutTicks;
 
@@ -28,8 +28,15 @@ namespace Liminal.Net.Core
         private int _disposed = 0;
         public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
-        private readonly ConcurrentDictionary<ushort, PeerChannelState> _peerChannels = new();
+        private readonly ConcurrentDictionary<ushort, PeerAssemblyState> _peers = new();
         private readonly ConcurrentDictionary<ushort, ushort> _outboundSequences = new();
+        private static readonly Func<ushort, PeerAssemblyState> PeerFactory = id => new PeerAssemblyState(id);
+
+        private int _peersWithPendingAssemblies;
+        private int _outstandingAssemblyBuffers;
+
+        internal int OutstandingAssemblyBuffers => Volatile.Read(ref _outstandingAssemblyBuffers);
+        internal int PeersWithPendingAssemblies => Volatile.Read(ref _peersWithPendingAssemblies);
 
         public int MTU => _mtu;
 
@@ -57,12 +64,11 @@ namespace Liminal.Net.Core
 
             _assemblyPool = ArrayPool<byte>.Create(maxRecovery, _config.MaxConnectionCount * 2);
 
-            int recoverySize = _config.Hiccup.Enabled ? config.Hiccup.MaxRecoveryScale : 1;
-            _fragmentPool = ArrayPool<byte>.Create(mtu, ((int)((_config.MaxPacketSizePerBatch * recoverySize) / mtu) + 1));
-
+            _transport.OnClientConnected += HandleClientCleanup;
+            _transport.OnLocalClientConnected += HandleLocalClientConnectionChanged;
             _transport.OnClientDisconnected += HandleClientCleanup;
             _transport.OnClientKicked += HandleClientCleanup;
-            _transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
+            _transport.OnLocalClientDisconnected += HandleLocalClientConnectionChanged;
             _transport.OnMessageReceivedFragmented += IngestFragment;
         }
 
@@ -137,8 +143,10 @@ namespace Liminal.Net.Core
 
         #endregion
 
-        #region Inbound / Producer-Consumer Assembly Path
+        #region Inbound / Assembly Path
 
+        //Reassembly and delivery run on the peer's receive thread, this keeps fragmented and normal reliable batches in wire order
+        //dont move delivery to another thread
         public void IngestFragment(ReadOnlySpan<byte> fragmentSpan, ushort senderId)
         {
             if (Volatile.Read(ref _disposed) != 0) return;
@@ -149,252 +157,95 @@ namespace Liminal.Net.Core
                 return;
             }
 
-            if (!_peerChannels.TryGetValue(senderId, out var peerState))
+            if (!_transport.IsClientConnected(senderId)) return;
+
+            var peer = _peers.GetOrAdd(senderId, PeerFactory);
+            long now = Stopwatch.GetTimestamp();
+            PendingAssembly completed = null;
+            string severReason;
+
+            lock (peer.Lock)
             {
-                if (!_transport.IsClientConnected(senderId) || Volatile.Read(ref _disposed) != 0) return;
+                if (peer.IsTerminated || Volatile.Read(ref _disposed) != 0) return;
 
-                lock (_peerChannels)
+                severReason = FindStaleAssemblyLocked(peer, now) ?? AddFragmentLocked(peer, fragmentSpan, now, out completed);
+                if (severReason != null)
                 {
-                    if (Volatile.Read(ref _disposed) != 0) return;
-
-                    if (!_peerChannels.TryGetValue(senderId, out peerState))
-                    {
-                        if (!_transport.IsClientConnected(senderId)) return;
-
-                        peerState = CreatePeerChannel(senderId);
-                        _peerChannels[senderId] = peerState;
-                    }
+                    TerminatePeerLocked(peer);
                 }
             }
 
-            if (Volatile.Read(ref peerState.IsTerminated) != 0)
+            if (severReason != null)
             {
+                SeverTerminatedPeer(peer, severReason);
                 return;
             }
 
-            byte[] rentedFragmentBuffer = _fragmentPool.Rent(fragmentSpan.Length);
-            fragmentSpan.CopyTo(rentedFragmentBuffer);
-
-            var inboundItem = new InboundFragment(rentedFragmentBuffer, fragmentSpan.Length);
-
-            if (!peerState.Channel.Writer.TryWrite(inboundItem))
-            {
-                _fragmentPool.Return(rentedFragmentBuffer);
-
-                if (Volatile.Read(ref peerState.IsTerminated) == 0 && Volatile.Read(ref _disposed) == 0)
-                {
-                    TriggerSever(senderId, "Inbound fragment queue overrun. Backpressure failure.");
-                }
-            }
-        }
-
-        private PeerChannelState CreatePeerChannel(ushort clientId)
-        {
-            var options = new BoundedChannelOptions(_config.MaxPacketCount * 4)
-            {
-                SingleWriter = false,
-                SingleReader = true,
-                FullMode = BoundedChannelFullMode.Wait
-            };
-
-            var channel = Channel.CreateBounded<InboundFragment>(options);
-            var state = new PeerChannelState(clientId, channel);
-
-            state.WorkerTask = Task.Run(() => ProcessPeerFragmentsAsync(state));
-            return state;
-        }
-
-        private async Task ProcessPeerFragmentsAsync(PeerChannelState state)
-        {
-            var reader = state.Channel.Reader;
-            var assemblies = new Dictionary<ushort, PendingAssembly>();
-            var token = state.LifetimeCts.Token;
-
-            int effectiveMaxFragmentPayload = _mtu - _transportHeaderSize - FragmentHeaderSize;
+            if (completed == null) return;
 
             try
             {
-                while (!token.IsCancellationRequested)
-                {
-                    CancellationTokenSource? timeoutCts = null;
-                    CancellationToken readToken = token;
-
-                    if (assemblies.Count > 0)
-                    {
-                        long now = Stopwatch.GetTimestamp();
-                        long oldestActivity = long.MaxValue;
-
-                        foreach (var pending in assemblies.Values)
-                        {
-                            if (pending.LastActivityTicks < oldestActivity)
-                            {
-                                oldestActivity = pending.LastActivityTicks;
-                            }
-                        }
-
-                        long elapsedTicks = now - oldestActivity;
-                        long remainingTicks = _assemblyTimeoutTicks - elapsedTicks;
-
-                        if (remainingTicks <= 0)
-                        {
-                            PruneStaleAssemblies(state, assemblies);
-                            return;
-                        }
-
-                        int remainingMs = Math.Max(1, (int)(remainingTicks * 1000 / Stopwatch.Frequency));
-                        timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                        timeoutCts.CancelAfter(remainingMs);
-                        readToken = timeoutCts.Token;
-                    }
-
-                    bool hasItems;
-                    bool isTimeout = false;
-
-                    try
-                    {
-                        hasItems = await reader.WaitToReadAsync(readToken).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) when (timeoutCts?.IsCancellationRequested == true && !token.IsCancellationRequested)
-                    {
-                        hasItems = false;
-                        isTimeout = true;
-                    }
-                    finally
-                    {
-                        timeoutCts?.Dispose();
-                    }
-
-                    if (hasItems)
-                    {
-                        while (reader.TryRead(out InboundFragment item))
-                        {
-                            try
-                            {
-                                if (!ProcessFragmentSync(state, item, assemblies, effectiveMaxFragmentPayload))
-                                {
-                                    return;
-                                }
-                            }
-                            finally
-                            {
-                                _fragmentPool.Return(item.Buffer);
-                            }
-                        }
-                    }
-                    else if (!isTimeout)
-                    {
-                        return;
-                    }
-
-                    if (!PruneStaleAssemblies(state, assemblies))
-                    {
-                        return;
-                    }
-                }
+                OnMessageReassembled?.Invoke(completed.Buffer.AsSpan(0, completed.ReassembledLength), senderId);
             }
-            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                LiminalLogger.LogError($"[Fragmentor-Consumer] Worker failed for {state.ClientId}: {ex}");
-                TriggerSever(state.ClientId, "Assembly worker crash.");
+                LiminalLogger.LogError($"[Fragmentor] Reassembled message handler failed for {senderId}: {ex}");
+                TriggerSever(peer, "Reassembled message handler failure.");
             }
             finally
             {
-                foreach (var pending in assemblies.Values)
-                {
-                    if (pending.Buffer != null)
-                    {
-                        _assemblyPool.Return(pending.Buffer);
-                        pending.Buffer = null!;
-                    }
-                }
-                assemblies.Clear();
-
-                while (reader.TryRead(out InboundFragment leftover))
-                {
-                    _fragmentPool.Return(leftover.Buffer);
-                }
+                ReturnAssemblyBuffer(completed);
             }
         }
 
-        private bool ProcessFragmentSync(
-            PeerChannelState state,
-            InboundFragment item,
-            Dictionary<ushort, PendingAssembly> assemblies,
-            int effectiveMaxFragmentPayload)
+        //Returns sever reason or null, completed assembly gets detached first so a cleanup during delivery cant return its buffer
+        private string AddFragmentLocked(PeerAssemblyState peer, ReadOnlySpan<byte> fragmentSpan, long now, out PendingAssembly completed)
         {
-            Span<byte> fragmentSpan = item.Buffer.AsSpan(0, item.Length);
+            completed = null;
 
             ushort seq = BinaryPrimitives.ReadUInt16LittleEndian(fragmentSpan.Slice(0, 2));
             ushort fragmentIndex = BinaryPrimitives.ReadUInt16LittleEndian(fragmentSpan.Slice(2, 2));
             ushort totalFragments = BinaryPrimitives.ReadUInt16LittleEndian(fragmentSpan.Slice(4, 2));
-            Span<byte> payloadChunk = fragmentSpan.Slice(FragmentHeaderSize);
+            ReadOnlySpan<byte> payloadChunk = fragmentSpan.Slice(FragmentHeaderSize);
+
+            int effectiveMaxFragmentPayload = _mtu - _transportHeaderSize - FragmentHeaderSize;
 
             if (totalFragments == 0 || fragmentIndex >= totalFragments)
-            {
-                TriggerSever(state.ClientId, $"Corrupt indices ({fragmentIndex}/{totalFragments}) on seq {seq}.");
-                return false;
-            }
+                return $"Corrupt indices ({fragmentIndex}/{totalFragments}) on seq {seq}.";
 
             bool isLastFragment = fragmentIndex == totalFragments - 1;
 
             if (!isLastFragment && payloadChunk.Length != effectiveMaxFragmentPayload)
-            {
-                TriggerSever(state.ClientId, $"Intermediate fragment {fragmentIndex} invalid payload length ({payloadChunk.Length}b != {effectiveMaxFragmentPayload}b).");
-                return false;
-            }
+                return $"Intermediate fragment {fragmentIndex} invalid payload length ({payloadChunk.Length}b != {effectiveMaxFragmentPayload}b).";
 
             if (isLastFragment && payloadChunk.Length > effectiveMaxFragmentPayload)
-            {
-                TriggerSever(state.ClientId, $"Terminal fragment {fragmentIndex} payload length ({payloadChunk.Length}b) exceeds max ({effectiveMaxFragmentPayload}b).");
-                return false;
-            }
+                return $"Terminal fragment {fragmentIndex} payload length ({payloadChunk.Length}b) exceeds max ({effectiveMaxFragmentPayload}b).";
 
-            long now = Stopwatch.GetTimestamp();
-
-            if (assemblies.TryGetValue(seq, out var assembly))
+            if (peer.Assemblies.TryGetValue(seq, out var assembly))
             {
                 if (assembly.TotalFragments != totalFragments)
-                {
-                    TriggerSever(state.ClientId, $"Sequence collision or total fragment mismatch on seq {seq} ({totalFragments} != {assembly.TotalFragments}).");
-                    return false;
-                }
-
-                if (now - assembly.LastActivityTicks > _assemblyTimeoutTicks)
-                {
-                    TriggerSever(state.ClientId, $"Fragment reassembly timed out on seq {seq}.");
-                    return false;
-                }
+                    return $"Sequence collision or total fragment mismatch on seq {seq} ({totalFragments} != {assembly.TotalFragments}).";
             }
-
-            if (assembly == null)
+            else
             {
+                if (peer.Assemblies.Count >= MaxPendingAssembliesPerPeer)
+                    return $"Too many concurrent fragment assemblies ({peer.Assemblies.Count}).";
+
                 long calculatedMaxExpected = (long)totalFragments * effectiveMaxFragmentPayload;
-
                 if (calculatedMaxExpected > _maxAssemblySize)
-                {
-                    TriggerSever(state.ClientId, $"Expected assembly size ({calculatedMaxExpected}b) exceeds max allowed packet size ({_maxAssemblySize}b).");
-                    return false;
-                }
+                    return $"Expected assembly size ({calculatedMaxExpected}b) exceeds max allowed packet size ({_maxAssemblySize}b).";
 
-                int maxExpected = (int)calculatedMaxExpected;
-                byte[] rentedAssemblyBuffer = _assemblyPool.Rent(maxExpected);
-                assembly = new PendingAssembly(rentedAssemblyBuffer, totalFragments);
-                assemblies[seq] = assembly;
+                assembly = new PendingAssembly(RentAssemblyBuffer((int)calculatedMaxExpected), totalFragments, now);
+                peer.Assemblies[seq] = assembly;
+                UpdatePendingCountLocked(peer);
             }
 
             if (assembly.Received[fragmentIndex])
-            {
-                TriggerSever(state.ClientId, $"Duplicate fragment {fragmentIndex} for seq {seq}. Wire sequence invalid.");
-                return false;
-            }
+                return $"Duplicate fragment {fragmentIndex} for seq {seq}. Wire sequence invalid.";
 
             int targetOffset = fragmentIndex * effectiveMaxFragmentPayload;
             if (targetOffset + payloadChunk.Length > assembly.Buffer.Length)
-            {
-                TriggerSever(state.ClientId, $"Buffer overrun on seq {seq}. Bounds calculation violation.");
-                return false;
-            }
+                return $"Buffer overrun on seq {seq}. Bounds calculation violation.";
 
             payloadChunk.CopyTo(assembly.Buffer.AsSpan(targetOffset));
             assembly.Received[fragmentIndex] = true;
@@ -408,43 +259,72 @@ namespace Liminal.Net.Core
 
             if (assembly.FragmentsReceivedCount == assembly.TotalFragments)
             {
-                assemblies.Remove(seq);
-
-                int totalReconstructedLength = ((assembly.TotalFragments - 1) * effectiveMaxFragmentPayload) + assembly.FinalFragmentLength;
-
-                try
-                {
-                    OnMessageReassembled?.Invoke(assembly.Buffer.AsSpan(0, totalReconstructedLength), state.ClientId);
-                }
-                finally
-                {
-                    if (assembly.Buffer != null)
-                    {
-                        _assemblyPool.Return(assembly.Buffer);
-                        assembly.Buffer = null!;
-                    }
-                }
+                peer.Assemblies.Remove(seq);
+                UpdatePendingCountLocked(peer);
+                assembly.ReassembledLength = ((assembly.TotalFragments - 1) * effectiveMaxFragmentPayload) + assembly.FinalFragmentLength;
+                completed = assembly;
             }
 
-            return true;
+            return null;
         }
 
-        private bool PruneStaleAssemblies(PeerChannelState state, Dictionary<ushort, PendingAssembly> assemblies)
+        private string FindStaleAssemblyLocked(PeerAssemblyState peer, long now)
         {
-            if (assemblies.Count == 0) return true;
-
-            long now = Stopwatch.GetTimestamp();
-
-            foreach (var (seq, pending) in assemblies)
+            foreach (var pair in peer.Assemblies)
             {
-                if (now - pending.LastActivityTicks >= _assemblyTimeoutTicks)
+                if (now - pair.Value.LastActivityTicks >= _assemblyTimeoutTicks)
                 {
-                    TriggerSever(state.ClientId, $"Fragment reassembly timed out on sequence {seq}.");
-                    return false;
+                    return $"Fragment reassembly timed out on sequence {pair.Key}.";
                 }
             }
+            return null;
+        }
 
-            return true;
+        private void UpdatePendingCountLocked(PeerAssemblyState peer)
+        {
+            int previous = peer.PendingCount;
+            int current = peer.Assemblies.Count;
+            if (previous == current) return;
+
+            Volatile.Write(ref peer.PendingCount, current);
+
+            if (previous == 0)
+                Interlocked.Increment(ref _peersWithPendingAssemblies);
+            else if (current == 0)
+                Interlocked.Decrement(ref _peersWithPendingAssemblies);
+        }
+
+        /// <summary>
+        /// Kicks peers whose half finished assemblies stopped getting fragments, session manager calls this every poll
+        /// </summary>
+        public void PruneStaleAssemblies() => PruneStaleAssemblies(Stopwatch.GetTimestamp());
+
+        internal void PruneStaleAssemblies(long now)
+        {
+            if (Volatile.Read(ref _disposed) != 0) return;
+            if (Volatile.Read(ref _peersWithPendingAssemblies) == 0) return;
+
+            foreach (var pair in _peers)
+            {
+                var peer = pair.Value;
+                if (Volatile.Read(ref peer.PendingCount) == 0) continue;
+
+                string severReason;
+                lock (peer.Lock)
+                {
+                    if (peer.IsTerminated) continue;
+                    severReason = FindStaleAssemblyLocked(peer, now);
+                    if (severReason != null)
+                    {
+                        TerminatePeerLocked(peer);
+                    }
+                }
+
+                if (severReason != null)
+                {
+                    SeverTerminatedPeer(peer, severReason);
+                }
+            }
         }
 
         #endregion
@@ -458,7 +338,31 @@ namespace Liminal.Net.Core
             LiminalLogger.LogError($"[Fragmentor-Fault] Severing client {clientId}. Reason: {reason}");
 
             HandleClientCleanup(clientId);
+            KickOrShutdown(clientId);
+        }
 
+        private void TriggerSever(PeerAssemblyState peer, string reason)
+        {
+            TerminatePeer(peer);
+            SeverTerminatedPeer(peer, reason);
+        }
+
+        //Decide and terminate under the same peer lock or a completing fragment could slip in and get delivered for a peer we are severing
+        private void SeverTerminatedPeer(PeerAssemblyState peer, string reason)
+        {
+            ((ICollection<KeyValuePair<ushort, PeerAssemblyState>>)_peers)
+                .Remove(new KeyValuePair<ushort, PeerAssemblyState>(peer.ClientId, peer));
+
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            LiminalLogger.LogError($"[Fragmentor-Fault] Severing client {peer.ClientId}. Reason: {reason}");
+
+            _outboundSequences.TryRemove(peer.ClientId, out _);
+            KickOrShutdown(peer.ClientId);
+        }
+
+        private void KickOrShutdown(ushort clientId)
+        {
             if (_transport.IsServer)
             {
                 _transport.Kick(clientId);
@@ -473,88 +377,92 @@ namespace Liminal.Net.Core
         {
             _outboundSequences.TryRemove(clientId, out _);
 
-            PeerChannelState? peerState;
-            lock (_peerChannels)
+            if (_peers.TryRemove(clientId, out var peer))
             {
-                _peerChannels.TryRemove(clientId, out peerState);
-            }
-
-            if (peerState != null && Interlocked.Exchange(ref peerState.IsTerminated, 1) == 0)
-            {
-                try { peerState.LifetimeCts.Cancel(); } catch (ObjectDisposedException) { }
-                peerState.Channel.Writer.TryComplete();
-
-                var worker = peerState.WorkerTask;
-                if (worker != null)
-                {
-                    _ = worker.ContinueWith(_ => peerState.Dispose(), TaskContinuationOptions.ExecuteSynchronously);
-                }
-                else
-                {
-                    peerState.Dispose();
-                }
+                TerminatePeer(peer);
             }
         }
 
-        private void HandleLocalClientDisconnected(ushort localId)
+        private void TerminatePeer(PeerAssemblyState peer)
+        {
+            lock (peer.Lock)
+            {
+                TerminatePeerLocked(peer);
+            }
+        }
+
+        private void TerminatePeerLocked(PeerAssemblyState peer)
+        {
+            if (peer.IsTerminated) return;
+            peer.IsTerminated = true;
+
+            foreach (var pair in peer.Assemblies)
+            {
+                ReturnAssemblyBuffer(pair.Value);
+            }
+
+            peer.Assemblies.Clear();
+            UpdatePendingCountLocked(peer);
+        }
+
+        private void HandleLocalClientConnectionChanged(ushort localId)
         {
             HandleClientCleanup(ILiminalTransport.SERVER_ID);
         }
 
+        private byte[] RentAssemblyBuffer(int size)
+        {
+            var buffer = _assemblyPool.Rent(size);
+            Interlocked.Increment(ref _outstandingAssemblyBuffers);
+            return buffer;
+        }
+
+        //Only the thread owning the assembly calls this, under peer lock while its in the dictionary or the delivering thread after detach
+        private void ReturnAssemblyBuffer(PendingAssembly assembly)
+        {
+            var buffer = assembly.Buffer;
+            if (buffer == null) return;
+
+            assembly.Buffer = null;
+            _assemblyPool.Return(buffer);
+            Interlocked.Decrement(ref _outstandingAssemblyBuffers);
+        }
+
         public void Dispose()
         {
-            // Atomically transition from 0 to 1; if already 1, exit immediately.
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
             {
                 return;
             }
 
+            _transport.OnClientConnected -= HandleClientCleanup;
+            _transport.OnLocalClientConnected -= HandleLocalClientConnectionChanged;
             _transport.OnClientDisconnected -= HandleClientCleanup;
             _transport.OnClientKicked -= HandleClientCleanup;
-            _transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
+            _transport.OnLocalClientDisconnected -= HandleLocalClientConnectionChanged;
             _transport.OnMessageReceivedFragmented -= IngestFragment;
 
-            foreach (var id in _peerChannels.Keys)
+            foreach (var id in _peers.Keys)
             {
                 HandleClientCleanup(id);
             }
 
-            _peerChannels.Clear();
             _outboundSequences.Clear();
         }
 
         #endregion
 
-        private readonly struct InboundFragment
-        {
-            public readonly byte[] Buffer;
-            public readonly int Length;
-
-            public InboundFragment(byte[] buffer, int length)
-            {
-                Buffer = buffer;
-                Length = length;
-            }
-        }
-
-        private sealed class PeerChannelState : IDisposable
+        private sealed class PeerAssemblyState
         {
             public readonly ushort ClientId;
-            public readonly Channel<InboundFragment> Channel;
-            public readonly CancellationTokenSource LifetimeCts;
-            public Task WorkerTask;
-            public int IsTerminated = 0;
+            public readonly object Lock = new();
+            public readonly Dictionary<ushort, PendingAssembly> Assemblies = new();
+            public bool IsTerminated;
+            public int PendingCount;
 
-            public PeerChannelState(ushort clientId, Channel<InboundFragment> channel)
+            public PeerAssemblyState(ushort clientId)
             {
                 ClientId = clientId;
-                Channel = channel;
-                LifetimeCts = new CancellationTokenSource();
-            }
-
-            public void Dispose()
-            {
-                LifetimeCts.Dispose();
             }
         }
 
@@ -565,14 +473,15 @@ namespace Liminal.Net.Core
             public readonly ushort TotalFragments;
             public ushort FragmentsReceivedCount;
             public int FinalFragmentLength;
+            public int ReassembledLength;
             public long LastActivityTicks;
 
-            public PendingAssembly(byte[] buffer, ushort totalFragments)
+            public PendingAssembly(byte[] buffer, ushort totalFragments, long now)
             {
                 Buffer = buffer;
                 TotalFragments = totalFragments;
                 Received = new bool[totalFragments];
-                LastActivityTicks = Stopwatch.GetTimestamp();
+                LastActivityTicks = now;
             }
         }
     }

@@ -159,13 +159,13 @@ namespace Liminal.Net.SyncVar
             if (sequence.IsSingleSegment)
             {
                 var span = sequence.FirstSpan;
-                string token = Utf8TokenRegistry.GetOrAddCachedToken(span);
+                string token = Utf8TokenRegistry.GetCachedOrDecodeToken(span);
                 return new SyncVarEvictPacket(token, sequence.First);
             }
 
             Span<byte> stackBuffer = stackalloc byte[(int)Math.Min(sequence.Length, 256)];
             sequence.CopyTo(stackBuffer);
-            string multiToken = Utf8TokenRegistry.GetOrAddCachedToken(stackBuffer);
+            string multiToken = Utf8TokenRegistry.GetCachedOrDecodeToken(stackBuffer);
             return new SyncVarEvictPacket(multiToken, stackBuffer.ToArray());
         }
     }
@@ -216,13 +216,13 @@ namespace Liminal.Net.SyncVar
             if (sequence.IsSingleSegment)
             {
                 var span = sequence.FirstSpan;
-                string token = Utf8TokenRegistry.GetOrAddCachedToken(span);
+                string token = Utf8TokenRegistry.GetCachedOrDecodeToken(span);
                 return new SyncVarClearPacket(token, sequence.First);
             }
 
             Span<byte> stackBuffer = stackalloc byte[(int)Math.Min(sequence.Length, 256)];
             sequence.CopyTo(stackBuffer);
-            string multiToken = Utf8TokenRegistry.GetOrAddCachedToken(stackBuffer);
+            string multiToken = Utf8TokenRegistry.GetCachedOrDecodeToken(stackBuffer);
             return new SyncVarClearPacket(multiToken, stackBuffer.ToArray());
         }
     }
@@ -273,13 +273,13 @@ namespace Liminal.Net.SyncVar
             if (sequence.IsSingleSegment)
             {
                 var span = sequence.FirstSpan;
-                string token = Utf8TokenRegistry.GetOrAddCachedToken(span);
+                string token = Utf8TokenRegistry.GetCachedOrDecodeToken(span);
                 return new SyncVarClearAckPacket(token, sequence.First);
             }
 
             Span<byte> stackBuffer = stackalloc byte[(int)Math.Min(sequence.Length, 256)];
             sequence.CopyTo(stackBuffer);
-            string multiToken = Utf8TokenRegistry.GetOrAddCachedToken(stackBuffer);
+            string multiToken = Utf8TokenRegistry.GetCachedOrDecodeToken(stackBuffer);
             return new SyncVarClearAckPacket(multiToken, stackBuffer.ToArray());
         }
     }
