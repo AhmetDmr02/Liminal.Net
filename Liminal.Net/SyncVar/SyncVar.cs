@@ -31,6 +31,7 @@ namespace Liminal.Net.SyncVar
         bool HasAuthority { get; }
 
         void SetLocallyVisible(bool isVisible);
+        void SetLocallyVisibleDeferred(bool isVisible);
         void SetAuthIds(params ushort[] clientIds);
         void AddAuthority(ushort clientId);
         void RemoveAuthority(ushort clientId);
@@ -63,6 +64,8 @@ namespace Liminal.Net.SyncVar
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
         bool TryExtractSnapshotData(out byte[] data, out uint version);
         bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0);
+        bool ApplyCachedBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force);
+        bool TryPublishSlot(ushort slot);
         void FirePendingEvents();
         void InternalTeardown();
         void ResetSession();
@@ -81,6 +84,11 @@ namespace Liminal.Net.SyncVar
 
         private volatile ushort _localSlot = ushort.MaxValue;
         private int _fallbackDirty = 0;
+
+        private const int NoPendingVisibility = 0;
+        private const int PendingHidden = 1;
+        private const int PendingVisible = 2;
+        private int _pendingVisibility = NoPendingVisibility;
 
         [ThreadStatic]
         private static ArrayBufferWriter<byte> _threadLocalWriter;
@@ -138,7 +146,8 @@ namespace Liminal.Net.SyncVar
         {
             get
             {
-                if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+                var currentMgr = _manager;
+                if (_localSlot == ushort.MaxValue || currentMgr == null || currentMgr.IsTornDown)
                 {
                     EnsureRegistered();
                 }
@@ -147,7 +156,8 @@ namespace Liminal.Net.SyncVar
             set
             {
                 if (IsDisposed) return;
-                if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+                var currentMgr = _manager;
+                if (_localSlot == ushort.MaxValue || currentMgr == null || currentMgr.IsTornDown)
                 {
                     EnsureRegistered();
                 }
@@ -192,6 +202,17 @@ namespace Liminal.Net.SyncVar
             if (_permissions.SetLocallyVisible(isVisible))
             {
                 OnVisibilityScopeChanged?.Invoke(isVisible);
+            }
+        }
+
+        void ISyncVarInternal.SetLocallyVisibleDeferred(bool isVisible) => SetLocallyVisibleDeferred(isVisible);
+
+        // For callers holding a lock: the event is raised later by FirePendingEvents.
+        private void SetLocallyVisibleDeferred(bool isVisible)
+        {
+            if (_permissions.SetLocallyVisible(isVisible))
+            {
+                Volatile.Write(ref _pendingVisibility, isVisible ? PendingVisible : PendingHidden);
             }
         }
 
@@ -261,23 +282,6 @@ namespace Liminal.Net.SyncVar
         public void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options)
         {
             MessagePackSerializer.Serialize(writer, _valueCell.Value, options);
-        }
-
-        public void Reattach(SyncVarManager manager = null)
-        {
-            if (IsDisposed) return;
-            lock (_registrationLock)
-            {
-                if (IsDisposed) return;
-                var mgr = manager ?? SyncVarManager.GetManagerForRegistration();
-                if (mgr != null && !mgr.IsTornDown)
-                {
-                    _manager = mgr;
-                    _permissions.UpdateManager(mgr);
-                    _wireBuffer.UpdateSlab(mgr.Slab);
-                    mgr.RegisterSyncVar(this);
-                }
-            }
         }
 
         private void EnsureRegistered(SyncVarManager activeMgr = null)
@@ -402,10 +406,32 @@ namespace Liminal.Net.SyncVar
         public bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0)
         {
             if (IsDisposed) return false;
-            if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+            var currentMgr = _manager;
+            if (_localSlot == ushort.MaxValue || currentMgr == null || currentMgr.IsTornDown)
             {
                 EnsureRegistered();
             }
+            return ApplyRemoteBytesCore(incomingBytes, newVersion, options, force, deferEvent, senderId);
+        }
+
+        bool ISyncVarInternal.TryPublishSlot(ushort slot)
+        {
+            lock (_writeLock)
+            {
+                if (IsDisposed) return false;
+                _localSlot = slot;
+                return true;
+            }
+        }
+
+        bool ISyncVarInternal.ApplyCachedBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force)
+        {
+            if (IsDisposed) return false;
+            return ApplyRemoteBytesCore(incomingBytes, newVersion, options, force, deferEvent: true, senderId: 0);
+        }
+
+        private bool ApplyRemoteBytesCore(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force, bool deferEvent, ushort senderId)
+        {
             uint currentVer = _valueCell.Version;
             if (!force && newVersion < currentVer && currentVer != 0) return false;
 
@@ -464,7 +490,8 @@ namespace Liminal.Net.SyncVar
 
         public bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version)
         {
-            if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+            var currentMgr = _manager;
+            if (_localSlot == ushort.MaxValue || currentMgr == null || currentMgr.IsTornDown)
             {
                 EnsureRegistered();
             }
@@ -492,7 +519,8 @@ namespace Liminal.Net.SyncVar
 
         public bool TryExtractSnapshotData(out byte[] data, out uint version)
         {
-            if (_localSlot == ushort.MaxValue || _manager == null || _manager.IsTornDown)
+            var currentMgr = _manager;
+            if (_localSlot == ushort.MaxValue || currentMgr == null || currentMgr.IsTornDown)
             {
                 EnsureRegistered();
             }
@@ -843,21 +871,32 @@ namespace Liminal.Net.SyncVar
 
         public void FirePendingEvents()
         {
+            int visibility = Interlocked.Exchange(ref _pendingVisibility, NoPendingVisibility);
             bool fireAuth = _permissions.TryFirePendingAuth(out bool authVal);
             bool fireVal = _valueCell.TryFirePendingValue(out T oldVal, out T newVal);
 
             try
             {
-                if (fireAuth)
+                if (visibility != NoPendingVisibility)
                 {
-                    OnAuthorityChanged?.Invoke(authVal);
+                    OnVisibilityScopeChanged?.Invoke(visibility == PendingVisible);
                 }
             }
             finally
             {
-                if (fireVal)
+                try
                 {
-                    OnValueChanged?.Invoke(oldVal, newVal);
+                    if (fireAuth)
+                    {
+                        OnAuthorityChanged?.Invoke(authVal);
+                    }
+                }
+                finally
+                {
+                    if (fireVal)
+                    {
+                        OnValueChanged?.Invoke(oldVal, newVal);
+                    }
                 }
             }
         }
@@ -904,13 +943,15 @@ namespace Liminal.Net.SyncVar
         {
             SyncVarManager previousManager;
             ushort claimedSlot;
+            bool visibilityChanged;
 
             lock (_writeLock)
             {
                 previousManager = _manager;
                 claimedSlot = _localSlot;
                 _localSlot = ushort.MaxValue;
-                SetLocallyVisible(false);
+                visibilityChanged = _permissions.SetLocallyVisible(false);
+                Volatile.Write(ref _pendingVisibility, NoPendingVisibility);
                 _permissions.ClearPendingAuth();
                 _permissions.UpdateManager(null);
                 _valueCell.ClearPendingValue();
@@ -921,6 +962,11 @@ namespace Liminal.Net.SyncVar
             }
 
             previousManager?.UnregisterClaimedSyncVar(this, claimedSlot);
+
+            if (visibilityChanged)
+            {
+                OnVisibilityScopeChanged?.Invoke(false);
+            }
         }
 
         void ISyncVarInternal.InternalTeardown() => InternalTeardown();
@@ -930,7 +976,7 @@ namespace Liminal.Net.SyncVar
             lock (_writeLock)
             {
                 _localSlot = ushort.MaxValue;
-                SetLocallyVisible(false);
+                SetLocallyVisibleDeferred(false);
                 _permissions.ClearPendingAuth();
                 _valueCell.ResetSessionState();
                 _wireBuffer.Clear();

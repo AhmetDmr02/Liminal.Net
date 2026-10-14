@@ -41,7 +41,7 @@ namespace Liminal.Net.Unity
             long nominal = NominalTickTicks;
             int ticksExecuted = 0;
 
-            while (currentTicks >= _nextTickTimestamp && ticksExecuted < MaxTicksPerFrame)
+            while (_isRunning && currentTicks >= _nextTickTimestamp && ticksExecuted < MaxTicksPerFrame)
             {
                 long currentSlew = Interlocked.Exchange(ref _slewAdjustmentTicks, 0);
                 _nextTickTimestamp += (nominal + currentSlew);

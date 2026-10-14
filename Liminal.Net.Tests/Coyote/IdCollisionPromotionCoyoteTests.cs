@@ -55,12 +55,6 @@ namespace Liminal.Net.Tests
                 return newHandle;
             }
 
-            public void TeardownSocket_Buggy(ushort id)
-            {
-                _activeSockets.TryRemove(id, out _);
-                _outboundQueues.TryRemove(id, out _);
-            }
-
             public void TeardownSocket_Fixed(ConnectionHandle handle)
             {
                 ((System.Collections.Generic.ICollection<System.Collections.Generic.KeyValuePair<ushort, ConnectionHandle>>)_activeSockets)
@@ -70,45 +64,6 @@ namespace Liminal.Net.Tests
 
             public int ActiveSocketCount => _activeSockets.Count;
             public bool HasOutboundQueue(ushort id) => _outboundQueues.ContainsKey(id);
-        }
-
-        [Microsoft.Coyote.SystematicTesting.Test]
-        public static async Task Coyote_Replicate_CollidingId_TeardownCannibalization()
-        {
-            var registry = new TransportSocketRegistry();
-            const ushort targetId = 42;
-
-            int generationCounter = 0;
-            var startGate = new TaskCompletionSource<bool>();
-
-            var client1Handle = registry.PromoteClient(targetId, Interlocked.Increment(ref generationCounter), out _);
-
-            var promoteClient2Task = Task.Run(async () =>
-            {
-                await Task.Yield();
-                registry.PromoteClient(targetId, Interlocked.Increment(ref generationCounter), out var evicted);
-
-                if (evicted.HasValue)
-                {
-                    startGate.TrySetResult(true);
-                }
-            });
-
-            var client1TeardownTask = Task.Run(async () =>
-            {
-                await startGate.Task;
-                await Task.Yield();
-
-                registry.TeardownSocket_Buggy(targetId);
-            });
-
-            await Task.WhenAll(promoteClient2Task, client1TeardownTask);
-
-            Specification.Assert(registry.ActiveSocketCount == 1,
-                $"RACE OCCURRED: Active socket count was {registry.ActiveSocketCount}, expected 1! Client 1's teardown deleted Client 2's socket.");
-
-            Specification.Assert(registry.HasOutboundQueue(targetId),
-                "RACE OCCURRED: Client 2 lost its outbound queue due to Client 1's concurrent eviction!");
         }
 
         [Microsoft.Coyote.SystematicTesting.Test]
@@ -183,43 +138,6 @@ namespace Liminal.Net.Tests
             public int TotalConnections = 0;
 
             public bool TryClaimDisconnect(ClientHandle handle) => FinalizedConnections.TryAdd(handle, 0);
-
-            public bool PromoteClient_Unsynchronized(ushort clientId, ClientHandle client, out ClientHandle evictedClient, out QueueHandle evictedQueue)
-            {
-                var sendState = new QueueHandle(client.Generation);
-                client.SendState = sendState;
-
-                QueueHandle oldQueue = null;
-                OutboundQueues.AddOrUpdate(clientId, sendState, (_, old) =>
-                {
-                    oldQueue = old;
-                    old.IsDisposed = true;
-                    return sendState;
-                });
-
-                ClientHandle oldClient = null;
-                ActiveSockets.AddOrUpdate(clientId, client, (_, old) =>
-                {
-                    oldClient = old;
-                    if (TryClaimDisconnect(old))
-                    {
-                        Interlocked.Decrement(ref TotalConnections);
-                    }
-                    old.IsClosed = true;
-                    return client;
-                });
-
-                evictedClient = oldClient;
-                evictedQueue = oldQueue;
-
-                if (!IsCurrentConnection(clientId, client, sendState))
-                {
-                    return false;
-                }
-
-                client.LoopsRunning = true;
-                return true;
-            }
 
             public bool PromoteClient(ushort clientId, ClientHandle client, out ClientHandle evictedClient, out QueueHandle evictedQueue)
             {
@@ -312,71 +230,6 @@ namespace Liminal.Net.Tests
 
                 FinalizedConnections.TryRemove(client, out _);
             }
-        }
-
-        [Microsoft.Coyote.SystematicTesting.Test]
-        public static async Task Coyote_Test21_SimultaneousFiveClientPromotion_DemonstrateUnsynchronizedBug()
-        {
-            var transport = new TcpTransportEngine();
-            const ushort targetId = 42;
-            const int clientCount = 5;
-
-            var clients = new TcpTransportEngine.ClientHandle[clientCount];
-            for (int i = 0; i < clientCount; i++)
-            {
-                clients[i] = new TcpTransportEngine.ClientHandle(i + 1);
-            }
-
-            var promotionTasks = new Task[clientCount];
-            var evictionTasks = new ConcurrentBag<Task>();
-
-            for (int i = 0; i < clientCount; i++)
-            {
-                int index = i;
-                promotionTasks[index] = Task.Run(async () =>
-                {
-                    Interlocked.Increment(ref transport.TotalConnections);
-                    await Task.Yield();
-
-                    var client = clients[index];
-                    bool promoted = transport.PromoteClient_Unsynchronized(targetId, client, out var evictedClient, out var evictedQueue);
-
-                    if (evictedClient != null)
-                    {
-                        var evTask = Task.Run(async () =>
-                        {
-                            await Task.Yield();
-                            transport.TeardownClient(targetId, evictedClient, evictedQueue);
-                        });
-                        evictionTasks.Add(evTask);
-                    }
-                });
-            }
-
-            await Task.WhenAll(promotionTasks);
-            await Task.WhenAll(evictionTasks);
-            await Task.Yield();
-
-            Specification.Assert(transport.ActiveSockets.Count == 1,
-                $"CRITICAL RACE: Active socket count was {transport.ActiveSockets.Count}, expected 1!");
-
-            Specification.Assert(transport.OutboundQueues.ContainsKey(targetId),
-                "CRITICAL RACE: Transport lost the outbound queue for ID 42 after concurrent promotion!");
-
-            transport.ActiveSockets.TryGetValue(targetId, out var retainedSocket);
-            transport.OutboundQueues.TryGetValue(targetId, out var retainedQueue);
-
-            Specification.Assert(retainedSocket != null && retainedQueue != null,
-                "CRITICAL RACE: Missing retained socket or queue!");
-
-            Specification.Assert(retainedSocket.Generation == retainedQueue.Generation,
-                $"CRITICAL RACE (SPLIT-BRAIN): Socket generation {retainedSocket.Generation} does not match send queue generation {retainedQueue.Generation}!");
-
-            Specification.Assert(retainedSocket.LoopsRunning,
-                $"CRITICAL RACE (ZOMBIE CONNECTION): Retained socket (gen {retainedSocket.Generation}) failed IsCurrentConnection and never started its processing loops!");
-
-            Specification.Assert(!retainedSocket.IsClosed,
-                $"CRITICAL RACE: Retained socket (gen {retainedSocket.Generation}) was marked closed by a racing eviction!");
         }
 
         [Microsoft.Coyote.SystematicTesting.Test]

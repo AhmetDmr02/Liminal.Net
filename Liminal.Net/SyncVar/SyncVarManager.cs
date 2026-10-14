@@ -183,42 +183,66 @@ namespace Liminal.Net.SyncVar
 
         public void ResetPendingState()
         {
-            Volatile.Write(ref _hasReceivedInitialSnapshot, 0);
-            DirtyBitset.Clear();
+            var allVars = new List<ISyncVarInternal>();
             lock (_unboundLock)
             {
-                _unboundCache.Clear();
-                _unboundOrder.Clear();
-                _unboundAuth.Clear();
+                ResetPendingStateLocked(allVars);
             }
+            FirePendingEvents(allVars);
+        }
+
+        private void ResetPendingStateLocked(List<ISyncVarInternal> allVars)
+        {
+            Volatile.Write(ref _hasReceivedInitialSnapshot, 0);
+            DirtyBitset.Clear();
+            _unboundCache.Clear();
+            _unboundOrder.Clear();
+            _unboundAuth.Clear();
             _pendingClearAcks.Clear();
 
-            var allVars = new List<ISyncVarInternal>();
             _tokenRegistry.GetAll(allVars);
             for (int i = 0; i < allVars.Count; i++)
             {
-                allVars[i].SetLocallyVisible(false);
+                allVars[i].SetLocallyVisibleDeferred(false);
             }
         }
 
         public void ResetSessionState()
         {
-            ResetPendingState();
-
             var allVars = new List<ISyncVarInternal>();
-            _tokenRegistry.GetAll(allVars);
-            for (int i = 0; i < allVars.Count; i++)
+            lock (_unboundLock)
             {
-                allVars[i].ResetSession();
-            }
+                ResetPendingStateLocked(allVars);
 
-            for (int i = 0; i < _localRegistry.Length; i++)
+                for (int i = 0; i < allVars.Count; i++)
+                {
+                    allVars[i].ResetSession();
+                }
+
+                for (int i = 0; i < _localRegistry.Length; i++)
+                {
+                    Volatile.Write(ref _localRegistry[i], null);
+                }
+                _slotBitset.Clear();
+
+                Slab?.Reset();
+            }
+            FirePendingEvents(allVars);
+        }
+
+        private static void FirePendingEvents(List<ISyncVarInternal> vars)
+        {
+            for (int i = 0; i < vars.Count; i++)
             {
-                Volatile.Write(ref _localRegistry[i], null);
+                try
+                {
+                    vars[i].FirePendingEvents();
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[SyncVarManager] Event handler for '{vars[i].Token}' threw: {ex.Message}");
+                }
             }
-            _slotBitset.Clear();
-
-            Slab?.Reset();
         }
 
         public void FullTeardown()
@@ -387,13 +411,6 @@ namespace Liminal.Net.SyncVar
         [ThreadStatic]
         private static ArrayBufferWriter<byte> _regWriter;
 
-        public void AttachPreExisting(ISyncVarInternal syncVar)
-        {
-            if (syncVar == null) return;
-            syncVar.ResetSession();
-            RegisterSyncVar(syncVar);
-        }
-
         public void RegisterSyncVar(ISyncVarInternal syncVar)
         {
             if (syncVar == null) throw new ArgumentNullException(nameof(syncVar));
@@ -462,23 +479,28 @@ namespace Liminal.Net.SyncVar
 
                 if (entry != null)
                 {
-                    syncVar.SetLocallyVisible(true);
+                    syncVar.SetLocallyVisibleDeferred(true);
                     bool force = !syncVar.HasAuthority;
-                    syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force, deferEvent: true);
+                    syncVar.ApplyCachedBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force);
+                }
+
+                if (!syncVar.TryPublishSlot(slot))
+                {
+                    _slotBitset.Free(slot);
+                    return;
                 }
 
                 _tokenRegistry.TryAdd(syncVar);
                 Volatile.Write(ref _localRegistry[slot], syncVar);
-                syncVar.LocalSlot = slot;
+
+                var netManager = _attachedManager;
+                if (syncVar.IsDirty || (netManager != null && netManager.Role != NetworkRole.Client && netManager.Role != NetworkRole.None))
+                {
+                    DirtyBitset.SetDirty(slot);
+                }
             }
 
             syncVar.FirePendingEvents();
-
-            var netManager = _attachedManager;
-            if (syncVar.IsDirty || (netManager != null && netManager.Role != NetworkRole.Client && netManager.Role != NetworkRole.None))
-            {
-                DirtyBitset.SetDirty(syncVar.LocalSlot);
-            }
         }
 
         public SyncVar<T> Bind<T>(string token, T defaultValue = default)

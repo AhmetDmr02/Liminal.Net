@@ -57,13 +57,14 @@ namespace Liminal.Net.Core
             if (_isRunning) return;
             _isRunning = true;
 
-            _tickThread = new Thread(RunLoop)
+            var thread = new Thread(RunLoop)
             {
                 Name = "Liminal Network Ticker",
                 IsBackground = true,
                 Priority = ThreadPriority.AboveNormal
             };
-            _tickThread.Start();
+            Volatile.Write(ref _tickThread, thread);
+            thread.Start();
         }
 
         public virtual void Stop()
@@ -71,14 +72,16 @@ namespace Liminal.Net.Core
             if (!_isRunning) return;
             _isRunning = false;
 
-            if (_tickThread != null && _tickThread.IsAlive)
+            var thread = Volatile.Read(ref _tickThread);
+
+            if (thread != null && thread != Thread.CurrentThread && thread.IsAlive)
             {
-                if (!_tickThread.Join(500))
+                if (!thread.Join(500))
                 {
                     LiminalLogger.LogWarning("[Ticker] Tick thread did not stop gracefully!");
                 }
             }
-            _tickThread = null;
+            Interlocked.CompareExchange(ref _tickThread, null, thread);
         }
 
         protected virtual void RunLoop()
@@ -88,7 +91,7 @@ namespace Liminal.Net.Core
             long nextTick = Stopwatch.GetTimestamp();
             Volatile.Write(ref _nextTickTimestamp, nextTick);
 
-            while (_isRunning)
+            while (_isRunning && Volatile.Read(ref _tickThread) == Thread.CurrentThread)
             {
                 long currentTicks = Stopwatch.GetTimestamp();
 
