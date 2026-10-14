@@ -357,10 +357,49 @@ namespace Liminal.Net.Transports
                 return;
             }
 
+            ShutdownClaimed();
+        }
+
+        //For late failures from a connection's own loops, checked and claimed under the lock new connections register under
+        //so an old socket failing late cant tear down a newer connection
+        private void ShutdownIfCurrent(TcpClient connection)
+        {
+            lock (_connectionLifecycleLock)
+            {
+                if (!_isClient || !_sockets.TryGetValue(ILiminalTransport.SERVER_ID, out var active) || !ReferenceEquals(active, connection))
+                {
+                    return;
+                }
+
+                if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+                {
+                    return;
+                }
+            }
+
+            ShutdownClaimed();
+        }
+
+        //Subclasses release their own resources here, only runs when the transport really shuts down
+        protected virtual void OnShutdownClaimed()
+        {
+        }
+
+        private void ShutdownClaimed()
+        {
             LiminalLogger.Log($"[Transport-Debug] Shutdown initiated by thread '{Thread.CurrentThread.Name ?? Thread.CurrentThread.ManagedThreadId.ToString()}'. Stack:\n{Environment.StackTrace}", LiminalLogger.LogLevel.Detailed);
 
             try
             {
+                try
+                {
+                    OnShutdownClaimed();
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Transport] Shutdown cleanup failed: {ex.Message}");
+                }
+
                 lock (_connectionLifecycleLock)
                 {
                     _clientConnectCts?.Cancel();
@@ -541,7 +580,7 @@ namespace Liminal.Net.Transports
                                     OnTransportDisconnectReason?.Invoke(clientId, DisconnectReason.Timeout, $"Send timed out ({timeoutSeconds}s).");
 
                                     if (IsServer) Kick(clientId);
-                                    else Shutdown();
+                                    else ShutdownIfCurrent(client);
                                     return;
                                 }
 
@@ -584,7 +623,7 @@ namespace Liminal.Net.Transports
                             OnTransportDisconnectReason?.Invoke(clientId, DisconnectReason.Timeout, $"Send flush timed out ({timeoutSeconds}s).");
 
                             if (IsServer) Kick(clientId);
-                            else Shutdown();
+                            else ShutdownIfCurrent(client);
                             return;
                         }
 
@@ -607,7 +646,7 @@ namespace Liminal.Net.Transports
                     if (IsCurrentConnection(clientId, client, state))
                         Kick(clientId);
                 }
-                else Shutdown();
+                else ShutdownIfCurrent(client);
             }
             catch (Exception ex)
             {
@@ -618,7 +657,7 @@ namespace Liminal.Net.Transports
                     if (IsCurrentConnection(clientId, client, state))
                         Kick(clientId);
                 }
-                else Shutdown();
+                else ShutdownIfCurrent(client);
             }
             finally
             {

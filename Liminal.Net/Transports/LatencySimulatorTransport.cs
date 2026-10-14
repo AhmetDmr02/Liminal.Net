@@ -214,7 +214,7 @@ namespace Liminal.Net.Transports
             }
         }
 
-        public override void Shutdown()
+        protected override void OnShutdownClaimed()
         {
             lock (_threadLifecycleLock)
             {
@@ -238,8 +238,6 @@ namespace Liminal.Net.Transports
                 _cts?.Dispose();
                 _cts = null;
             }
-
-            base.Shutdown();
         }
     }
 }
