@@ -78,5 +78,75 @@ namespace Liminal.Net.Tests
             }
             finally { manager.Shutdown(); }
         }
+
+        //Fills the reset slab from the start so a stale slot held by an unregistered syncvar overlaps one of these
+        private static SyncVar<int>[] CreateVictims(SyncVarManager mgr, string prefix)
+        {
+            var victims = new SyncVar<int>[6];
+            for (int i = 0; i < victims.Length; i++) victims[i] = new SyncVar<int>($"{prefix}_{i}", 500 + i, mgr);
+            return victims;
+        }
+
+        private static void AssertVictimsIntact(SyncVar<int>[] victims)
+        {
+            for (int i = 0; i < victims.Length; i++)
+            {
+                Assert.That(DecodeWire(victims[i]), Is.EqualTo(500 + i), $"{victims[i].Token} was overwritten by a SyncVar that is not registered.");
+            }
+        }
+
+        [Test]
+        public void RejectedDuplicate_AfterSessionReset_DoesNotWriteIntoAnotherSyncVarsMemory()
+        {
+            var manager = StartMockServer();
+            var mgr = manager.SyncVarManager;
+            try
+            {
+                var original = new SyncVar<int>("lifecycle_dup", 1, mgr);
+                var duplicate = new SyncVar<int>("lifecycle_dup", 2, mgr);
+                duplicate.Value = 999;
+
+                mgr.ResetSessionState();
+
+                var victims = CreateVictims(mgr, "lifecycle_dup_victim");
+                duplicate.Value = 777;
+                duplicate.Value = 778;
+
+                AssertVictimsIntact(victims);
+                Assert.That(duplicate.Value, Is.EqualTo(778), "The rejected duplicate must still keep its value locally.");
+                Assert.That(mgr.TryGetSyncVar("lifecycle_dup", out var registered) && ReferenceEquals(registered, original), Is.True);
+            }
+            finally { manager.Shutdown(); }
+        }
+
+        //Its old manager is shut down and the new one already has the token, so joining fails after picking the new slab
+        [Test]
+        public void SyncVarFailingToJoinNewManager_DoesNotWriteIntoThatManagersMemory()
+        {
+            var oldManager = StartMockServer();
+            var leftover = new SyncVar<int>("lifecycle_join_taken", 1, oldManager.SyncVarManager);
+            var newManager = StartMockServer();
+            var mgr = newManager.SyncVarManager;
+            try
+            {
+                var owner = new SyncVar<int>("lifecycle_join_taken", 2, mgr);
+                oldManager.Shutdown();
+
+                leftover.Value = 999;
+                mgr.ResetSessionState();
+
+                var victims = CreateVictims(mgr, "lifecycle_join_victim");
+                leftover.Value = 777;
+                leftover.Value = 778;
+
+                AssertVictimsIntact(victims);
+                Assert.That(mgr.TryGetSyncVar("lifecycle_join_taken", out var registered) && ReferenceEquals(registered, owner), Is.True);
+            }
+            finally
+            {
+                oldManager.Shutdown();
+                newManager.Shutdown();
+            }
+        }
     }
 }

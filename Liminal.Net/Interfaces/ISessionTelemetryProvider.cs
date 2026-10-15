@@ -16,6 +16,6 @@ namespace Liminal.Net.Interfaces
 
         public void InitializeConfig (LiminalTelemetryConfig config);
 
-        public event Action<ushort,Memory<byte>> OnPacketBuffered;
+        public event Action<ushort, int> OnPacketBuffered;
     }
 }

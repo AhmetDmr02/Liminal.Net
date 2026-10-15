@@ -386,7 +386,8 @@ namespace Liminal.Net.Core
 
         #region Write Path
 
-        public event Action<ushort, Memory<byte>> OnPacketBuffered;
+        //Size only, the frame lives in a native send buffer that gets reused and freed once the lock is released
+        public event Action<ushort, int> OnPacketBuffered;
 
         public void BufferPacket(ushort senderId, ushort targetId, ushort packetId, ReadOnlySpan<byte> payload, DeliveryMethod deliveryMethod = DeliveryMethod.Reliable)
         {
@@ -451,7 +452,7 @@ namespace Liminal.Net.Core
             bool shouldKick = false;
             string kickReason = null;
 
-            Memory<byte> bufferedMemory = default;
+            int bufferedSize = 0;
             bool raiseBufferedEvent = false;
 
             try
@@ -501,10 +502,7 @@ namespace Liminal.Net.Core
 
                         if (_telemetryConfig?.EnablePacketCounting == true)
                         {
-                            bufferedMemory =
-                                session.RawSendBufferUnreliable.Memory.Slice(
-                                    session.RawSendCursorUnreliable - frameSize,
-                                    frameSize);
+                            bufferedSize = frameSize;
 
                             raiseBufferedEvent = true;
                         }
@@ -597,10 +595,7 @@ namespace Liminal.Net.Core
 
                         if (_telemetryConfig?.EnablePacketCounting == true)
                         {
-                            bufferedMemory =
-                                session.ActiveRawSendBufferReliable.Memory.Slice(
-                                    session.RawSendCursorReliable - frameSize,
-                                    frameSize);
+                            bufferedSize = frameSize;
 
                             raiseBufferedEvent = true;
                         }
@@ -617,7 +612,7 @@ namespace Liminal.Net.Core
                 }
 
                 if (raiseBufferedEvent)
-                    OnPacketBuffered?.Invoke(packetId, bufferedMemory);
+                    OnPacketBuffered?.Invoke(packetId, bufferedSize);
             }
             finally
             {

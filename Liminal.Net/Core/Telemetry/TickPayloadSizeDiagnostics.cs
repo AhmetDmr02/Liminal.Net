@@ -86,9 +86,8 @@ namespace Liminal.Net.Core.Telemetry
             }
         }
 
-        private void HandlePacketBuffered(ushort packetId, Memory<byte> memory)
+        private void HandlePacketBuffered(ushort packetId, int length)
         {
-            int length = memory.Length;
             lock (_bufferLock)
             {
                 for (int i = 0; i < _activeCount; i++)

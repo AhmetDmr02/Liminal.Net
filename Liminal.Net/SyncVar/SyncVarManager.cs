@@ -503,6 +503,7 @@ namespace Liminal.Net.SyncVar
 
                 if (!_slotBitset.TryAllocate(out ushort slot))
                 {
+                    syncVar.DetachFromSlab();
                     throw new InvalidOperationException($"[SyncVarManager] Exceeded maximum local SyncVar capacity ({_slotBitset.Capacity}).");
                 }
 
@@ -514,6 +515,7 @@ namespace Liminal.Net.SyncVar
                 if (!syncVar.TryInitializeSlabSlots(writer.WrittenSpan))
                 {
                     _slotBitset.Free(slot);
+                    syncVar.DetachFromSlab();
                     return false;
                 }
                 Interlocked.Add(ref _totalAllocatedBytes, size * 2);
@@ -544,6 +546,7 @@ namespace Liminal.Net.SyncVar
                 if (!syncVar.TryPublishSlot(slot))
                 {
                     _slotBitset.Free(slot);
+                    syncVar.DetachFromSlab();
                     return false;
                 }
 

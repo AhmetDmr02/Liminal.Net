@@ -209,7 +209,8 @@ namespace Liminal.Net.SyncVar
 
             _permissions = new SyncVarPermissions(_manager, token, visibility);
             _valueCell = new SyncVarValueCell<T>(initialValue);
-            _wireBuffer = new SyncVarWireBuffer(_manager?.Slab);
+            //No slab until a manager actually registers it, an unregistered syncvar writing there would overwrite memory the manager hands out
+            _wireBuffer = new SyncVarWireBuffer(null);
 
             //Add to directory before joining so a manager created at the same time either sees us or we see it
             SyncVarDirectory.Add(this);
@@ -436,7 +437,6 @@ namespace Liminal.Net.SyncVar
                 current?.ReleaseSyncVar(this);
                 _manager = mgr;
                 _permissions.UpdateManager(mgr);
-                _wireBuffer.UpdateSlab(mgr.Slab);
             }
 
             if (reason == JoinReason.Construction)
