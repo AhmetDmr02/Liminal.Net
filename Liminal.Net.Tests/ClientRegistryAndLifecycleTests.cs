@@ -50,7 +50,7 @@ namespace Liminal.Net.Tests
             {
                 try { client?.Shutdown(); } catch { }
             }
-            try { _serverManager?.Shutdown(); } catch { }
+            try { _serverManager?.Dispose(); } catch { }
         }
 
         private LiminalNetworkManager CreateClientManager()
@@ -473,7 +473,7 @@ namespace Liminal.Net.Tests
 
             _serverManager.Disconnect();
             _serverManager.StartHost();
-            _serverManager.Shutdown();
+            _serverManager.Disconnect();
             bool started = _serverManager.StartHost();
             Assert.That(started, Is.True);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.IsConnected, 4000), Is.True);

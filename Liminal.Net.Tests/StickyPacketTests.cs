@@ -35,7 +35,7 @@ namespace Liminal.Net.Tests
         [TearDown]
         public void TearDown()
         {
-            _manager.Shutdown();
+            _manager.Dispose();
         }
 
         [Test]

@@ -171,7 +171,7 @@ namespace Liminal.Net.Tests
                 transport.TriggerClientConnected(clientForCycle);
                 Assert.That(orderCheck, Is.EqualTo(1), $"Cycle {cycle}: Session did not exist when OnClientConnected fired.");
 
-                manager.Shutdown();
+                manager.Disconnect();
             }
         }
     }

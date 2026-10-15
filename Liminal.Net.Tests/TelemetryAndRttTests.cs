@@ -52,7 +52,7 @@ namespace Liminal.Net.Tests
             {
                 client?.Shutdown();
             }
-            _serverManager?.Shutdown();
+            _serverManager?.Dispose();
         }
 
         private LiminalNetworkManager CreateAndStartClient(LiminalTelemetryConfig telemetryConfig = null, bool waitForConnect = true)

@@ -173,18 +173,17 @@ namespace Liminal.Net.Tests.Coyote
             await Task.WhenAll(shutdown, adopt);
 
             Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            Specification.Assert(!owner.StartServer("127.0.0.1", 7777), "A shut down manager started again.");
 
-            owner.StartServer("127.0.0.1", 7777);
             adopter.SyncVarManager.AdoptOrphans();
-            AssertOwnedByExactlyOne(hp, owner, adopter);
+            Specification.Assert(IsRegisteredIn(adopter, hp), "The adopter did not take the SyncVar of the shut down owner.");
+            Specification.Assert(CountRegistrySlots(adopter, hp) == 1, $"hp holds {CountRegistrySlots(adopter, hp)} adopter slots, expected 1.");
 
-            var probeOwner = new SyncVar<int>(UniqueToken("adopt_probe_owner"), 111, owner.SyncVarManager);
             var probeAdopter = new SyncVar<int>(UniqueToken("adopt_probe_adopter"), 222, adopter.SyncVarManager);
             hp.Value = 5;
             hp.Value = 6;
 
             Specification.Assert(DecodeWire(hp) == 6, $"hp wire bytes decode to {DecodeWire(hp)}, expected 6.");
-            Specification.Assert(DecodeWire(probeOwner) == 111, "hp wrote into the restarted owner's slab memory.");
             Specification.Assert(DecodeWire(probeAdopter) == 222, "hp wrote into the adopter's slab memory.");
 
             owner.Shutdown();
@@ -192,12 +191,13 @@ namespace Liminal.Net.Tests.Coyote
         }
 
         [Test]
-        public static async Task Coyote_Adoption_OldManagerRestartVsNewManager_ExactlyOneOwner()
+        //A disconnected manager is still alive, restarting it races a new manager that must never take its syncvar
+        public static async Task Coyote_Adoption_DisconnectedManagerRestartVsNewManager_OldKeepsItsSyncVar()
         {
             Exception failure = null;
             var old = StartMockServer();
             var hp = new SyncVar<int>(UniqueToken("adopt_restart"), 8, old.SyncVarManager);
-            old.Shutdown();
+            old.Disconnect();
             LiminalNetworkManager fresh = null;
 
             var restart = RunCapturing(() => { old.StartServer("127.0.0.1", 7777); }, ex => failure = ex);
@@ -206,7 +206,8 @@ namespace Liminal.Net.Tests.Coyote
 
             Specification.Assert(failure == null, $"Unexpected exception: {failure}");
             AssertOwnedByExactlyOne(hp, old, fresh);
-            Specification.Assert(DecodeWire(hp) == 8, "Wire bytes corrupted during adoption.");
+            Specification.Assert(IsRegisteredIn(old, hp), "A new manager took the SyncVar of a manager that was only disconnected.");
+            Specification.Assert(DecodeWire(hp) == 8, "Wire bytes corrupted during the restart.");
 
             hp.Value = 9;
             Specification.Assert(DecodeWire(hp) == 9, "The owner's slab does not accept writes after adoption.");

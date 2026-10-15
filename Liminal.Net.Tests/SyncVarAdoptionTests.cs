@@ -134,7 +134,7 @@ namespace Liminal.Net.Tests
             var manager = CreateManager(out var transport);
             var hp = new SyncVar<int>("adopt_same_manager", 1, manager.SyncVarManager);
             ConnectAsMockClient(manager, transport);
-            manager.Shutdown();
+            manager.Disconnect();
 
             int seen = 0;
             hp.OnValueChanged += (_, next) => seen = next;

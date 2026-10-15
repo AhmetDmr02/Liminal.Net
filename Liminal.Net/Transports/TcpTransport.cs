@@ -282,18 +282,31 @@ namespace Liminal.Net.Transports
 
             if (_isClient)
             {
-                _clientConnectCts?.Cancel();
+                ushort disconnectedId;
+                bool wasConnected;
 
-                ushort disconnectedId = _localClientId;
-                bool wasConnected = _isConnected;
-                _isConnected = false;
+                //Claimed before anything wakes the reader, under the lock its lost connection check uses
+                //so the reader stays quiet and this is the only shutdown, finished before Disconnect returns
+                lock (_connectionLifecycleLock)
+                {
+                    if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+                    {
+                        return;
+                    }
+
+                    disconnectedId = _localClientId;
+                    wasConnected = _isConnected;
+                    _isConnected = false;
+                }
+
+                _clientConnectCts?.Cancel();
 
                 if (wasConnected)
                 {
                     _onLocalClientDisconnected?.Invoke(disconnectedId);
                 }
 
-                Shutdown();
+                ShutdownClaimed();
                 LiminalLogger.Log("[Transport] Disconnected from server.");
                 return;
             }
@@ -1232,9 +1245,10 @@ namespace Liminal.Net.Transports
                         if (payloadSpan.Length >= 16)
                         {
                             float countdownMs = 0f;
-                            if (NextTickProvider != null)
+                            var nextTickProvider = NextTickProvider;
+                            if (nextTickProvider != null)
                             {
-                                long nextTick = NextTickProvider();
+                                long nextTick = nextTickProvider();
                                 long diffTicks = Math.Max(0, nextTick - Stopwatch.GetTimestamp());
                                 countdownMs = (float)((diffTicks * 1000.0) / Stopwatch.Frequency);
                             }

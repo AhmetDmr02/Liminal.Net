@@ -184,6 +184,20 @@ namespace Liminal.Net.Core
             _resolved[clientId] = (reason, message);
         }
 
+        //The local side left on purpose, a reason the server already sent (a kick) is kept
+        internal void RecordLocalLeave(ushort localId, string message)
+        {
+            if (_disposed) return;
+            _resolved.TryAdd(localId, (DisconnectReason.ClientDisconnected, message));
+        }
+
+        //For a local leave the transport wont report, like Shutdown
+        internal void ResolveLocalLeave(ushort localId, string message)
+        {
+            RecordLocalLeave(localId, message);
+            Resolve(localId);
+        }
+
         public bool TryGetResolvedReason(ushort id, out DisconnectReason reason, out string message)
         {
             if (_resolved.TryGetValue(id, out var entry))

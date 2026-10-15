@@ -29,7 +29,7 @@ namespace Liminal.Net.Core
         Stopping
     }
 
-    public class LiminalNetworkManager
+    public class LiminalNetworkManager : IDisposable
     {
         #region Singleton
         public static volatile LiminalNetworkManager Instance;
@@ -403,6 +403,12 @@ namespace Liminal.Net.Core
         {
             lock (_teardownLock)
             {
+                if (Volatile.Read(ref _isShutDown) != 0)
+                {
+                    LiminalLogger.LogError("[Manager] Cannot StartHost: this manager was shut down, create a new LiminalNetworkManager.");
+                    return false;
+                }
+
                 if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
                 {
                     LiminalLogger.LogWarning($"[Manager] Cannot StartHost: Manager is in state '{LifecycleState}' (Role: {Role}).");
@@ -450,7 +456,7 @@ namespace Liminal.Net.Core
                 catch (Exception ex)
                 {
                     LiminalLogger.LogError($"[Manager] StartHost failed: {ex.Message}");
-                    ShutdownInternal();
+                    AbortStart();
                     throw;
                 }
             }
@@ -464,6 +470,12 @@ namespace Liminal.Net.Core
         {
             lock (_teardownLock)
             {
+                if (Volatile.Read(ref _isShutDown) != 0)
+                {
+                    LiminalLogger.LogError("[Manager] Cannot StartServer: this manager was shut down, create a new LiminalNetworkManager.");
+                    return false;
+                }
+
                 if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
                 {
                     LiminalLogger.LogWarning($"[Manager] Cannot StartServer: Manager is in state '{LifecycleState}' (Role: {Role}).");
@@ -498,7 +510,7 @@ namespace Liminal.Net.Core
                 catch (Exception ex)
                 {
                     LiminalLogger.LogError($"[Manager] StartServer failed: {ex.Message}");
-                    ShutdownInternal();
+                    AbortStart();
                     throw;
                 }
             }
@@ -514,6 +526,12 @@ namespace Liminal.Net.Core
         {
             lock (_teardownLock)
             {
+                if (Volatile.Read(ref _isShutDown) != 0)
+                {
+                    LiminalLogger.LogError("[Manager] Cannot StartClient: this manager was shut down, create a new LiminalNetworkManager.");
+                    return false;
+                }
+
                 if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
                 {
                     LiminalLogger.LogWarning($"[Manager] Cannot StartClient: Manager is in state '{LifecycleState}' (Role: {Role}).");
@@ -542,7 +560,7 @@ namespace Liminal.Net.Core
                 catch (Exception ex)
                 {
                     LiminalLogger.LogError($"[Manager] StartClient failed: {ex.Message}");
-                    ShutdownInternal();
+                    AbortStart();
                     throw;
                 }
             }
@@ -551,6 +569,7 @@ namespace Liminal.Net.Core
         private readonly object _teardownLock = new();
         private int _isDisconnecting;
         private int _isShuttingDown;
+        private int _isShutDown;
 
         public void Disconnect()
         {
@@ -562,6 +581,11 @@ namespace Liminal.Net.Core
                 Volatile.Write(ref _isDisconnecting, 1);
                 try
                 {
+                    if (Role == NetworkRole.Client && _transport.LocalClientId != 0)
+                    {
+                        DisconnectCoordinator?.RecordLocalLeave(_transport.LocalClientId, "Disconnect() was called.");
+                    }
+
                     _ticker?.Stop();
                     _transport.Disconnect();
 
@@ -615,10 +639,34 @@ namespace Liminal.Net.Core
             }
         }
 
+        //Undoes a failed start only, the manager and the game's subscriptions stay so it can be started again
+        private void AbortStart()
+        {
+            Volatile.Write(ref _isDisconnecting, 1);
+            try
+            {
+                _ticker?.Stop();
+                _transport.Shutdown();
+                TeardownSession();
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] Error while undoing a failed start: {ex.Message}");
+                Role = NetworkRole.None;
+                LifecycleState = NetworkLifecycleState.Stopped;
+            }
+            finally
+            {
+                Volatile.Write(ref _isDisconnecting, 0);
+            }
+        }
+
+        //Final, after this the manager cant be started again, Disconnect is the call for leaving and reconnecting
         public void Shutdown()
         {
             lock (_teardownLock)
             {
+                if (Volatile.Read(ref _isShutDown) != 0) return;
                 if (LifecycleState == NetworkLifecycleState.Stopping) return;
                 if (Volatile.Read(ref _isDisconnecting) != 0) return;
                 if (Volatile.Read(ref _isShuttingDown) != 0) return;
@@ -627,8 +675,11 @@ namespace Liminal.Net.Core
             }
         }
 
+        public void Dispose() => Shutdown();
+
         private void ShutdownInternal()
         {
+            Volatile.Write(ref _isShutDown, 1);
             Volatile.Write(ref _isShuttingDown, 1);
             bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped || _transport.IsConnected;
             LifecycleState = NetworkLifecycleState.Stopping;
@@ -637,6 +688,11 @@ namespace Liminal.Net.Core
 
             try
             {
+                if (Role == NetworkRole.Client && _transport.LocalClientId != 0)
+                {
+                    DisconnectCoordinator?.ResolveLocalLeave(_transport.LocalClientId, "Shutdown() was called.");
+                }
+
                 _ticker?.Stop();
 
                 _transport.Shutdown();
@@ -645,7 +701,13 @@ namespace Liminal.Net.Core
 
                 ShutdownSystems();
 
+                //Final, so the manager lets go of the transport, a transport the game keeps must not keep this manager alive
+                _transport.OnShutdown -= HandleTransportShutdown;
                 _eventHub.Clear();
+                if (_transport is ITransportTelemetryProvider telemetryProvider)
+                {
+                    telemetryProvider.NextTickProvider = null;
+                }
 
                 Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;

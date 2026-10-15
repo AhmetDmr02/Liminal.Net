@@ -103,6 +103,62 @@ namespace Liminal.Net.Tests.Coyote
             catch (Exception ex) { onError(ex); }
         });
 
+        //A flush snapshots visibility before it sends, an exclusion and its eviction landing in between must not be undone
+        //by that flush's batch reaching the client after the eviction
+        [Test]
+        public static async Task Coyote_Visibility_FlushVsExclusion_ExcludedClientStaysHidden()
+        {
+            Exception failure = null;
+            var pair = Pair.Connect();
+            string token = UniqueToken("visibility_exclude");
+            var serverVar = new SyncVar<int>(token, 1, pair.Server.SyncVarManager);
+            var clientVar = new SyncVar<int>(token, 0, pair.Client.SyncVarManager);
+            pair.Pump();
+            Specification.Assert(clientVar.IsVisible && clientVar.Value == 1, "Precondition: client never saw the SyncVar.");
+
+            serverVar.Value = 2;
+            var tick = RunCapturing(() => pair.Server.Ticker.TickOnce(), ex => failure = ex);
+            var exclude = RunCapturing(() => serverVar.AddExclusion(ClientId), ex => failure = ex);
+            await Task.WhenAll(tick, exclude);
+            pair.Pump();
+
+            Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            Specification.Assert(!clientVar.IsVisible, "A batch sent after the eviction made the excluded client see the SyncVar again.");
+
+            pair.Shutdown();
+        }
+
+        //A value the server writes after excluding a client must never reach that client, even from a flush already under way
+        [Test]
+        public static async Task Coyote_Visibility_ValueWrittenAfterExclusion_NeverReachesExcludedClient()
+        {
+            Exception failure = null;
+            var pair = Pair.Connect();
+            string token = UniqueToken("visibility_secret");
+            var serverVar = new SyncVar<int>(token, 1, pair.Server.SyncVarManager);
+            var clientVar = new SyncVar<int>(token, 0, pair.Client.SyncVarManager);
+            pair.Pump();
+            Specification.Assert(clientVar.Value == 1, "Precondition: client never saw the SyncVar.");
+
+            bool sawSecret = false;
+            clientVar.OnValueChanged += (_, next) => { if (next == 99) sawSecret = true; };
+
+            serverVar.Value = 2;
+            var tick = RunCapturing(() => pair.Server.Ticker.TickOnce(), ex => failure = ex);
+            var excludeThenWrite = RunCapturing(() =>
+            {
+                serverVar.AddExclusion(ClientId);
+                serverVar.Value = 99;
+            }, ex => failure = ex);
+            await Task.WhenAll(tick, excludeThenWrite);
+            pair.Pump();
+
+            Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            Specification.Assert(!sawSecret && clientVar.Value != 99, "A value written after the exclusion reached the excluded client.");
+
+            pair.Shutdown();
+        }
+
         //Unregister revokes and using it again regrants, whatever the order the client has to end up matching the server
         [Test]
         public static async Task Coyote_Authority_UnregisterVsUse_ClientMatchesServer()

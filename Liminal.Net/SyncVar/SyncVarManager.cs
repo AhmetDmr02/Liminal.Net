@@ -868,7 +868,6 @@ namespace Liminal.Net.SyncVar
                         if (syncVar != null && !syncVar.IsDisposed && syncVar.LocalSlot == slot)
                         {
                             _reusableDirtyList.Add(syncVar);
-                            _reusableStateList.Add(syncVar.VisibilityState);
                         }
 
                         umask &= (umask - 1);
@@ -926,7 +925,36 @@ namespace Liminal.Net.SyncVar
                     return;
                 }
 
-                // Server / Host Flush
+                FlushServerBatches(netManager);
+            }
+            finally
+            {
+                _clientAuthorizedList.Clear();
+                _tailoredVarsList.Clear();
+                _reusableDirtyList.Clear();
+                _reusableStateList.Clear();
+                Interlocked.CompareExchange(ref _lifecycleGate, 0, 1);
+            }
+        }
+
+        //Holds every dirty syncvar's visibility lock, taken in slot order, from reading visibility to handing off the batches
+        //so an exclusion lands fully before (seen here) or fully after (its eviction goes out after these batches)
+        //and a value written after an exclusion cant be read into a batch for the excluded client
+        private void FlushServerBatches(LiminalNetworkManager netManager)
+        {
+            int locked = 0;
+            try
+            {
+                for (; locked < _reusableDirtyList.Count; locked++)
+                {
+                    Monitor.Enter(_reusableDirtyList[locked].VisibilityLock);
+                }
+
+                for (int i = 0; i < _reusableDirtyList.Count; i++)
+                {
+                    _reusableStateList.Add(_reusableDirtyList[i].VisibilityState);
+                }
+
                 _sharedPayloadWriter.Clear();
                 var masterPayloadWriter = new MessagePackWriter(_sharedPayloadWriter);
                 int masterWrittenCount = 0;
@@ -1063,11 +1091,10 @@ namespace Liminal.Net.SyncVar
             }
             finally
             {
-                _clientAuthorizedList.Clear();
-                _tailoredVarsList.Clear();
-                _reusableDirtyList.Clear();
-                _reusableStateList.Clear();
-                Interlocked.CompareExchange(ref _lifecycleGate, 0, 1);
+                for (int i = 0; i < locked; i++)
+                {
+                    Monitor.Exit(_reusableDirtyList[i].VisibilityLock);
+                }
             }
         }
 

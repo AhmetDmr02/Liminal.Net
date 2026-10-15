@@ -72,6 +72,7 @@ namespace Liminal.Net.SyncVar
         void Adopt(SyncVarManager manager);
         ClientWriteResult ApplyClientWrite(ReadOnlySequence<byte> incomingBytes, ushort senderId, MessagePackSerializerOptions options);
         void RefreshClientAuthority();
+        object VisibilityLock { get; }
         void FirePendingEvents();
         void InternalTeardown();
         void ResetSession();
@@ -382,6 +383,9 @@ namespace Liminal.Net.SyncVar
         //Server side, unregistered means authorized clients lose authority, registered again means they get value version and authority back
         //under _permissionBroadcastLock so it cant get reordered with grants and revokes
         void ISyncVarInternal.RefreshClientAuthority() => RefreshClientAuthority();
+
+        //Visibility changes and their evictions happen under this, the server flush holds it while it targets and sends
+        object ISyncVarInternal.VisibilityLock => _permissionBroadcastLock;
 
         private void RefreshClientAuthority()
         {

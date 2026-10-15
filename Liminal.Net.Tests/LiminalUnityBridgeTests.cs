@@ -48,8 +48,8 @@ namespace Liminal.Net.Tests
         public void Teardown()
         {
             _bridge?.Dispose();
-            try { _clientManager?.Shutdown(); } catch { }
-            try { _serverManager?.Shutdown(); } catch { }
+            try { _clientManager?.Dispose(); } catch { }
+            try { _serverManager?.Dispose(); } catch { }
         }
 
         [Test]

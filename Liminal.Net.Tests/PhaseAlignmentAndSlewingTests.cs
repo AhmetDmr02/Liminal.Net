@@ -54,7 +54,7 @@ namespace Liminal.Net.Tests
             {
                 client?.Shutdown();
             }
-            _serverManager?.Shutdown();
+            _serverManager?.Dispose();
         }
 
         private LiminalNetworkManager CreateAndStartClient(ILiminalTransport transport, uint tickRate = 20, bool waitForConnect = true)

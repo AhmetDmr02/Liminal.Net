@@ -72,7 +72,7 @@ namespace Liminal.Net.Tests
             {
                 client?.Shutdown();
             }
-            _serverManager?.Shutdown();
+            _serverManager?.Dispose();
         }
 
         private LiminalNetworkManager CreateAndStartClient(bool waitForConnect = true)
@@ -413,7 +413,7 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void Test12_ManagerShutdown_ClearsAndReinitializesSlabState()
+        public void Test12_ManagerShutdown_NewManagerStartsCleanAndAdoptsTheSyncVar()
         {
             string token = $"shutdown_reset_{Guid.NewGuid():N}";
             var serverVar = new SyncVar<int>(token, 10);
@@ -424,8 +424,9 @@ namespace Liminal.Net.Tests
             _serverManager.Shutdown();
             Assert.That(_serverManager.Transport.IsConnected, Is.False);
 
-            // Reinitialize network on a fresh port and ensure previous shutdown cleaned up properly
+            //Shutdown is final so networking comes back with a new manager, which adopts the old syncvar
             int newPort = Interlocked.Increment(ref _portCounter);
+            _serverManager = new LiminalNetworkManager(new TcpTransport(), _serverConfig);
             _serverManager.StartServer("127.0.0.1", newPort);
             Assert.That(SpinWait.SpinUntil(() => _serverManager.Transport.IsConnected, 2000), Is.True);
 
