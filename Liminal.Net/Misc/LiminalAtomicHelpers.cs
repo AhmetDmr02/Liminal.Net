@@ -1,5 +1,4 @@
 using System;
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
 
@@ -31,34 +30,18 @@ namespace Liminal.Net.Misc
             }
         }
 
-        private static readonly FieldInfo _invocationListField =
-            typeof(MulticastDelegate).GetField("_invocationList", BindingFlags.NonPublic | BindingFlags.Instance);
+        //Delegates never change once created so each one's handler list is built once and reused
+        //no private runtime fields so it behaves the same on .NET, mono and il2cpp
+        private static readonly ConditionalWeakTable<Delegate, Delegate[]> _handlerLists = new();
+        private static readonly ConditionalWeakTable<Delegate, Delegate[]>.CreateValueCallback _buildHandlerList = d => d.GetInvocationList();
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool IsMulticast(Delegate d)
-        {
-            if (d == null) return false;
-            return _invocationListField != null && _invocationListField.GetValue(d) != null;
-        }
+        private static Delegate[] GetHandlers(Delegate d) => _handlerLists.GetValue(d, _buildHandlerList);
 
         public static void SafeInvoke(Action action)
         {
             if (action == null) return;
 
-            if (!IsMulticast(action))
-            {
-                try
-                {
-                    action();
-                }
-                catch (Exception ex)
-                {
-                    Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {ex}");
-                }
-                return;
-            }
-
-            var list = action.GetInvocationList();
+            var list = GetHandlers(action);
             for (int i = 0; i < list.Length; i++)
             {
                 try
@@ -76,20 +59,7 @@ namespace Liminal.Net.Misc
         {
             if (action == null) return;
 
-            if (!IsMulticast(action))
-            {
-                try
-                {
-                    action(arg);
-                }
-                catch (Exception ex)
-                {
-                    Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {ex}");
-                }
-                return;
-            }
-
-            var list = action.GetInvocationList();
+            var list = GetHandlers(action);
             for (int i = 0; i < list.Length; i++)
             {
                 try
@@ -107,20 +77,7 @@ namespace Liminal.Net.Misc
         {
             if (action == null) return;
 
-            if (!IsMulticast(action))
-            {
-                try
-                {
-                    action(arg1, arg2, arg3);
-                }
-                catch (Exception ex)
-                {
-                    Liminal.Net.Core.LiminalLogger.LogError($"[EventHub] Exception in event handler: {ex}");
-                }
-                return;
-            }
-
-            var list = action.GetInvocationList();
+            var list = GetHandlers(action);
             for (int i = 0; i < list.Length; i++)
             {
                 try

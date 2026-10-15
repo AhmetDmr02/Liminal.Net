@@ -150,5 +150,51 @@ namespace Liminal.Net.Tests
             Assert.DoesNotThrow(() => LiminalAtomicHelpers.SafeInvoke(single));
             Assert.That(count, Is.EqualTo(1));
         }
+
+        //Hub raises some events every tick so raising a multi handler event must not allocate
+        [Test]
+        public void SafeInvoke_MultipleHandlers_DoesNotAllocatePerRaise()
+        {
+            int calls = 0;
+            Action multi = () => calls++;
+            multi += () => calls++;
+            multi += () => calls++;
+            Action<int> multiWithArg = x => calls += x;
+            multiWithArg += x => calls += x;
+
+            LiminalAtomicHelpers.SafeInvoke(multi);
+            LiminalAtomicHelpers.SafeInvoke(multiWithArg, 1);
+
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 1000; i++)
+            {
+                LiminalAtomicHelpers.SafeInvoke(multi);
+                LiminalAtomicHelpers.SafeInvoke(multiWithArg, 1);
+            }
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+            Assert.That(calls, Is.EqualTo(5 * 1001));
+            Assert.That(allocated, Is.EqualTo(0), $"Raising events allocated {allocated} bytes over 2000 raises.");
+        }
+
+        [Test]
+        public void SafeInvoke_AfterSubscribeAndUnsubscribe_RunsTheCurrentHandlersOnly()
+        {
+            int a = 0, b = 0, c = 0;
+            Action handlerA = () => a++;
+            Action handlerB = () => b++;
+            Action handlerC = () => c++;
+            Action evt = null;
+
+            LiminalAtomicHelpers.SafeAdd(ref evt, handlerA);
+            LiminalAtomicHelpers.SafeAdd(ref evt, handlerB);
+            LiminalAtomicHelpers.SafeInvoke(evt);
+
+            LiminalAtomicHelpers.SafeRemove(ref evt, handlerA);
+            LiminalAtomicHelpers.SafeAdd(ref evt, handlerC);
+            LiminalAtomicHelpers.SafeInvoke(evt);
+
+            Assert.That((a, b, c), Is.EqualTo((1, 2, 1)));
+        }
     }
 }

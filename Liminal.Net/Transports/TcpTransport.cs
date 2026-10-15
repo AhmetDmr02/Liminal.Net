@@ -324,7 +324,7 @@ namespace Liminal.Net.Transports
                 _onClientKicked?.Invoke(clientId);
                 try { clientSocket.Close(); } catch { }
 
-                ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(clientId, clientSocket));
+                bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(clientId, clientSocket));
 
                 if (_sendQueues.TryGetValue(clientId, out var sendState))
                 {
@@ -335,7 +335,7 @@ namespace Liminal.Net.Transports
                     TeardownSendQueue(clientId);
                 }
 
-                if (TryClaimDisconnect(clientSocket))
+                if (removed && TryClaimDisconnect(clientSocket))
                 {
                     Interlocked.Decrement(ref _totalConnections);
                     _onClientDisconnected?.Invoke(clientId);
@@ -417,6 +417,12 @@ namespace Liminal.Net.Transports
 
                         if (_sockets.TryRemove(id, out var clientSocket))
                         {
+                            //Removing it from _sockets makes this its disconnect, its late reader finds it gone and stays quiet
+                            //a client's own connection to the server was never counted
+                            if (id != ILiminalTransport.SERVER_ID && TryClaimDisconnect(clientSocket))
+                            {
+                                Interlocked.Decrement(ref _totalConnections);
+                            }
                             try { clientSocket.Close(); } catch { }
                             LiminalLogger.Log($"[Transport] Client {id} cleared.");
                         }
@@ -439,7 +445,6 @@ namespace Liminal.Net.Transports
             finally
             {
                 Interlocked.Exchange(ref _isShuttingDown, 0);
-                Volatile.Write(ref _totalConnections, 0);
                 _finalizedConnections.Clear();
                 lock (_wireLock)
                 {
@@ -814,7 +819,7 @@ namespace Liminal.Net.Transports
                                 {
                                     assignedClientId = assignedId;
                                     PrePromoteClient(assignedId, acceptedClient, out clientSendState);
-                                    promoted = true;
+                                    promoted = clientSendState != null;
                                     return clientSendState;
                                 },
                                 onClientPostValidated: (assignedId, state) =>
@@ -1139,9 +1144,10 @@ namespace Liminal.Net.Transports
 
                     if (!isServerConn)
                     {
-                        ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
+                        //Shutdown, a kick or a replacement may have removed this socket already, then its disconnect is theirs
+                        bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
 
-                        if (TryClaimDisconnect(client))
+                        if (removed && TryClaimDisconnect(client))
                         {
                             Interlocked.Decrement(ref _totalConnections);
                             if (_sockets.TryGetValue(incomingId, out var activeClient) && !ReferenceEquals(activeClient, client))
