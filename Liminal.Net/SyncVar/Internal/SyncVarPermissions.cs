@@ -532,12 +532,13 @@ namespace Liminal.Net.SyncVar.Internal
             }
         }
 
-        //Client side, the ended session's server granted these and the next session's server grants again
-        public void ClearRemoteAuthorities()
+        //Client ids start over every session so nothing keyed by one carries into the next, the visibility mode is a setting and stays
+        public void ClearSessionClientIds()
         {
             lock (_lock)
             {
-                Volatile.Write(ref _state, Volatile.Read(ref _state).WithAuthorities(Array.Empty<ushort>()));
+                var current = Volatile.Read(ref _state);
+                Volatile.Write(ref _state, new SyncVarVisibilityState(current.Mode, Array.Empty<ushort>(), Array.Empty<ushort>(), Array.Empty<ushort>()));
                 _hasPendingAuthChanged = false;
             }
         }

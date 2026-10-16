@@ -6,6 +6,7 @@ using Liminal.Net.Interfaces;
 using Liminal.Net.Misc;
 using Liminal.Net.Registry;
 using System;
+using System.Threading;
 
 namespace Liminal.Net.Unity
 {
@@ -165,6 +166,9 @@ namespace Liminal.Net.Unity
         private LiminalNetworkManager _manager;
         private ZeroGcRingBuffer _ringBuffer;
 
+        //Thread that runs Update, queued events are only ever delivered on it
+        private int _mainThreadId;
+
         private void InitializeBuffer()
         {
             _ringBuffer = new ZeroGcRingBuffer(256);
@@ -194,6 +198,7 @@ namespace Liminal.Net.Unity
 
         private void Update()
         {
+            Volatile.Write(ref _mainThreadId, Environment.CurrentManagedThreadId);
             PollPackets();
             TickUnityTicker();
             DrainEvents();
@@ -215,6 +220,7 @@ namespace Liminal.Net.Unity
 
         public void Update()
         {
+            Volatile.Write(ref _mainThreadId, Environment.CurrentManagedThreadId);
             PollPackets();
             TickUnityTicker();
             DrainEvents();
@@ -238,6 +244,7 @@ namespace Liminal.Net.Unity
 
             _manager.OnLifecycleStateChanged += HandleLifecycleStateChanged;
             _manager.OnConnectedAndReady += HandleConnectedAndReady;
+            _manager.Interpreter.BeforeDispatch += DrainBeforeDispatch;
 
             var events = _manager.Events;
             if (events != null)
@@ -267,6 +274,7 @@ namespace Liminal.Net.Unity
 
             _manager.OnLifecycleStateChanged -= HandleLifecycleStateChanged;
             _manager.OnConnectedAndReady -= HandleConnectedAndReady;
+            _manager.Interpreter.BeforeDispatch -= DrainBeforeDispatch;
 
             var events = _manager.Events;
             if (events != null)
@@ -295,6 +303,16 @@ namespace Liminal.Net.Unity
         #endregion
 
         #region Main Thread Processing
+        //Transports raise a peer's connect events before its receive loop starts, so every event queued before this
+        //packet arrived is in the ring already, draining here keeps events ahead of the packets that came after them
+        private void DrainBeforeDispatch()
+        {
+            if (Environment.CurrentManagedThreadId == Volatile.Read(ref _mainThreadId))
+            {
+                DrainEvents();
+            }
+        }
+
         public void DrainEvents()
         {
             if (_ringBuffer == null) return;
@@ -407,8 +425,8 @@ namespace Liminal.Net.Unity
         #region Zero-GC Preallocated Ring Buffer
         private sealed class ZeroGcRingBuffer
         {
-            private readonly UnityNetworkEvent[] _buffer;
-            private readonly int _capacity;
+            private UnityNetworkEvent[] _buffer;
+            private int _capacity;
             private int _head;
             private int _tail;
             private readonly object _lock = new();
@@ -426,13 +444,30 @@ namespace Liminal.Net.Unity
                     int nextHead = (_head + 1) % _capacity;
                     if (nextHead == _tail)
                     {
-                        return false;
+                        //Dropping a connect or disconnect leaves the game out of sync for good, growing only allocates in a burst
+                        Grow();
+                        nextHead = (_head + 1) % _capacity;
                     }
 
                     _buffer[_head] = ev;
                     _head = nextHead;
                     return true;
                 }
+            }
+
+            private void Grow()
+            {
+                var next = new UnityNetworkEvent[_capacity * 2];
+                int count = 0;
+                for (int i = _tail; i != _head; i = (i + 1) % _capacity)
+                {
+                    next[count++] = _buffer[i];
+                }
+
+                _buffer = next;
+                _capacity = next.Length;
+                _tail = 0;
+                _head = count;
             }
 
             public bool TryDequeue(out UnityNetworkEvent ev)
@@ -456,7 +491,7 @@ namespace Liminal.Net.Unity
             {
                 lock (_lock)
                 {
-                    Array.Clear(_buffer, 0, _capacity);
+                    Array.Clear(_buffer, 0, _buffer.Length);
                     _head = 0;
                     _tail = 0;
                 }

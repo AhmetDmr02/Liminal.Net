@@ -38,6 +38,7 @@ namespace Liminal.Net.Core
 
         private volatile bool _sessionManagerDisposed;
         private int _isPolling;
+        private int _loopbackCount;
 
         private long _totalPacketsInbound;
         private long _totalPacketsOutbound;
@@ -406,8 +407,10 @@ namespace Liminal.Net.Core
 
             if (isLocalDestination)
             {
-                if (_loopbackQueue.Count >= _config.MaxPacketCount)
+                //Reserve first, a count check then enqueue lets every concurrent sender past the limit
+                if (Interlocked.Increment(ref _loopbackCount) > _config.MaxPacketCount)
                 {
+                    Interlocked.Decrement(ref _loopbackCount);
                     LiminalLogger.LogError("[SessionManager] Loopback queue overflow. Dropping packet.");
                     return;
                 }
@@ -431,7 +434,10 @@ namespace Liminal.Net.Core
                 finally
                 {
                     if (rentedBuffer != null)
+                    {
                         _privatePool.Return(rentedBuffer);
+                        Interlocked.Decrement(ref _loopbackCount);
+                    }
                 }
             }
 
@@ -813,6 +819,7 @@ namespace Liminal.Net.Core
                 while (!_loopbackQueue.IsEmpty &&
                        _loopbackQueue.TryDequeue(out var loopbackItem))
                 {
+                    Interlocked.Decrement(ref _loopbackCount);
                     var senderId = loopbackItem.SenderId;
                     var packet = loopbackItem.Packet;
 
@@ -1023,8 +1030,9 @@ namespace Liminal.Net.Core
 
         private void DisposeDisconnectedSession(LiminalSession session)
         {
-            ReleaseRecoveryForSession(session);
+            //Disposed first, after that no receive or send under the session locks can attach recovery buffers, so the release gets all of them
             session.Dispose();
+            ReleaseRecoveryForSession(session);
 
             while (session.InboundQueueUnreliable.TryDequeue(out var packet))
             {
@@ -1044,10 +1052,9 @@ namespace Liminal.Net.Core
 
         private void RaiseShutdown()
         {
-            if (disposed)
+            //Flush, Poll and Dispose can all get here at once from different threads
+            if (Interlocked.Exchange(ref _shutdownRaised, 1) != 0)
                 return;
-
-            disposed = true;
 
             _fragmentor.OnMessageReassembled -= HandleReliableMessage;
             _fragmentor.Dispose();
@@ -1058,7 +1065,10 @@ namespace Liminal.Net.Core
             _interpreter.OnSendRequest -= BufferPacket;
 
             while (_loopbackQueue.TryDequeue(out var loopbackItem))
+            {
+                Interlocked.Decrement(ref _loopbackCount);
                 ReturnPacketBuffer(loopbackItem.Packet);
+            }
 
             while (_pendingDisconnects.TryDequeue(out var pending))
             {
@@ -1080,13 +1090,10 @@ namespace Liminal.Net.Core
             _hiccup.Dispose();
         }
 
-        private bool disposed;
+        private int _shutdownRaised;
 
         public void Dispose()
         {
-            if (_sessionManagerDisposed)
-                return;
-
             _sessionManagerDisposed = true;
             RaiseShutdown();
         }

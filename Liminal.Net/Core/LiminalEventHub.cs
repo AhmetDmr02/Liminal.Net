@@ -8,8 +8,8 @@ namespace Liminal.Net.Core
     public class LiminalEventHub : ILiminalEventHub, IDisposable
     {
         private readonly ILiminalTransport _transport;
-        private LiminalSessionManager _sessionManager;
-        private DisconnectReasonCoordinator _disconnectCoordinator;
+        private volatile LiminalSessionManager _sessionManager;
+        private volatile DisconnectReasonCoordinator _disconnectCoordinator;
 
         private volatile bool _disposed;
 
@@ -175,7 +175,8 @@ namespace Liminal.Net.Core
         {
             if (_disposed) return;
 
-            _sessionManager?.HandleClientConnected(clientId);
+            var sessionManager = _sessionManager;
+            sessionManager?.HandleClientConnected(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onClientConnected, clientId);
         }
@@ -184,7 +185,8 @@ namespace Liminal.Net.Core
         {
             if (_disposed) return;
 
-            _sessionManager?.HandleLocalConnection(clientId);
+            var sessionManager = _sessionManager;
+            sessionManager?.HandleLocalConnection(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientConnected, clientId);
 
@@ -197,7 +199,8 @@ namespace Liminal.Net.Core
         {
             if (_disposed) return;
 
-            _sessionManager?.HandleClientDisconnected(clientId);
+            var sessionManager = _sessionManager;
+            sessionManager?.HandleClientDisconnected(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onClientDisconnected, clientId);
         }
@@ -208,17 +211,20 @@ namespace Liminal.Net.Core
 
             LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientDisconnected, clientId);
 
-            _sessionManager?.HandleClientDisconnected(clientId);
-            _sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
+            var sessionManager = _sessionManager;
+            sessionManager?.HandleClientDisconnected(clientId);
+            sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
 
             LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, clientId);
         }
 
         private void HandleTransportClientKicked(ushort clientId)
         {
-            if (_disposed || _sessionManager == null) return;
+            //Read once, teardown can unbind it between a null check and the call
+            var sessionManager = _sessionManager;
+            if (_disposed || sessionManager == null) return;
 
-            _sessionManager.HandleClientDisconnected(clientId);
+            sessionManager.HandleClientDisconnected(clientId);
 
             LiminalAtomicHelpers.SafeInvoke(_onClientKicked, clientId);
         }

@@ -168,6 +168,16 @@ namespace Liminal.Net.Core
             {
                 if (peer.IsTerminated || Volatile.Read(ref _disposed) != 0) return;
 
+                //Checked after the peer is published, transports remove the socket before raising the disconnect that cleans peers up
+                //so a peer made after that cleanup always sees the client gone here
+                if (!_transport.IsClientConnected(senderId))
+                {
+                    TerminatePeerLocked(peer);
+                    ((ICollection<KeyValuePair<ushort, PeerAssemblyState>>)_peers)
+                        .Remove(new KeyValuePair<ushort, PeerAssemblyState>(senderId, peer));
+                    return;
+                }
+
                 severReason = FindStaleAssemblyLocked(peer, now) ?? AddFragmentLocked(peer, fragmentSpan, now, out completed);
                 if (severReason != null)
                 {

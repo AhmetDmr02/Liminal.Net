@@ -9,8 +9,25 @@ namespace Liminal.Net.Core
         protected readonly LiminalNetworkConfig _config;
         public event Action OnTick;
 
-        protected volatile bool _isRunning;
+        private int _running;
+        protected bool _isRunning
+        {
+            get => Volatile.Read(ref _running) != 0;
+            set => Volatile.Write(ref _running, value ? 1 : 0);
+        }
+
+        public bool IsRunning => _isRunning;
+
+        protected bool TryMarkRunning() => Interlocked.CompareExchange(ref _running, 1, 0) == 0;
+
         private Thread _tickThread;
+
+        [ThreadStatic]
+        private static LiminalTicker _tickingOnThisThread;
+        private int _ticksInFlight;
+
+        //True inside OnTick on this thread, a teardown asked for from here cant wait for its own tick
+        internal bool IsTickingOnCurrentThread => ReferenceEquals(_tickingOnThisThread, this);
 
         protected long _nextTickTimestamp;
         public long NextTickTimestamp => Volatile.Read(ref _nextTickTimestamp);
@@ -18,6 +35,8 @@ namespace Liminal.Net.Core
         public long NominalTickTicks => Stopwatch.Frequency / _config.TickRate;
 
         protected long _slewAdjustmentTicks = 0;
+
+        private const int StopWaitMilliseconds = 500;
 
         public LiminalTicker(LiminalNetworkConfig config)
         {
@@ -44,18 +63,47 @@ namespace Liminal.Net.Core
 
             Volatile.Write(ref _nextTickTimestamp, nextTick);
 
-            OnTick?.Invoke();
+            InvokeTick();
         }
 
         protected void InvokeTick()
         {
-            OnTick?.Invoke();
+            var previous = _tickingOnThisThread;
+            _tickingOnThisThread = this;
+            Interlocked.Increment(ref _ticksInFlight);
+            try
+            {
+                OnTick?.Invoke();
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _ticksInFlight);
+                _tickingOnThisThread = previous;
+            }
+        }
+
+        //Teardown must not run under a tick still going on another thread
+        protected void WaitForTicksToFinish()
+        {
+            if (IsTickingOnCurrentThread)
+                return;
+
+            long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * StopWaitMilliseconds / 1000;
+            var spinner = new SpinWait();
+            while (Volatile.Read(ref _ticksInFlight) > 0)
+            {
+                if (Stopwatch.GetTimestamp() > deadline)
+                {
+                    LiminalLogger.LogWarning("[Ticker] A tick on another thread did not finish before Stop gave up waiting.");
+                    return;
+                }
+                spinner.SpinOnce();
+            }
         }
 
         public virtual void Start()
         {
-            if (_isRunning) return;
-            _isRunning = true;
+            if (!TryMarkRunning()) return;
 
             var thread = new Thread(RunLoop)
             {
@@ -69,19 +117,21 @@ namespace Liminal.Net.Core
 
         public virtual void Stop()
         {
-            if (!_isRunning) return;
             _isRunning = false;
 
             var thread = Volatile.Read(ref _tickThread);
 
             if (thread != null && thread != Thread.CurrentThread && thread.IsAlive)
             {
-                if (!thread.Join(500))
+                if (!thread.Join(StopWaitMilliseconds))
                 {
                     LiminalLogger.LogWarning("[Ticker] Tick thread did not stop gracefully!");
                 }
             }
             Interlocked.CompareExchange(ref _tickThread, null, thread);
+
+            //Manual TickOnce callers are not the tick thread, wait for them too
+            WaitForTicksToFinish();
         }
 
         protected virtual void RunLoop()
@@ -104,7 +154,7 @@ namespace Liminal.Net.Core
 
                     try
                     {
-                        OnTick?.Invoke();
+                        InvokeTick();
                     }
                     catch (Exception ex)
                     {

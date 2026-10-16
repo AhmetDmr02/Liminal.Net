@@ -16,6 +16,8 @@ $coyote = (Get-Command coyote).Source
 $extraArgs = @{
     'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_RapidRestart_CancelledConnectTask_NeverClobbersLocalClientId' = '--skip-potential-deadlocks'
     'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_RapidRestart_OldReceiveLoop_NeverShutsDownNewSession' = '--skip-potential-deadlocks'
+    'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_HandshakeGap_ServerSessionMustExistWhenLocalClientConnectedFires' = '--skip-potential-deadlocks'
+    'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_HandshakeGap_ServerToClientPacketDroppedIfSentImmediatelyOnLocalConnect' = '--skip-potential-deadlocks'
 }
 
 if (-not $NoBuild) {

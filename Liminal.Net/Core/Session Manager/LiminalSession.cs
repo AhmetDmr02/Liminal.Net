@@ -142,13 +142,7 @@ namespace Liminal.Net.Core
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
 
-            if (Recovery.AnyActive)
-            {
-                LiminalLogger.LogWarning(
-                    $"[Hiccup] Session {Id} disposed while recovery resources were still attached. " +
-                    "SessionManager should release recovery resources first.");
-            }
-
+            //Recovery buffers are pooled, SessionManager releases them after this so none can attach late
             lock (SendLock)
             {
                 RawSendBufferReliable.ManualDispose();

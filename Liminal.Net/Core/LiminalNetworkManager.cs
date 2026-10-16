@@ -268,7 +268,8 @@ namespace Liminal.Net.Core
 
         private void HandleTransportShutdown()
         {
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return;
+            try
             {
                 if (Volatile.Read(ref _isDisconnecting) != 0) return;
                 if (Volatile.Read(ref _isShuttingDown) != 0) return;
@@ -277,19 +278,32 @@ namespace Liminal.Net.Core
                 TeardownSession();
                 CompleteRequestedShutdownLocked();
             }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
+            }
         }
 
+        //Transport thread, decided under the lock teardown and shutdown hold so a connect landing during or after them cant bring the state back
         private void HandlePreLocalClientConnected(ushort clientId)
         {
-            if (Role == NetworkRole.Client)
+            if (!TryEnterTeardownLock()) return;
+            try
             {
-                LifecycleState = NetworkLifecycleState.Connected;
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                if (Volatile.Read(ref _isDisconnecting) != 0 || Volatile.Read(ref _isTearingDown) != 0 || Volatile.Read(ref _isShuttingDown) != 0)
+                    return;
+
+                NetworkLifecycleState next;
+                if (Role == NetworkRole.Client) next = NetworkLifecycleState.Connected;
+                else if (Role == NetworkRole.Host) next = NetworkLifecycleState.HostActive;
+                else return;
+
+                LifecycleState = next;
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, next);
             }
-            else if (Role == NetworkRole.Host)
+            finally
             {
-                LifecycleState = NetworkLifecycleState.HostActive;
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                Monitor.Exit(_teardownLock);
             }
         }
 
@@ -300,7 +314,8 @@ namespace Liminal.Net.Core
 
         private void HandlePreLocalClientDisconnected(ushort clientId)
         {
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return;
+            try
             {
                 if (Volatile.Read(ref _isDisconnecting) != 0 || Volatile.Read(ref _isShuttingDown) != 0)
                     return;
@@ -310,6 +325,10 @@ namespace Liminal.Net.Core
                     LifecycleState = NetworkLifecycleState.Stopping;
                     LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
                 }
+            }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
             }
         }
 
@@ -402,7 +421,8 @@ namespace Liminal.Net.Core
 
         public bool StartHost(string host, int port)
         {
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return false;
+            try
             {
                 if (Volatile.Read(ref _isShutDown) != 0)
                 {
@@ -461,6 +481,10 @@ namespace Liminal.Net.Core
                     throw;
                 }
             }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
+            }
         }
 
         public bool StartServer() => StartServer(_config.Default_Host, _config.Default_Port);
@@ -469,7 +493,8 @@ namespace Liminal.Net.Core
 
         public bool StartServer(string ip, int port)
         {
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return false;
+            try
             {
                 if (Volatile.Read(ref _isShutDown) != 0)
                 {
@@ -515,6 +540,10 @@ namespace Liminal.Net.Core
                     throw;
                 }
             }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
+            }
         }
 
         public bool StartClient() => StartClient(_config.Default_Host, _config.Default_Port);
@@ -525,7 +554,8 @@ namespace Liminal.Net.Core
 
         public bool StartClient(string ip, int port)
         {
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return false;
+            try
             {
                 if (Volatile.Read(ref _isShutDown) != 0)
                 {
@@ -565,9 +595,32 @@ namespace Liminal.Net.Core
                     throw;
                 }
             }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
+            }
         }
 
         private readonly object _teardownLock = new();
+
+        //A teardown holding this lock stops the ticker and waits for its tick, a tick blocked here would stall that wait
+        //so on the tick thread give up once the ticker is being stopped, the teardown in progress covers what was asked
+        private bool TryEnterTeardownLock()
+        {
+            var ticker = _ticker;
+            if (ticker == null || !ticker.IsTickingOnCurrentThread)
+            {
+                Monitor.Enter(_teardownLock);
+                return true;
+            }
+
+            while (!Monitor.TryEnter(_teardownLock, 1))
+            {
+                if (!ticker.IsRunning)
+                    return false;
+            }
+            return true;
+        }
         private int _isDisconnecting;
         private int _isTearingDown;
         private int _isShuttingDown;
@@ -577,7 +630,8 @@ namespace Liminal.Net.Core
 
         public void Disconnect()
         {
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return;
+            try
             {
                 if (LifecycleState == NetworkLifecycleState.Stopping) return;
                 if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
@@ -606,6 +660,10 @@ namespace Liminal.Net.Core
                 }
 
                 CompleteRequestedShutdownLocked();
+            }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
             }
         }
 
@@ -682,7 +740,8 @@ namespace Liminal.Net.Core
         {
             //Final from here on even if it cant run yet, so Start* refuses and the running teardown finishes it
             Volatile.Write(ref _isShutDown, 1);
-            lock (_teardownLock)
+            if (!TryEnterTeardownLock()) return;
+            try
             {
                 //All of these are only set while _teardownLock is held, seeing one here means this thread is inside that teardown
                 if (Volatile.Read(ref _isDisconnecting) != 0) return;
@@ -690,6 +749,10 @@ namespace Liminal.Net.Core
                 if (Volatile.Read(ref _isShuttingDown) != 0) return;
 
                 CompleteRequestedShutdownLocked();
+            }
+            finally
+            {
+                Monitor.Exit(_teardownLock);
             }
         }
 

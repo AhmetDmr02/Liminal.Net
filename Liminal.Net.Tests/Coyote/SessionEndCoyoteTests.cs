@@ -150,6 +150,26 @@ namespace Liminal.Net.Tests.Coyote
             AssertShutDown(manager, states);
         }
 
+        //Transport reports the connection while the game shuts down, a connect landing during or after the shutdown must not bring the state back
+        [Test]
+        public static async Task Coyote_ConnectedEvent_VsShutdown_StateNeverComesBack()
+        {
+            Exception failure = null;
+            var manager = CreateClient(out var transport);
+            var states = RecordStates(manager);
+            Specification.Assert(manager.StartClient("127.0.0.1", 7777), "Precondition: the start should succeed.");
+
+            var connected = RunCapturing(() => transport.TriggerLocalClientConnected(transport.LocalClientId), ex => failure = ex);
+            var shutdown = RunCapturing(() => manager.Shutdown(), ex => failure = ex);
+            await Task.WhenAll(connected, shutdown);
+
+            Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            var seen = states.ToArray();
+            int lastStopped = Array.LastIndexOf(seen, NetworkLifecycleState.Stopped);
+            Specification.Assert(lastStopped == seen.Length - 1, $"Something was raised after the shutdown finished: {string.Join(", ", seen)}");
+            AssertShutDown(manager, states);
+        }
+
         //A grant the tick thread is still dispatching from the ended session must not survive into the next one
         [Test]
         public static async Task Coyote_LateGrantVsSessionEnd_NoAuthorityInNextSession()

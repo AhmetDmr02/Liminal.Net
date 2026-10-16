@@ -197,8 +197,15 @@ namespace Liminal.Net.Tests.Coyote
         [CoyoteTest]
         public static async Task Coyote_HandshakeGap_ServerToClientPacketDroppedIfSentImmediatelyOnLocalConnect()
         {
-            var server = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
-            var client = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
+            //Same as above, the IO deadline watchdog's real Timer crashes Coyote's lock tracking and deadlines arent what this tests
+            var serverConfig = CreateConfig();
+            serverConfig.SendResponseTimeout = 0;
+            serverConfig.ReceiveResponseTimeout = 0;
+            var clientConfig = CreateConfig();
+            clientConfig.SendResponseTimeout = 0;
+            clientConfig.ReceiveResponseTimeout = 0;
+            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
 
             server.StartServer("127.0.0.1", 0);
             int port = server.BoundPort;

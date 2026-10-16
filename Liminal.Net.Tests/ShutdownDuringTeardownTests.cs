@@ -28,6 +28,32 @@ namespace Liminal.Net.Tests
             Assert.That(manager.LifecycleState, Is.EqualTo(NetworkLifecycleState.Stopped));
         }
 
+        //Transport reports the connection while the shutdown is running, the shutdown owns the state and it must end Stopped
+        [Test]
+        public void ConnectedEvent_DuringShutdown_DoesNotBringStateBack()
+        {
+            var config = new LiminalNetworkConfig { TickRate = 60, ClientIdResolver = new BaseResolver() };
+            var transport = new MockTransport { IsServer = false };
+            var manager = new LiminalNetworkManager(transport, config, customTicker: new LiminalUnityTicker(config));
+            Assert.That(manager.StartClient("127.0.0.1", 7777), Is.True);
+
+            var states = new System.Collections.Generic.List<NetworkLifecycleState>();
+            manager.OnLifecycleStateChanged += state =>
+            {
+                states.Add(state);
+                if (state == NetworkLifecycleState.Stopping) transport.TriggerLocalClientConnected(transport.LocalClientId);
+            };
+            try
+            {
+                manager.Shutdown();
+
+                Assert.That(states, Is.EqualTo(new[] { NetworkLifecycleState.Stopping, NetworkLifecycleState.Stopped }),
+                    $"A connect during the shutdown changed the lifecycle: {string.Join(", ", states)}");
+                AssertShutDown(manager);
+            }
+            finally { manager.Shutdown(); }
+        }
+
         //Connection dropped, the transport has not finished tearing down yet, the game shuts down in that gap
         [Test]
         public void Shutdown_BetweenConnectionDropAndTransportTeardown_IsNotIgnored()

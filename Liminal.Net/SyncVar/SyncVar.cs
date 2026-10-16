@@ -76,7 +76,7 @@ namespace Liminal.Net.SyncVar
         object VisibilityLock { get; }
         void FirePendingEvents();
         void InternalTeardown();
-        void ResetSession(bool clearRemoteAuthority);
+        void ResetSession();
     }
 
     public enum ClientWriteResult
@@ -1190,7 +1190,7 @@ namespace Liminal.Net.SyncVar
 
         void ISyncVarInternal.InternalTeardown() => InternalTeardown();
 
-        internal void ResetSession(bool clearRemoteAuthority)
+        internal void ResetSession()
         {
             lock (_writeLock)
             {
@@ -1198,11 +1198,7 @@ namespace Liminal.Net.SyncVar
                 _joinedByAdoption = true;
                 _localSlot = ushort.MaxValue;
                 SetLocallyVisibleDeferred(false);
-                _permissions.ClearPendingAuth();
-                if (clearRemoteAuthority)
-                {
-                    _permissions.ClearRemoteAuthorities();
-                }
+                _permissions.ClearSessionClientIds();
                 _valueCell.ResetSessionState();
                 _wireBuffer.Clear();
                 _wireBuffer.UpdateSlab(null);
@@ -1210,7 +1206,7 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        void ISyncVarInternal.ResetSession(bool clearRemoteAuthority) => ResetSession(clearRemoteAuthority);
+        void ISyncVarInternal.ResetSession() => ResetSession();
 
         private void BroadcastAuthIfServer(ushort[] next)
         {

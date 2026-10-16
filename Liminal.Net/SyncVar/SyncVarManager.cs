@@ -86,6 +86,7 @@ namespace Liminal.Net.SyncVar
         private readonly LockFreeSlotBitset _slotBitset;
         private readonly ISyncVarInternal[] _localRegistry;
         private readonly ConcurrentDictionary<string, ConcurrentDictionary<ushort, byte>> _pendingClearAcks = new();
+        private readonly ConcurrentQueue<ushort> _pendingJoinSnapshots = new();
         private readonly List<ISyncVarInternal> _reusableDirtyList = new(64);
         private readonly List<SyncVarVisibilityState> _reusableStateList = new(64);
         private readonly List<ISyncVarInternal> _clientAuthorizedList = new(64);
@@ -166,7 +167,6 @@ namespace Liminal.Net.SyncVar
         public void DetachFromManager()
         {
             if (_attachedManager == null) return;
-            bool clientSession = _attachedManager.Role == NetworkRole.Client;
 
             try
             {
@@ -181,7 +181,7 @@ namespace Liminal.Net.SyncVar
 
             //Null before the reset takes _unboundLock, ApplyRemoteAuth checks it under that lock so a late packet cant regrant after the reset
             _attachedManager = null;
-            ResetSessionState(clientSession);
+            ResetSessionState();
         }
 
         public void Reattach(LiminalNetworkManager manager)
@@ -209,6 +209,7 @@ namespace Liminal.Net.SyncVar
             _unboundOrder.Clear();
             _unboundAuth.Clear();
             _pendingClearAcks.Clear();
+            _pendingJoinSnapshots.Clear();
 
             _tokenRegistry.GetAll(allVars);
             for (int i = 0; i < allVars.Count; i++)
@@ -217,10 +218,7 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void ResetSessionState() => ResetSessionState(_attachedManager?.Role == NetworkRole.Client);
-
-        //Client authority came from the ended session's server, server and host authority is their own and stays
-        private void ResetSessionState(bool clientSession)
+        public void ResetSessionState()
         {
             var allVars = new List<ISyncVarInternal>();
             lock (_unboundLock)
@@ -229,7 +227,7 @@ namespace Liminal.Net.SyncVar
 
                 for (int i = 0; i < allVars.Count; i++)
                 {
-                    allVars[i].ResetSession(clientSession);
+                    allVars[i].ResetSession();
                 }
 
                 for (int i = 0; i < _localRegistry.Length; i++)
@@ -880,6 +878,11 @@ namespace Liminal.Net.SyncVar
 
             try
             {
+                if (netManager.Role != NetworkRole.Client)
+                {
+                    SendPendingJoinSnapshots(netManager);
+                }
+
                 _reusableDirtyList.Clear();
                 _reusableStateList.Clear();
 
@@ -1361,36 +1364,70 @@ namespace Liminal.Net.SyncVar
             ApplyRemoteAuth(packet.Token, packet.AuthIds);
         }
 
+        //Runs on the transport thread, the snapshot itself is built by FlushDirty on the tick
+        //built here it could go out after a newer delta the tick already sent and the client applies snapshots with force
         private void HandleClientConnected(ushort clientId)
         {
             var netManager = _attachedManager;
             if (netManager == null || netManager.Role == NetworkRole.Client) return;
 
+            _pendingJoinSnapshots.Enqueue(clientId);
+        }
+
+        //Tick thread only, under _lifecycleGate and before this tick's deltas so a snapshot is never older than a delta already sent
+        private void SendPendingJoinSnapshots(LiminalNetworkManager netManager)
+        {
+            if (_pendingJoinSnapshots.IsEmpty) return;
+
             var allVars = new List<ISyncVarInternal>();
             _tokenRegistry.GetAll(allVars);
 
-            var entries = new List<SyncVarSnapshotEntry>(allVars.Count);
-            for (int i = 0; i < allVars.Count; i++)
+            while (_pendingJoinSnapshots.TryDequeue(out ushort clientId))
             {
-                var syncVar = allVars[i];
-                if (!syncVar.IsVisibleTo(clientId)) continue;
-
-                if (!syncVar.TryExtractSnapshotData(out byte[] data, out uint version))
+                bool isHostSelf = netManager.Role == NetworkRole.Host && clientId == netManager.localID;
+                if (!isHostSelf && netManager.SessionManager != null && !netManager.SessionManager.HasSession(clientId))
                     continue;
 
-                entries.Add(new SyncVarSnapshotEntry
+                //Same slot ordered visibility locks the batch flush takes, an exclusion racing this lands fully before or after the send
+                int locked = 0;
+                try
                 {
-                    Token = syncVar.Token,
-                    Version = version,
-                    AuthIds = syncVar.AuthIds,
-                    Data = data
-                });
-            }
+                    for (; locked < allVars.Count; locked++)
+                    {
+                        Monitor.Enter(allVars[locked].VisibilityLock);
+                    }
 
-            netManager.Interpreter.SendCommand(clientId, new SyncVarSnapshotPacket
-            {
-                Entries = entries
-            });
+                    var entries = new List<SyncVarSnapshotEntry>(allVars.Count);
+                    for (int i = 0; i < allVars.Count; i++)
+                    {
+                        var syncVar = allVars[i];
+                        if (!syncVar.IsVisibleTo(clientId)) continue;
+
+                        if (!syncVar.TryExtractSnapshotData(out byte[] data, out uint version))
+                            continue;
+
+                        entries.Add(new SyncVarSnapshotEntry
+                        {
+                            Token = syncVar.Token,
+                            Version = version,
+                            AuthIds = syncVar.AuthIds,
+                            Data = data
+                        });
+                    }
+
+                    netManager.Interpreter.SendCommand(clientId, new SyncVarSnapshotPacket
+                    {
+                        Entries = entries
+                    });
+                }
+                finally
+                {
+                    for (int i = 0; i < locked; i++)
+                    {
+                        Monitor.Exit(allVars[i].VisibilityLock);
+                    }
+                }
+            }
         }
 
         private void HandleSnapshot(SyncVarSnapshotPacket packet, ushort senderId)

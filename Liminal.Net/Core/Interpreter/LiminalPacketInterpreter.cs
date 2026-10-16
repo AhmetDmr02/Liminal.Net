@@ -1,4 +1,5 @@
 using Liminal.Net.Interfaces;
+using Liminal.Net.Misc;
 using MessagePack;
 using System;
 using System.Buffers;
@@ -1720,8 +1721,19 @@ namespace Liminal.Net.Core
 
         #region Dispatch
 
+        private Action _beforeDispatch;
+
+        //Runs on the dispatching thread before every packet, lets a deferred event queue deliver what was raised before this packet arrived
+        internal event Action BeforeDispatch
+        {
+            add => LiminalAtomicHelpers.SafeAdd(ref _beforeDispatch, value);
+            remove => LiminalAtomicHelpers.SafeRemove(ref _beforeDispatch, value);
+        }
+
         public void Dispatch(ushort packetId, ushort sender, ReadOnlyMemory<byte> rawData)
         {
+            Volatile.Read(ref _beforeDispatch)?.Invoke();
+
             bool isSticky = LiminalPacketLibrary.IsSticky(packetId);
             if (isSticky)
             {

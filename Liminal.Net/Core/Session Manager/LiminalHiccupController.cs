@@ -22,7 +22,7 @@ namespace Liminal.Net.Core
         private readonly LiminalInboundRecoveryPool _inboundPool;
         private readonly LiminalOutboundRecoveryPool _outboundPool;
         private int _activeRecoverySessions;
-        private bool _disposed;
+        private int _disposed;
 
         internal event Action<ServerStarvationEvent> OnServerStarvation;
 
@@ -273,8 +273,7 @@ namespace Liminal.Net.Core
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
             _inboundPool.Dispose();
             _outboundPool.Dispose();
         }

@@ -8,7 +8,6 @@ namespace Liminal.Net.Unity
     public class LiminalUnityTicker : LiminalTicker
     {
         public int MaxTicksPerFrame { get; set; } = 5;
-        public bool IsRunning => _isRunning;
 
         public LiminalUnityTicker(LiminalNetworkConfig config) : base(config)
         {
@@ -16,8 +15,7 @@ namespace Liminal.Net.Unity
 
         public override void Start()
         {
-            if (_isRunning) return;
-            _isRunning = true;
+            if (!TryMarkRunning()) return;
             _nextTickTimestamp = Stopwatch.GetTimestamp() + NominalTickTicks;
         }
 
@@ -26,6 +24,9 @@ namespace Liminal.Net.Unity
             _isRunning = false;
             _nextTickTimestamp = 0;
             Interlocked.Exchange(ref _slewAdjustmentTicks, 0);
+
+            //Teardown from a transport thread must not overlap a tick still running on the main thread
+            WaitForTicksToFinish();
         }
 
         public int TickUpdate()

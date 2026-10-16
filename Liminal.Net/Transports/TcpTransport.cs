@@ -40,6 +40,10 @@ namespace Liminal.Net.Transports
         public EndPoint? LocalEndpoint => _listener?.LocalEndpoint;
         private CancellationTokenSource _clientConnectCts;
 
+        //Local end of our own client connection, in host mode the accepted socket with this remote end is our own client
+        private EndPoint _pendingLocalEndpoint;
+        private LocalAnnouncement _localAnnouncement;
+
         public ServerHandshakeOrchestrator<TcpClient> ServerHandshaker { get; set; } = DefaultHandshakes.ServerTcpHandshake;
         public ClientHandshakeOrchestrator<TcpClient> ClientHandshaker { get; set; } = DefaultHandshakes.ClientTcpHandshake;
 
@@ -229,6 +233,7 @@ namespace Liminal.Net.Transports
                     _clientConnectCts?.Dispose();
                     _clientConnectCts = new CancellationTokenSource();
                     token = _clientConnectCts.Token;
+                    _pendingLocalEndpoint = null;
                 }
 
                 string targetIp = ip;
@@ -284,6 +289,7 @@ namespace Liminal.Net.Transports
             {
                 ushort disconnectedId;
                 bool wasConnected;
+                LocalAnnouncement announcement;
 
                 //Claimed before anything wakes the reader, under the lock its lost connection check uses
                 //so the reader stays quiet and this is the only shutdown, finished before Disconnect returns
@@ -297,11 +303,13 @@ namespace Liminal.Net.Transports
                     disconnectedId = _localClientId;
                     wasConnected = _isConnected;
                     _isConnected = false;
+                    announcement = _localAnnouncement;
+                    _localAnnouncement = null;
+                    _clientConnectCts?.Cancel();
                 }
 
-                _clientConnectCts?.Cancel();
-
-                if (wasConnected)
+                bool raiseDisconnected = announcement != null ? announcement.TryHandOffDisconnect() : wasConnected;
+                if (raiseDisconnected)
                 {
                     _onLocalClientDisconnected?.Invoke(disconnectedId);
                 }
@@ -314,7 +322,10 @@ namespace Liminal.Net.Transports
             Shutdown();
         }
 
-        public virtual void Kick(ushort clientId)
+        public virtual void Kick(ushort clientId) => KickConnection(clientId, null);
+
+        //expected set means only that socket may be kicked, a late failure of a replaced connection must not kick the new one
+        internal void KickConnection(ushort clientId, TcpClient expected)
         {
             if (!_isServer)
                 return;
@@ -332,12 +343,24 @@ namespace Liminal.Net.Transports
                 return;
             }
 
-            if (_sockets.TryGetValue(clientId, out var clientSocket))
+            if (!_sockets.TryGetValue(clientId, out var clientSocket) || (expected != null && !ReferenceEquals(clientSocket, expected)))
+            {
+                if (expected == null)
+                    LiminalLogger.LogError($"[Transport] Couldn't find socket for client {clientId}");
+                return;
+            }
+
+            //Removing it is the claim, a racing kick or the reader finds it gone and leaves the events to us
+            if (!((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(clientId, clientSocket)))
+                return;
+
+            try
             {
                 _onClientKicked?.Invoke(clientId);
+            }
+            finally
+            {
                 try { clientSocket.Close(); } catch { }
-
-                bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(clientId, clientSocket));
 
                 if (_sendQueues.TryGetValue(clientId, out var sendState))
                 {
@@ -348,7 +371,7 @@ namespace Liminal.Net.Transports
                     TeardownSendQueue(clientId);
                 }
 
-                if (removed && TryClaimDisconnect(clientSocket))
+                if (TryClaimDisconnect(clientSocket))
                 {
                     Interlocked.Decrement(ref _totalConnections);
                     _onClientDisconnected?.Invoke(clientId);
@@ -356,10 +379,6 @@ namespace Liminal.Net.Transports
                 }
 
                 LiminalLogger.Log($"[Transport] Kicked client {clientId}.");
-            }
-            else
-            {
-                LiminalLogger.LogError($"[Transport] Couldn't find socket for client {clientId}");
             }
         }
 
@@ -423,6 +442,9 @@ namespace Liminal.Net.Transports
                     _isServer = false;
                     _isClient = false;
                     _localClientId = 0;
+                    _pendingLocalEndpoint = null;
+                    _localAnnouncement?.TryCancelPending();
+                    _localAnnouncement = null;
 
                     foreach (var id in _sockets.Keys)
                     {
@@ -552,11 +574,7 @@ namespace Liminal.Net.Transports
                 if (!queued)
                 {
                     _sendBytePool.Return(rentedBuffer);
-
-                    if (IsServer)
-                        Kick(targetId);
-                    else
-                        Shutdown();
+                    FailConnection(targetId, sendState);
                 }
             }
         }
@@ -597,7 +615,7 @@ namespace Liminal.Net.Transports
                                     LiminalLogger.LogWarning($"[Transport] Send timed out on client {clientId} (exceeded {timeoutSeconds}s).");
                                     OnTransportDisconnectReason?.Invoke(clientId, DisconnectReason.Timeout, $"Send timed out ({timeoutSeconds}s).");
 
-                                    if (IsServer) Kick(clientId);
+                                    if (IsServer) KickConnection(clientId, client);
                                     else ShutdownIfCurrent(client);
                                     return;
                                 }
@@ -640,7 +658,7 @@ namespace Liminal.Net.Transports
                             LiminalLogger.LogWarning($"[Transport] Send flush timed out on client {clientId} (exceeded {timeoutSeconds}s).");
                             OnTransportDisconnectReason?.Invoke(clientId, DisconnectReason.Timeout, $"Send flush timed out ({timeoutSeconds}s).");
 
-                            if (IsServer) Kick(clientId);
+                            if (IsServer) KickConnection(clientId, client);
                             else ShutdownIfCurrent(client);
                             return;
                         }
@@ -662,7 +680,7 @@ namespace Liminal.Net.Transports
                 if (IsServer)
                 {
                     if (IsCurrentConnection(clientId, client, state))
-                        Kick(clientId);
+                        KickConnection(clientId, client);
                 }
                 else ShutdownIfCurrent(client);
             }
@@ -673,7 +691,7 @@ namespace Liminal.Net.Transports
                 if (IsServer)
                 {
                     if (IsCurrentConnection(clientId, client, state))
-                        Kick(clientId);
+                        KickConnection(clientId, client);
                 }
                 else ShutdownIfCurrent(client);
             }
@@ -706,6 +724,14 @@ namespace Liminal.Net.Transports
                 {
                     try { client.Close(); } catch { }
                     return;
+                }
+
+                lock (_connectionLifecycleLock)
+                {
+                    if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                    {
+                        _pendingLocalEndpoint = client.Client.LocalEndPoint;
+                    }
                 }
 
                 _onHandshakeInitialized?.Invoke();
@@ -849,14 +875,8 @@ namespace Liminal.Net.Transports
                                 }
                                 if (promoted && assignedClientId != 0)
                                 {
-                                    if (_sockets.TryGetValue(assignedClientId, out var cur) && ReferenceEquals(cur, acceptedClient))
-                                    {
-                                        Kick(assignedClientId);
-                                    }
-                                    else
-                                    {
-                                        try { acceptedClient.Close(); } catch { }
-                                    }
+                                    KickConnection(assignedClientId, acceptedClient);
+                                    try { acceptedClient.Close(); } catch { }
                                 }
                                 else
                                 {
@@ -869,14 +889,8 @@ namespace Liminal.Net.Transports
                             LiminalLogger.LogError($"[Transport] Handshake error: {ex.Message}");
                             if (promoted && assignedClientId != 0)
                             {
-                                if (_sockets.TryGetValue(assignedClientId, out var cur) && ReferenceEquals(cur, acceptedClient))
-                                {
-                                    Kick(assignedClientId);
-                                }
-                                else
-                                {
-                                    try { acceptedClient.Close(); } catch { }
-                                }
+                                KickConnection(assignedClientId, acceptedClient);
+                                try { acceptedClient.Close(); } catch { }
                             }
                             else
                             {
@@ -955,6 +969,12 @@ namespace Liminal.Net.Transports
                 });
 
                 _clientIdResolver.ConfirmRegistration(clientId);
+
+                //Our own client only learns its id after ReadyConfirmed, server side handlers run before that and must already see it as local
+                if (_isClient && _localClientId == 0 && IsOwnClientConnection(client))
+                {
+                    _localClientId = clientId;
+                }
             }
 
             if (oldSendState != null)
@@ -981,14 +1001,8 @@ namespace Liminal.Net.Transports
             catch (Exception ex)
             {
                 LiminalLogger.LogError($"[Transport] Error during OnClientConnected for {clientId}: {ex.Message}");
-                if (_sockets.TryGetValue(clientId, out var cur) && ReferenceEquals(cur, client))
-                {
-                    Kick(clientId);
-                }
-                else
-                {
-                    try { client.Close(); } catch { }
-                }
+                KickConnection(clientId, client);
+                try { client.Close(); } catch { }
                 sendState = null;
                 return;
             }
@@ -1019,6 +1033,7 @@ namespace Liminal.Net.Transports
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
 
             ClientSendState sendState;
+            LocalAnnouncement announcement;
             lock (_connectionLifecycleLock)
             {
                 if (_isShuttingDown != 0 || !_isClient)
@@ -1032,7 +1047,14 @@ namespace Liminal.Net.Transports
                 _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
                 _sockets[ILiminalTransport.SERVER_ID] = client;
                 _isConnected = true;
+                announcement = new LocalAnnouncement();
+                _localAnnouncement = announcement;
             }
+
+            //A Disconnect or Shutdown that got in after the lock cancelled it, Connected must not follow their Disconnected
+            if (!announcement.TryBegin())
+                return;
+
             try
             {
                 _onLocalClientConnected?.Invoke(assignedId);
@@ -1040,7 +1062,17 @@ namespace Liminal.Net.Transports
             catch (Exception ex)
             {
                 LiminalLogger.LogError($"[Transport] Error during OnLocalClientConnected: {ex.Message}");
-                Disconnect();
+                if (announcement.TryComplete())
+                    Disconnect();
+                else
+                    _onLocalClientDisconnected?.Invoke(assignedId);
+                return;
+            }
+
+            //Disconnect came in while Connected handlers ran, it left Disconnected to us so it comes after them
+            if (!announcement.TryComplete())
+            {
+                _onLocalClientDisconnected?.Invoke(assignedId);
                 return;
             }
 
@@ -1059,6 +1091,41 @@ namespace Liminal.Net.Transports
                    ReferenceEquals(currentClient, client) &&
                    _sendQueues.TryGetValue(clientId, out var currentSendState) &&
                    ReferenceEquals(currentSendState, sendState);
+        }
+
+        //Ends the connection that owns sendState, a replaced one is left alone
+        private void FailConnection(ushort clientId, ClientSendState sendState)
+        {
+            if (!_sockets.TryGetValue(clientId, out var client) || !IsCurrentConnection(clientId, client, sendState))
+                return;
+
+            if (IsServer) KickConnection(clientId, client);
+            else ShutdownIfCurrent(client);
+        }
+
+        private static bool IsSameEndpoint(EndPoint a, EndPoint b)
+        {
+            if (!(a is IPEndPoint x) || !(b is IPEndPoint y) || x.Port != y.Port)
+                return false;
+
+            var ax = x.Address.IsIPv4MappedToIPv6 ? x.Address.MapToIPv4() : x.Address;
+            var ay = y.Address.IsIPv4MappedToIPv6 ? y.Address.MapToIPv4() : y.Address;
+            return ax.Equals(ay);
+        }
+
+        private bool IsOwnClientConnection(TcpClient accepted)
+        {
+            var local = _pendingLocalEndpoint;
+            if (local == null) return false;
+
+            try
+            {
+                return IsSameEndpoint(accepted.Client.RemoteEndPoint, local);
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or SocketException)
+            {
+                return false;
+            }
         }
 
         private async Task ReceiveLoop(ushort incomingId, TcpClient client, ClientSendState ownedSendState)
@@ -1086,7 +1153,7 @@ namespace Liminal.Net.Transports
                     {
                         LiminalLogger.LogError($"[Transport] Buffer overflow on {incomingId}");
                         OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.InboundQueueOverflow, "Ingest buffer overflow.");
-                        Kick(incomingId);
+                        KickConnection(incomingId, client);
                         return;
                     }
 
@@ -1107,7 +1174,7 @@ namespace Liminal.Net.Transports
                             {
                                 LiminalLogger.LogWarning($"[Transport] Client {incomingId} timed out (exceeded {timeoutSeconds}s).");
                                 OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.Timeout, $"Receive timeout exceeded ({timeoutSeconds}s).");
-                                Kick(incomingId);
+                                KickConnection(incomingId, client);
                                 return;
                             }
                             throw;
@@ -1128,7 +1195,7 @@ namespace Liminal.Net.Transports
                         Interlocked.Add(ref _totalBytesInbound, read);
 
                     bytesInBuffer += read;
-                    ProcessIngestBufferSynchronous(incomingId, ingestBuffer, ref bytesInBuffer);
+                    ProcessIngestBufferSynchronous(incomingId, client, ingestBuffer, ref bytesInBuffer);
 
                     if (!IsClientConnected(incomingId) && incomingId != ILiminalTransport.SERVER_ID)
                         break;
@@ -1178,6 +1245,7 @@ namespace Liminal.Net.Transports
                     {
                         bool isCurrent = false;
                         ushort disconnectedId = 0;
+                        LocalAnnouncement announcement = null;
 
                         lock (_connectionLifecycleLock)
                         {
@@ -1189,13 +1257,18 @@ namespace Liminal.Net.Transports
                                 disconnectedId = _localClientId;
                                 _isConnected = false;
                                 isCurrent = true;
+                                announcement = _localAnnouncement;
+                                _localAnnouncement = null;
                             }
                         }
 
                         if (isCurrent)
                         {
                             LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
-                            _onLocalClientDisconnected?.Invoke(disconnectedId);
+                            if (announcement == null || announcement.TryHandOffDisconnect())
+                            {
+                                _onLocalClientDisconnected?.Invoke(disconnectedId);
+                            }
                             Shutdown();
                         }
                     }
@@ -1205,7 +1278,7 @@ namespace Liminal.Net.Transports
             }
         }
 
-        private void ProcessIngestBufferSynchronous(ushort incomingId, LiminalNativeBuffer ingestBuffer, ref int bytesInBuffer)
+        private void ProcessIngestBufferSynchronous(ushort incomingId, TcpClient client, LiminalNativeBuffer ingestBuffer, ref int bytesInBuffer)
         {
             Span<byte> bufferSpan = ingestBuffer.GetSpan();
             int offset = 0;
@@ -1222,7 +1295,7 @@ namespace Liminal.Net.Transports
                 {
                     LiminalLogger.LogError($"[Transport] Malformed frame header received from {incomingId}. Kicking connection.");
                     OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.ProtocolViolation, "Malformed transport frame header.");
-                    Kick(incomingId);
+                    KickConnection(incomingId, client);
                     return;
                 }
 
@@ -1230,7 +1303,7 @@ namespace Liminal.Net.Transports
                 {
                     LiminalLogger.LogError($"[Transport] Invalid payload size {payloadLength}b on client {incomingId}");
                     OnTransportDisconnectReason?.Invoke(incomingId, DisconnectReason.InvalidPacketSize, $"Payload length {payloadLength}b outside allowed bounds.");
-                    Kick(incomingId);
+                    KickConnection(incomingId, client);
                     return;
                 }
 
@@ -1424,6 +1497,46 @@ namespace Liminal.Net.Transports
             Volatile.Write(ref _serverCountdownSnapshot, new ServerCountdownSnapshot(adjustedCountdown, now));
         }
         #endregion
+
+        //Orders the local Connected and Disconnected events without anyone waiting on the other's handlers
+        private sealed class LocalAnnouncement
+        {
+            private const int Pending = 0;
+            private const int Announcing = 1;
+            private const int Announced = 2;
+            private const int Cancelled = 3;
+            private const int DisconnectedWhileAnnouncing = 4;
+            private const int Closed = 5;
+
+            private int _state;
+
+            public bool TryBegin() => Interlocked.CompareExchange(ref _state, Announcing, Pending) == Pending;
+
+            //False when a disconnect came in during the Connected handlers, the announcer raises Disconnected then
+            public bool TryComplete() => Interlocked.CompareExchange(ref _state, Announced, Announcing) == Announcing;
+
+            public void TryCancelPending() => Interlocked.CompareExchange(ref _state, Cancelled, Pending);
+
+            //True when the caller raises Disconnected itself, true at most once
+            public bool TryHandOffDisconnect()
+            {
+                while (true)
+                {
+                    int current = Volatile.Read(ref _state);
+                    int next;
+                    switch (current)
+                    {
+                        case Pending: next = Cancelled; break;
+                        case Announcing: next = DisconnectedWhileAnnouncing; break;
+                        case Announced: next = Closed; break;
+                        default: return false;
+                    }
+
+                    if (Interlocked.CompareExchange(ref _state, next, current) == current)
+                        return current == Announced;
+                }
+            }
+        }
 
         internal readonly struct OutboundPacket
         {

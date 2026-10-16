@@ -119,6 +119,36 @@ namespace Liminal.Net.Tests
             }
         }
 
+        //Game reuses its SyncVars with Bind and grants again on every join, the server already lists the owner from last session
+        [Test]
+        public void BindReusedAcrossSessions_RegrantOnJoin_OwnerStillGetsAuthority()
+        {
+            int port = Interlocked.Increment(ref _port);
+            const string token = "rejoin_tcp_bind_at";
+            var server = new LiminalNetworkManager(new TcpTransport(), Config(port));
+            var client = new LiminalNetworkManager(new TcpTransport(), Config(port));
+            try
+            {
+                for (int session = 1; session <= 3; session++)
+                {
+                    Connect(server, client, port);
+                    var serverVar = server.SyncVarManager.Bind<int>(token, 0);
+                    serverVar.AddAuthority(client.localID);
+                    var clientVar = client.SyncVarManager.Bind<int>(token, 0);
+
+                    Assert.That(SpinWait.SpinUntil(() => clientVar.HasAuthority, 3000), Is.True, $"Session {session}: the owner never got authority.");
+                    clientVar.Value = session * 10;
+                    Assert.That(SpinWait.SpinUntil(() => serverVar.Value == session * 10, 3000), Is.True, $"Session {session}: the owner's write never reached the server.");
+                    EndSession(server, client);
+                }
+            }
+            finally
+            {
+                client.Dispose();
+                server.Dispose();
+            }
+        }
+
         //created -> disconnect -> rejoin on the same manager and rebind -> disconnect -> brand new client manager
         [Test]
         public void ReboundSyncVar_IsAdoptedByBrandNewManager()
