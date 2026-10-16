@@ -532,6 +532,16 @@ namespace Liminal.Net.SyncVar.Internal
             }
         }
 
+        //Client side, the ended session's server granted these and the next session's server grants again
+        public void ClearRemoteAuthorities()
+        {
+            lock (_lock)
+            {
+                Volatile.Write(ref _state, Volatile.Read(ref _state).WithAuthorities(Array.Empty<ushort>()));
+                _hasPendingAuthChanged = false;
+            }
+        }
+
         private void CommitAuthUpdate(ushort[] newAuthIds, out bool fireEvent, out bool currentAuth)
         {
             bool previousAuth = HasAuthority;

@@ -238,6 +238,162 @@ namespace Liminal.Net.Tests
             finally { second.Shutdown(); }
         }
 
+        //Manager kept across sessions, the game destroys its objects and binds the same tokens again in the next one
+        [Test]
+        public void NewSyncVar_ReplacesLeftoverFromPreviousSession_OnSameManager()
+        {
+            var manager = CreateManager(out var transport);
+            var leftover = new SyncVar<int>("rejoin_same_manager", 1, manager.SyncVarManager);
+            ConnectAsMockClient(manager, transport);
+            manager.Disconnect();
+            ConnectAsMockClient(manager, transport);
+            try
+            {
+                var fresh = new SyncVar<int>("rejoin_same_manager", 2, manager.SyncVarManager);
+                Assert.That(IsRegisteredIn(manager, fresh), Is.True, "The new SyncVar was rejected by the previous session's leftover.");
+
+                int seen = 0;
+                fresh.OnValueChanged += (_, next) => seen = next;
+                PushFromServer(manager, "rejoin_same_manager", 5, 80);
+                Assert.That(seen, Is.EqualTo(80), "The server value did not reach the new SyncVar.");
+
+                leftover.Value = 99;
+                Assert.That(IsRegisteredIn(manager, fresh), Is.True, "Touching the leftover took the token back.");
+                Assert.That(fresh.Value, Is.EqualTo(80));
+            }
+            finally { manager.Shutdown(); }
+        }
+
+        [Test]
+        public void NewSyncVar_CreatedWhileDisconnected_ReplacesLeftover()
+        {
+            var manager = CreateManager(out var transport);
+            var leftover = new SyncVar<int>("rejoin_while_disconnected", 1, manager.SyncVarManager);
+            ConnectAsMockClient(manager, transport);
+            manager.Disconnect();
+            try
+            {
+                var fresh = new SyncVar<int>("rejoin_while_disconnected", 2, manager.SyncVarManager);
+                ConnectAsMockClient(manager, transport);
+
+                Assert.That(IsRegisteredIn(manager, fresh), Is.True, "The new SyncVar lost its token when the leftover came back on reconnect.");
+                Assert.That(IsRegisteredIn(manager, leftover), Is.False);
+            }
+            finally { manager.Shutdown(); }
+        }
+
+        //What the replacement warning suggests, Bind hands back the same instance in the next session instead of replacing it
+        [TestCase("SameManager")]
+        [TestCase("NewManager")]
+        public void Bind_InNextSession_ReturnsTheExistingSyncVar(string how)
+        {
+            var first = CreateManager(out var transport);
+            var hp = first.SyncVarManager.Bind<int>("bind_next_session_" + how, 1);
+            ConnectAsMockClient(first, transport);
+            first.Disconnect();
+
+            var next = first;
+            if (how == "SameManager") ConnectAsMockClient(first, transport);
+            else
+            {
+                first.Shutdown();
+                next = StartMockClient();
+            }
+
+            var originalOut = Console.Out;
+            var captured = new System.IO.StringWriter();
+            Console.SetOut(captured);
+            try
+            {
+                var again = next.SyncVarManager.Bind<int>(hp.Token, 2);
+                Console.SetOut(originalOut);
+
+                Assert.That(again, Is.SameAs(hp), "Bind created a second SyncVar instead of returning the existing one.");
+                Assert.That(IsRegisteredIn(next, hp), Is.True);
+                Assert.That(captured.ToString(), Does.Not.Contain("replaced an older one"));
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                next.Shutdown();
+            }
+        }
+
+        [Test]
+        public void SyncVarBoundInNewSession_StillRefusesDuplicates()
+        {
+            var manager = CreateManager(out var transport);
+            _ = new SyncVar<int>("rejoin_duplicate", 1, manager.SyncVarManager);
+            ConnectAsMockClient(manager, transport);
+            manager.Disconnect();
+            ConnectAsMockClient(manager, transport);
+            try
+            {
+                var fresh = new SyncVar<int>("rejoin_duplicate", 2, manager.SyncVarManager);
+                var duplicate = new SyncVar<int>("rejoin_duplicate", 3, manager.SyncVarManager);
+
+                Assert.That(IsRegisteredIn(manager, fresh), Is.True);
+                Assert.That(IsRegisteredIn(manager, duplicate), Is.False, "A duplicate from the same session replaced a live SyncVar.");
+            }
+            finally { manager.Shutdown(); }
+        }
+
+        [Test]
+        public void ReplacingLeftover_WarnsThatTheOldOneStoppedSyncing()
+        {
+            var manager = CreateManager(out var transport);
+            _ = new SyncVar<int>("rejoin_warning", 1, manager.SyncVarManager);
+            ConnectAsMockClient(manager, transport);
+            manager.Disconnect();
+            ConnectAsMockClient(manager, transport);
+
+            var originalOut = Console.Out;
+            var captured = new System.IO.StringWriter();
+            Console.SetOut(captured);
+            try
+            {
+                _ = new SyncVar<int>("rejoin_warning", 2, manager.SyncVarManager);
+            }
+            finally
+            {
+                Console.SetOut(originalOut);
+                manager.Shutdown();
+            }
+
+            string log = captured.ToString();
+            Assert.That(log, Does.Contain("'rejoin_warning'").And.Contain("no longer syncs"), $"Log was: {log}");
+        }
+
+        //Disconnect detaches the syncvar manager from manager events, a later Shutdown still has to tear it down so a new manager can adopt
+        [TestCase("Disconnect")]
+        [TestCase("ConnectionLost")]
+        public void ShutdownAfterSessionEnded_NewManagerAdoptsSyncVars(string howEnded)
+        {
+            var first = CreateManager(out var transport);
+            var hp = new SyncVar<int>("adopt_after_" + howEnded, 1, first.SyncVarManager);
+            ConnectAsMockClient(first, transport);
+            if (howEnded == "Disconnect") first.Disconnect();
+            else
+            {
+                transport.TriggerLocalClientDisconnected(transport.LocalClientId);
+                transport.Shutdown();
+            }
+            first.Shutdown();
+
+            Assert.That(first.SyncVarManager.IsTornDown, Is.True, "Shutdown left the SyncVarManager alive.");
+
+            int seen = 0;
+            hp.OnValueChanged += (_, next) => seen = next;
+            var second = StartMockClient();
+            try
+            {
+                Assert.That(IsRegisteredIn(second, hp), Is.True, "The new manager did not adopt the SyncVar.");
+                PushFromServer(second, hp.Token, 5, 90);
+                Assert.That(seen, Is.EqualTo(90));
+            }
+            finally { second.Shutdown(); }
+        }
+
         [Test]
         public void SyncVarConstructedForLiveManager_KeepsItsTokenAgainstNewcomers()
         {

@@ -165,6 +165,7 @@ namespace Liminal.Net.SyncVar
         public void DetachFromManager()
         {
             if (_attachedManager == null) return;
+            bool clientSession = _attachedManager.Role == NetworkRole.Client;
 
             try
             {
@@ -177,8 +178,9 @@ namespace Liminal.Net.SyncVar
             }
             catch { }
 
+            //Null before the reset takes _unboundLock, ApplyRemoteAuth checks it under that lock so a late packet cant regrant after the reset
             _attachedManager = null;
-            ResetSessionState();
+            ResetSessionState(clientSession);
         }
 
         public void Reattach(LiminalNetworkManager manager)
@@ -214,7 +216,10 @@ namespace Liminal.Net.SyncVar
             }
         }
 
-        public void ResetSessionState()
+        public void ResetSessionState() => ResetSessionState(_attachedManager?.Role == NetworkRole.Client);
+
+        //Client authority came from the ended session's server, server and host authority is their own and stays
+        private void ResetSessionState(bool clientSession)
         {
             var allVars = new List<ISyncVarInternal>();
             lock (_unboundLock)
@@ -223,7 +228,7 @@ namespace Liminal.Net.SyncVar
 
                 for (int i = 0; i < allVars.Count; i++)
                 {
-                    allVars[i].ResetSession();
+                    allVars[i].ResetSession(clientSession);
                 }
 
                 for (int i = 0; i < _localRegistry.Length; i++)
@@ -378,25 +383,26 @@ namespace Liminal.Net.SyncVar
             FullTeardown();
         }
 
-        private void StoreUnboundAuth(string token, ushort[] authIds)
+        //Applied under _unboundLock, same lock the session reset clears authority under, so a packet from an ended session is either cleared or dropped
+        private void ApplyRemoteAuth(string token, ushort[] authIds)
         {
             ISyncVarInternal registered = null;
 
             lock (_unboundLock)
             {
+                if (_attachedManager == null || Volatile.Read(ref _lifecycleGate) == 2) return;
+
                 if (_tokenRegistry.TryGet(token, out registered))
                 {
+                    registered.ApplyAuthUpdateFromRemote(authIds, deferEvent: true);
                 }
-                else
+                else if (authIds != null)
                 {
                     _unboundAuth[token] = authIds;
                 }
             }
 
-            if (registered != null)
-            {
-                registered.ApplyAuthUpdateFromRemote(authIds);
-            }
+            registered?.FirePendingEvents();
         }
 
         private void StoreUnboundData(string token, uint version, byte[] data)
@@ -492,7 +498,10 @@ namespace Liminal.Net.SyncVar
                         return false;
                     }
 
-                    LiminalLogger.LogWarning($"[SyncVarManager] SyncVar '{syncVar.Token}' replaces an adopted SyncVar with the same token.");
+                    LiminalLogger.LogWarning($"[SyncVarManager] A new SyncVar '{syncVar.Token}' replaced an older one with the same token left from a previous session or manager. " +
+                        "The older instance no longer syncs: its writes stay local and it gets no server updates. " +
+                        "To keep using the existing one across sessions get it with SyncVarManager.Bind(token) instead of new SyncVar(...), and unsubscribe handlers of destroyed owners. " +
+                        "Otherwise give it a unique token or unregister it when its owner is destroyed.");
                     _tokenRegistry.TryRemove(syncVar.Token, out _);
                     FreeSlotLocked(existingRegistered);
                     existingRegistered.DetachFromSlab();
@@ -1309,14 +1318,7 @@ namespace Liminal.Net.SyncVar
         {
             if (!IsFromAuthoritativeServer(senderId)) return;
 
-            if (TryGetSyncVar(packet.Token, out var syncVar))
-            {
-                syncVar.ApplyAuthUpdateFromRemote(packet.AuthIds);
-            }
-            else
-            {
-                StoreUnboundAuth(packet.Token, packet.AuthIds);
-            }
+            ApplyRemoteAuth(packet.Token, packet.AuthIds);
         }
 
         private void HandleClientConnected(ushort clientId)
@@ -1370,13 +1372,13 @@ namespace Liminal.Net.SyncVar
                     {
                         syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force: true);
                     }
-                    syncVar.ApplyAuthUpdateFromRemote(entry.AuthIds);
+                    ApplyRemoteAuth(entry.Token, entry.AuthIds);
                 }
                 else
                 {
                     if (entry.AuthIds != null)
                     {
-                        StoreUnboundAuth(entry.Token, entry.AuthIds);
+                        ApplyRemoteAuth(entry.Token, entry.AuthIds);
                     }
                     if (entry.Data != null && entry.Data.Length > 0)
                     {

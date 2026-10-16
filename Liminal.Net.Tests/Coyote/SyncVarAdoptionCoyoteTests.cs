@@ -238,6 +238,91 @@ namespace Liminal.Net.Tests.Coyote
             adopter.Shutdown();
         }
 
+        //Reconnect re-registers last session's leftover while the game binds the same token again, the newcomer has to own it either way
+        [Test]
+        public static async Task Coyote_SameManagerRestart_NewSyncVarVsReconnect_NewcomerOwnsToken()
+        {
+            Exception failure = null;
+            string token = UniqueToken("rejoin_restart");
+            var manager = StartMockServer();
+            var leftover = new SyncVar<int>(token, 1, manager.SyncVarManager);
+            manager.Disconnect();
+            SyncVar<int> fresh = null;
+
+            var construct = RunCapturing(() => { fresh = new SyncVar<int>(token, 2, manager.SyncVarManager); }, ex => failure = ex);
+            var restart = RunCapturing(() => { manager.StartServer("127.0.0.1", 7777); }, ex => failure = ex);
+            await Task.WhenAll(construct, restart);
+
+            Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            Specification.Assert(IsRegisteredIn(manager, fresh), "The newly bound SyncVar lost its token to last session's leftover.");
+            Specification.Assert(CountRegistrySlots(manager, fresh) == 1, $"Newcomer holds {CountRegistrySlots(manager, fresh)} slots, expected 1.");
+            Specification.Assert(CountRegistrySlots(manager, leftover) == 0, "The leftover still holds a slot.");
+            Specification.Assert(DecodeWire(fresh) == 2, $"Newcomer wire bytes decode to {DecodeWire(fresh)}, expected 2.");
+
+            leftover.Value = 99;
+            Specification.Assert(IsRegisteredIn(manager, fresh) && DecodeWire(fresh) == 2, "Touching the leftover took the token or slab memory back.");
+
+            manager.Shutdown();
+        }
+
+        //Session ending races the game binding the same token, whichever wins the registry must stay consistent
+        [Test]
+        public static async Task Coyote_SessionEndVsNewSyncVar_ExactlyOneOwnsToken()
+        {
+            Exception failure = null;
+            string token = UniqueToken("rejoin_session_end");
+            var manager = StartMockServer();
+            var original = new SyncVar<int>(token, 1, manager.SyncVarManager);
+            SyncVar<int> fresh = null;
+
+            var disconnect = RunCapturing(() => manager.Disconnect(), ex => failure = ex);
+            var construct = RunCapturing(() => { fresh = new SyncVar<int>(token, 2, manager.SyncVarManager); }, ex => failure = ex);
+            await Task.WhenAll(disconnect, construct);
+            manager.StartServer("127.0.0.1", 7777);
+
+            Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            bool freshOwns = IsRegisteredIn(manager, fresh);
+            bool originalOwns = IsRegisteredIn(manager, original);
+            Specification.Assert(freshOwns ^ originalOwns, $"fresh={freshOwns} original={originalOwns}, expected exactly one owner.");
+
+            var owner = freshOwns ? fresh : original;
+            var other = freshOwns ? original : fresh;
+            Specification.Assert(CountRegistrySlots(manager, owner) == 1, $"Owner holds {CountRegistrySlots(manager, owner)} slots, expected 1.");
+            Specification.Assert(CountRegistrySlots(manager, other) == 0, "The other SyncVar still holds a slot.");
+            Specification.Assert(DecodeWire(owner) == owner.Value, $"Owner wire bytes decode to {DecodeWire(owner)}, expected {owner.Value}.");
+
+            manager.Shutdown();
+        }
+
+        //Disconnect unhooks the syncvar manager from the shutdown event, Shutdown has to tear it down itself for a new manager to adopt
+        [Test]
+        public static async Task Coyote_ShutdownAfterDisconnectVsNewManager_SyncVarMovesSafely()
+        {
+            Exception failure = null;
+            var owner = StartMockServer();
+            var hp = new SyncVar<int>(UniqueToken("adopt_after_disconnect"), 4, owner.SyncVarManager);
+            owner.Disconnect();
+            LiminalNetworkManager adopter = null;
+
+            var shutdown = RunCapturing(() => owner.Shutdown(), ex => failure = ex);
+            var create = RunCapturing(() => { adopter = StartMockServer(); }, ex => failure = ex);
+            await Task.WhenAll(shutdown, create);
+
+            Specification.Assert(failure == null, $"Unexpected exception: {failure}");
+            Specification.Assert(owner.SyncVarManager.IsTornDown, "Shutdown after Disconnect left the SyncVarManager alive.");
+
+            adopter.SyncVarManager.AdoptOrphans();
+            Specification.Assert(IsRegisteredIn(adopter, hp), "The new manager did not adopt the SyncVar of the shut down owner.");
+            Specification.Assert(CountRegistrySlots(adopter, hp) == 1, $"hp holds {CountRegistrySlots(adopter, hp)} adopter slots, expected 1.");
+
+            var probe = new SyncVar<int>(UniqueToken("adopt_after_disconnect_probe"), 222, adopter.SyncVarManager);
+            hp.Value = 6;
+            Specification.Assert(DecodeWire(hp) == 6, $"hp wire bytes decode to {DecodeWire(hp)}, expected 6.");
+            Specification.Assert(DecodeWire(probe) == 222, "hp wrote into another SyncVar's slab memory.");
+
+            adopter.Shutdown();
+        }
+
         [Test]
         public static async Task Coyote_Adoption_NewSyncVarVsLeftoverUse_NewcomerOwnsToken()
         {

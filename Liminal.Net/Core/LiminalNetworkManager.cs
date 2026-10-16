@@ -275,6 +275,7 @@ namespace Liminal.Net.Core
                 if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped && DisconnectCoordinator == null) return;
 
                 TeardownSession();
+                CompleteRequestedShutdownLocked();
             }
         }
 
@@ -568,8 +569,11 @@ namespace Liminal.Net.Core
 
         private readonly object _teardownLock = new();
         private int _isDisconnecting;
+        private int _isTearingDown;
         private int _isShuttingDown;
+        //Set the moment Shutdown is asked for, _shutdownCompleted once ShutdownInternal actually ran
         private int _isShutDown;
+        private int _shutdownCompleted;
 
         public void Disconnect()
         {
@@ -600,42 +604,52 @@ namespace Liminal.Net.Core
                 {
                     Volatile.Write(ref _isDisconnecting, 0);
                 }
+
+                CompleteRequestedShutdownLocked();
             }
         }
 
         private void TeardownSession()
         {
             // Must be called while holding _teardownLock
-            bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
-            bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
-            LifecycleState = NetworkLifecycleState.Stopping;
-
-            if (!alreadyStopping)
-            {
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-            }
-
+            Volatile.Write(ref _isTearingDown, 1);
             try
             {
-                _ticker?.Stop();
+                bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
+                bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
+                LifecycleState = NetworkLifecycleState.Stopping;
 
-                ShutdownSystems();
-
-                Role = NetworkRole.None;
-                LifecycleState = NetworkLifecycleState.Stopped;
-
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
-                if (wasActive)
+                if (!alreadyStopping)
                 {
-                    LiminalLogger.Log("[Manager] Network State Disconnected.");
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                }
+
+                try
+                {
+                    _ticker?.Stop();
+
+                    ShutdownSystems();
+
+                    Role = NetworkRole.None;
+                    LifecycleState = NetworkLifecycleState.Stopped;
+
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+
+                    if (wasActive)
+                    {
+                        LiminalLogger.Log("[Manager] Network State Disconnected.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Manager] Error during session teardown: {ex.Message}");
+                    Role = NetworkRole.None;
+                    LifecycleState = NetworkLifecycleState.Stopped;
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                LiminalLogger.LogError($"[Manager] Error during session teardown: {ex.Message}");
-                Role = NetworkRole.None;
-                LifecycleState = NetworkLifecycleState.Stopped;
+                Volatile.Write(ref _isTearingDown, 0);
             }
         }
 
@@ -659,32 +673,50 @@ namespace Liminal.Net.Core
             {
                 Volatile.Write(ref _isDisconnecting, 0);
             }
+
+            CompleteRequestedShutdownLocked();
         }
 
         //Final, after this the manager cant be started again, Disconnect is the call for leaving and reconnecting
         public void Shutdown()
         {
+            //Final from here on even if it cant run yet, so Start* refuses and the running teardown finishes it
+            Volatile.Write(ref _isShutDown, 1);
             lock (_teardownLock)
             {
-                if (Volatile.Read(ref _isShutDown) != 0) return;
-                if (LifecycleState == NetworkLifecycleState.Stopping) return;
+                //All of these are only set while _teardownLock is held, seeing one here means this thread is inside that teardown
                 if (Volatile.Read(ref _isDisconnecting) != 0) return;
+                if (Volatile.Read(ref _isTearingDown) != 0) return;
                 if (Volatile.Read(ref _isShuttingDown) != 0) return;
 
-                ShutdownInternal();
+                CompleteRequestedShutdownLocked();
             }
         }
 
         public void Dispose() => Shutdown();
 
+        //Must hold _teardownLock, every teardown path calls this on its way out so a Shutdown that came in during it is not lost
+        private void CompleteRequestedShutdownLocked()
+        {
+            if (Volatile.Read(ref _isShutDown) == 0) return;
+            if (Volatile.Read(ref _shutdownCompleted) != 0) return;
+
+            ShutdownInternal();
+        }
+
         private void ShutdownInternal()
         {
-            Volatile.Write(ref _isShutDown, 1);
+            Volatile.Write(ref _shutdownCompleted, 1);
             Volatile.Write(ref _isShuttingDown, 1);
             bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped || _transport.IsConnected;
+            //A dropped connection already raised Stopping, this shutdown is what closes it
+            bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
             LifecycleState = NetworkLifecycleState.Stopping;
 
-            LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+            if (!alreadyStopping)
+            {
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+            }
 
             try
             {
@@ -698,6 +730,8 @@ namespace Liminal.Net.Core
                 _transport.Shutdown();
 
                 _eventHub.RaiseManagerShutdown();
+                //Disconnect already unhooked it from OnManagerShutdown so tear it down directly or no new manager can adopt its syncvars
+                SyncVarManager?.FullTeardown();
 
                 ShutdownSystems();
 
