@@ -137,8 +137,15 @@ namespace Liminal.Net.Tests.Coyote
         [CoyoteTest]
         public static async Task Coyote_HandshakeGap_ServerSessionMustExistWhenLocalClientConnectedFires()
         {
-            var server = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
-            var client = new LiminalNetworkManager(new TcpTransport(), CreateConfig());
+            //IO deadline watchdog runs on a real Timer Coyote cant control, its callback crashes Coyote's lock tracking, deadlines arent what this tests
+            var serverConfig = CreateConfig();
+            serverConfig.SendResponseTimeout = 0;
+            serverConfig.ReceiveResponseTimeout = 0;
+            var clientConfig = CreateConfig();
+            clientConfig.SendResponseTimeout = 0;
+            clientConfig.ReceiveResponseTimeout = 0;
+            var server = new LiminalNetworkManager(new TcpTransport(), serverConfig);
+            var client = new LiminalNetworkManager(new TcpTransport(), clientConfig);
 
             server.StartServer("127.0.0.1", 0);
             int port = server.BoundPort;

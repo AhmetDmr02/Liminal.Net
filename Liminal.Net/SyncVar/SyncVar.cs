@@ -63,6 +63,7 @@ namespace Liminal.Net.SyncVar
         void SerializeInitial(IBufferWriter<byte> writer, MessagePackSerializerOptions options);
         bool TryWriteSlotForWire(ref MessagePackWriter writer, out uint version);
         bool TryExtractSnapshotData(out byte[] data, out uint version);
+        bool TryReadSnapshotData(out byte[] data, out uint version);
         bool ApplyRemoteBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force = false, bool deferEvent = false, ushort senderId = 0);
         bool ApplyCachedBytes(ReadOnlySequence<byte> incomingBytes, uint newVersion, MessagePackSerializerOptions options, bool force);
         bool TryPublishSlot(ushort slot);
@@ -724,6 +725,14 @@ namespace Liminal.Net.SyncVar
                 EnsureRegistered();
             }
 
+            return TryReadSnapshotData(out data, out version);
+        }
+
+        //Unlike TryExtractSnapshotData never registers, the server answering a client must not bring back a syncvar the game unregistered
+        bool ISyncVarInternal.TryReadSnapshotData(out byte[] data, out uint version) => TryReadSnapshotData(out data, out version);
+
+        private bool TryReadSnapshotData(out byte[] data, out uint version)
+        {
             if (!_wireBuffer.TryBeginRead(out int slotIndex, out int page, out int offset, out int length, out version))
             {
                 data = Array.Empty<byte>();

@@ -105,6 +105,14 @@ namespace Liminal.Net.SyncVar
         }
     }
 
+    //Client replaced a leftover that already got this session's state, asks the server to send that SyncVar again
+    [MessagePackObject]
+    [LiminalPacket]
+    public struct SyncVarResyncRequestPacket
+    {
+        [Key(0)] public string Token;
+    }
+
     [MessagePackObject]
     [LiminalPacket]
     public struct SyncVarAuthUpdatePacket

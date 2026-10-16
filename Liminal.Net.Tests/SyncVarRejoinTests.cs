@@ -85,6 +85,40 @@ namespace Liminal.Net.Tests
             }
         }
 
+        //Game spawns the player after this session's server state already arrived, so that state first lands on last session's leftover
+        [Test]
+        public void PlayerBindsAfterServerStateArrived_GetsAuthorityAndValue()
+        {
+            int port = Interlocked.Increment(ref _port);
+            const string token = "rejoin_tcp_late_bind";
+            var server = new LiminalNetworkManager(new TcpTransport(), Config(port));
+            var client = new LiminalNetworkManager(new TcpTransport(), Config(port));
+            try
+            {
+                Connect(server, client, port);
+                SpawnPlayer(server, client, token, 11, out var leftover);
+                EndSession(server, client);
+
+                Connect(server, client, port);
+                var serverVar = new SyncVar<int>(token, 77, server.SyncVarManager);
+                serverVar.SetAuthIds(client.localID);
+                Assert.That(SpinWait.SpinUntil(() => leftover.HasAuthority && leftover.Value == 77, 3000), Is.True,
+                    "Precondition: this session's state should reach the client before the game binds.");
+
+                var fresh = new SyncVar<int>(token, 0, client.SyncVarManager);
+                Assert.That(SpinWait.SpinUntil(() => fresh.HasAuthority && fresh.Value == 77, 3000), Is.True,
+                    $"The newly bound SyncVar never got this session's state: authority={fresh.HasAuthority} value={fresh.Value}.");
+
+                fresh.Value = 88;
+                Assert.That(SpinWait.SpinUntil(() => serverVar.Value == 88, 3000), Is.True, "The new SyncVar's write never reached the server.");
+            }
+            finally
+            {
+                client.Dispose();
+                server.Dispose();
+            }
+        }
+
         //created -> disconnect -> rejoin on the same manager and rebind -> disconnect -> brand new client manager
         [Test]
         public void ReboundSyncVar_IsAdoptedByBrandNewManager()

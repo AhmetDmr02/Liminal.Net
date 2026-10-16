@@ -154,6 +154,7 @@ namespace Liminal.Net.SyncVar
             _attachedManager.Interpreter.Subscribe<SyncVarEvictPacket>(HandleEviction, this);
             _attachedManager.Interpreter.Subscribe<SyncVarClearPacket>(HandleClear, this);
             _attachedManager.Interpreter.Subscribe<SyncVarClearAckPacket>(HandleClearAck, this);
+            _attachedManager.Interpreter.Subscribe<SyncVarResyncRequestPacket>(HandleResyncRequest, this);
 
             _attachedManager.Events.OnClientConnected += HandleClientConnected;
             _attachedManager.Events.OnClientDisconnected += HandleClientDisconnected;
@@ -467,6 +468,7 @@ namespace Liminal.Net.SyncVar
 
             UnboundEntry entry = null;
             ushort[] cachedAuth = null;
+            bool replacedLeftover = false;
 
             lock (_unboundLock)
             {
@@ -506,6 +508,7 @@ namespace Liminal.Net.SyncVar
                     FreeSlotLocked(existingRegistered);
                     existingRegistered.DetachFromSlab();
                     existingRegistered.ExcludedFromAdoption = true;
+                    replacedLeftover = true;
                 }
 
                 syncVar.AttachManager(this);
@@ -570,7 +573,22 @@ namespace Liminal.Net.SyncVar
                 }
             }
 
+            //Server state for this token may have landed on the leftover before the game bound this one, sent after it is
+            //registered so the answer reaches this one, the server only answers if we can see it
+            if (replacedLeftover)
+            {
+                RequestResync(syncVar.Token);
+            }
+
             return true;
+        }
+
+        private void RequestResync(string token)
+        {
+            var netManager = _attachedManager;
+            if (netManager == null || netManager.Role != NetworkRole.Client || !netManager.CanSend) return;
+
+            netManager.Interpreter.SendCommand(ILiminalTransport.SERVER_ID, new SyncVarResyncRequestPacket { Token = token });
         }
 
         public SyncVar<T> Bind<T>(string token, T defaultValue = default)
@@ -698,7 +716,8 @@ namespace Liminal.Net.SyncVar
             });
         }
 
-        internal void SendSyncVarToClient(ISyncVarInternal syncVar, ushort clientId)
+        //registerIfNeeded false when a client asked for it, a request must not bring back a syncvar the game unregistered
+        internal void SendSyncVarToClient(ISyncVarInternal syncVar, ushort clientId, bool registerIfNeeded = true)
         {
             var netManager = _attachedManager;
             if (netManager == null || netManager.Role == NetworkRole.Client || !netManager.CanSend)
@@ -710,7 +729,12 @@ namespace Liminal.Net.SyncVar
                     return;
             }
 
-            if (!syncVar.TryExtractSnapshotData(out byte[] data, out uint version))
+            byte[] data;
+            uint version;
+            bool read = registerIfNeeded
+                ? syncVar.TryExtractSnapshotData(out data, out version)
+                : syncVar.TryReadSnapshotData(out data, out version);
+            if (!read)
                 return;
 
             var packet = new SyncVarSnapshotPacket
@@ -1214,6 +1238,22 @@ namespace Liminal.Net.SyncVar
             }
         }
 
+        private void HandleResyncRequest(SyncVarResyncRequestPacket packet, ushort senderId)
+        {
+            var netManager = _attachedManager;
+            if (netManager == null || netManager.Role == NetworkRole.Client || string.IsNullOrEmpty(packet.Token)) return;
+            if (!TryGetSyncVar(packet.Token, out var syncVar)) return;
+
+            //Exclusions evict under this lock, so an excluded client either gets evicted after this send or is never sent it
+            lock (syncVar.VisibilityLock)
+            {
+                if (syncVar.IsVisibleTo(senderId))
+                {
+                    SendSyncVarToClient(syncVar, senderId, registerIfNeeded: false);
+                }
+            }
+        }
+
         private void HandleClientRequest(SyncVarSlabClientRequestPacket packet, ushort senderId)
         {
             var netManager = _attachedManager;
@@ -1360,6 +1400,10 @@ namespace Liminal.Net.SyncVar
             Volatile.Write(ref _hasReceivedInitialSnapshot, 1);
             if (packet.Entries == null || packet.Entries.Count == 0) return;
 
+            var netManager = _attachedManager;
+            bool isClient = netManager != null && netManager.Role == NetworkRole.Client;
+            ushort localId = isClient ? netManager.localID : (ushort)0;
+
             for (int i = 0; i < packet.Entries.Count; i++)
             {
                 var entry = packet.Entries[i];
@@ -1370,7 +1414,10 @@ namespace Liminal.Net.SyncVar
                     syncVar.SetLocallyVisible(true);
                     if (entry.Data != null && entry.Data.Length > 0)
                     {
-                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force: true);
+                        //Owner that stays owner gets a refresh like a resync answer, versions keep its newer unsent writes
+                        //authority is cleared every session so these versions are this session's, everything else takes server state as is
+                        bool staysOwner = isClient && syncVar.HasAuthority && entry.AuthIds != null && Array.IndexOf(entry.AuthIds, localId) >= 0;
+                        syncVar.ApplyRemoteBytes(new ReadOnlySequence<byte>(entry.Data), entry.Version, SerializerOptions, force: !staysOwner);
                     }
                     ApplyRemoteAuth(entry.Token, entry.AuthIds);
                 }
