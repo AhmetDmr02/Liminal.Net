@@ -52,31 +52,6 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void SessionManager_OptionC_AllocatesSessionOnDemand_WhenTransportReportsClientConnected()
-        {
-            var config = CreateConfig();
-            var transport = new MockTransport();
-            const ushort targetClientId = 55;
-
-            // Transport confirms client 55 is connected at transport layer
-            transport.IsClientConnectedFunc = id => id == targetClientId;
-
-            var manager = new LiminalNetworkManager(transport, config);
-
-            Assert.That(manager.SessionManager.HasSession(targetClientId), Is.False,
-                "Precondition: session should not exist before any interaction.");
-
-            // Attempt to send a packet BEFORE OnClientConnected event fires
-            manager.Interpreter.SendCommand(targetClientId, new ChatPacket { Message = "OnDemandOutbound" });
-
-            // Option C: SessionManager must allocate session on-demand rather than dropping
-            Assert.That(manager.SessionManager.HasSession(targetClientId), Is.True,
-                "Option C failed: Session was not allocated on-demand when sending to a connected client.");
-
-            manager.Shutdown();
-        }
-
-        [Test]
         public void SessionManager_OptionC_DoesNotAllocateSession_WhenTransportReportsClientNotConnected()
         {
             var config = CreateConfig();
@@ -99,41 +74,6 @@ namespace Liminal.Net.Tests
         }
 
         [Test]
-        public void SessionManager_OptionC_ProcessIncoming_AllocatesSessionOnDemand_WhenTransportConnected()
-        {
-            var config = CreateConfig();
-            var transport = new MockTransport();
-            const ushort senderClientId = 77;
-
-            transport.IsClientConnectedFunc = id => id == senderClientId;
-
-            var manager = new LiminalNetworkManager(transport, config);
-
-            bool packetReceived = false;
-            manager.Interpreter.Subscribe<ChatPacket>((pkt, sender) =>
-            {
-                if (pkt.Message == "InboundOnDemand")
-                    packetReceived = true;
-            }, "TestTag");
-
-            Assert.That(manager.SessionManager.HasSession(senderClientId), Is.False);
-
-            // Inbound packet arrives from transport before OnClientConnected was triggered
-            byte[] rawBatch = CreateFramedChatBatch("InboundOnDemand");
-            transport.TriggerReliableReceived(rawBatch, senderClientId);
-
-            // Option C must have allocated session on demand to ingest the packet
-            Assert.That(manager.SessionManager.HasSession(senderClientId), Is.True,
-                "Option C failed: Inbound packet did not trigger on-demand session creation.");
-
-            // Poll to process queue
-            manager.SessionManager.Poll();
-            Assert.That(packetReceived, Is.True, "Packet should have been delivered through on-demand session.");
-
-            manager.Shutdown();
-        }
-
-        [Test]
         public void SessionManager_PromotionFailure_DisconnectCleansUpSessionAndBuffers()
         {
             var config = CreateConfig();
@@ -144,7 +84,7 @@ namespace Liminal.Net.Tests
 
             var manager = new LiminalNetworkManager(transport, config);
 
-            // Allocate session on demand
+            transport.TriggerClientConnected(targetClientId);
             manager.Interpreter.SendCommand(targetClientId, new ChatPacket { Message = "Test" });
             Assert.That(manager.SessionManager.HasSession(targetClientId), Is.True);
 
@@ -156,7 +96,7 @@ namespace Liminal.Net.Tests
                 "SessionManager.HasSession must be false immediately after disconnect.");
 
             // Drain pending disconnects
-            manager.SessionManager.ProcessPendingDisconnects();
+            manager.SessionManager.ProcessLifecycleEvents();
 
             Span<ushort> remainingSessions = stackalloc ushort[10];
             int count = manager.SessionManager.GetSessionIds(remainingSessions);
@@ -176,7 +116,7 @@ namespace Liminal.Net.Tests
 
             var manager = new LiminalNetworkManager(transport, config);
 
-            // Allocate session
+            transport.TriggerClientConnected(targetClientId);
             manager.Interpreter.SendCommand(targetClientId, new ChatPacket { Message = "Test" });
             Assert.That(manager.SessionManager.HasSession(targetClientId), Is.True);
 
@@ -191,7 +131,7 @@ namespace Liminal.Net.Tests
             Assert.That(manager.SessionManager.HasSession(targetClientId), Is.False,
                 "SessionManager must not resurrect a session that is in disconnecting state.");
 
-            manager.SessionManager.ProcessPendingDisconnects();
+            manager.SessionManager.ProcessLifecycleEvents();
             manager.Shutdown();
         }
 

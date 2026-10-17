@@ -173,7 +173,7 @@ namespace Liminal.Net.Tests
                 client.StartClient("127.0.0.1", port);
 
                 Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
-                Assert.That(SpinWait.SpinUntil(() => server.ClientRegistry.Count == 1, 3000), Is.True);
+                Assert.That(SpinWait.SpinUntil(() => { serverTicker.TickUpdate(); return server.ClientRegistry.Count == 1; }, 3000), Is.True);
 
                 // Both tickers can be updated by Unity update loop
                 serverTicker.TickUpdate();

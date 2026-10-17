@@ -2,6 +2,7 @@ using Liminal.Net.ClientIdResolvers;
 using Liminal.Net.Core;
 using Liminal.Net.Interfaces;
 using Liminal.Net.Registry;
+using Liminal.Net.Unity;
 using MessagePack;
 using Microsoft.Coyote.Specifications;
 using Microsoft.Coyote.SystematicTesting;
@@ -18,6 +19,7 @@ using NUnitTestAttribute = NUnit.Framework.TestAttribute;
 namespace Liminal.Net.Tests.Coyote
 {
     [TestFixture]
+    //Unity ticker so no real tick thread runs, the tests poll by hand and Coyote cant schedule around a thread it doesnt control
     public class ClientRegistryConcurrencyCoyoteTests
     {
         private static void SimulateInboundPacket<T>(LiminalNetworkManager manager, ushort senderId, T packet) where T : struct
@@ -44,7 +46,7 @@ namespace Liminal.Net.Tests.Coyote
         {
             var config = CreateTestConfig();
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new LiminalUnityTicker(config));
             var registry = netManager.ClientRegistry;
 
             try
@@ -142,7 +144,7 @@ namespace Liminal.Net.Tests.Coyote
         {
             var config = CreateTestConfig();
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new LiminalUnityTicker(config));
 
             try
             {
@@ -152,6 +154,7 @@ namespace Liminal.Net.Tests.Coyote
 
                 ushort localId = 10;
                 transport.TriggerLocalClientConnected(localId);
+                netManager.SessionManager.Poll();
 
                 var registry = netManager.ClientRegistry;
                 Specification.Assert(registry.LocalClient != null, "LocalClient must be registered upon connection");
@@ -234,7 +237,7 @@ namespace Liminal.Net.Tests.Coyote
         {
             var config = CreateTestConfig();
             var transport = new MockTransport();
-            var netManager = new LiminalNetworkManager(transport, config);
+            var netManager = new LiminalNetworkManager(transport, config, customTicker: new LiminalUnityTicker(config));
             var registry = netManager.ClientRegistry;
 
             try
@@ -302,12 +305,12 @@ namespace Liminal.Net.Tests.Coyote
         {
             var serverConfig = CreateTestConfig();
             var serverTransport = new MockTransport { IsServer = true };
-            var serverManager = new LiminalNetworkManager(serverTransport, serverConfig);
+            var serverManager = new LiminalNetworkManager(serverTransport, serverConfig, customTicker: new LiminalUnityTicker(serverConfig));
             serverManager.StartServer(7777);
 
             var clientConfig = CreateTestConfig();
             var clientTransport = new MockTransport { IsServer = false };
-            var clientManager = new LiminalNetworkManager(clientTransport, clientConfig);
+            var clientManager = new LiminalNetworkManager(clientTransport, clientConfig, customTicker: new LiminalUnityTicker(clientConfig));
             clientManager.StartClient("127.0.0.1", 7777);
             clientTransport.TriggerLocalClientConnected(2);
             var clientRegistry = clientManager.ClientRegistry;
@@ -326,6 +329,13 @@ namespace Liminal.Net.Tests.Coyote
                 var connectTask2 = Task.Run(() => serverTransport.TriggerClientConnected(3));
 
                 await Task.WhenAll(connectTask1, connectTask2);
+
+                //Joins are raised on the server tick now, poll until both went through
+                for (int i = 0; i < 200 && !(clientRegistry.ContainsClient(2) && clientRegistry.ContainsClient(3)); i++)
+                {
+                    serverManager.SessionManager.Poll();
+                    await Task.Yield();
+                }
 
                 Specification.Assert(clientRegistry.ContainsClient(2), "Client 2 must contain Client 2 in its registry.");
                 Specification.Assert(clientRegistry.ContainsClient(3), "Client 2 must contain Client 3 in its registry.");

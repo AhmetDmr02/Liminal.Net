@@ -32,6 +32,11 @@ namespace Liminal.Net.Interfaces
         #region Connection State
         public bool IsClientConnected(ushort clientId);
         public int ConnectedClientCount { get; }
+
+        /// <summary>
+        /// Id of the client's current connection, 0 when it has none. Never reused by this transport, a reconnect under the same client id gets a new one.
+        /// </summary>
+        public uint GetConnectionId(ushort clientId);
         #endregion
 
         #region Initialization
@@ -53,6 +58,12 @@ namespace Liminal.Net.Interfaces
         /// Server Only: Forcibly removes a specific client.
         /// </summary>
         public void Kick(ushort clientId);
+
+        /// <summary>
+        /// Server Only: kicks the client only if its current connection is still connectionId, decided and claimed atomically.
+        /// A delayed kick uses this so it cant hit a newer connection that reused the client id.
+        /// </summary>
+        public void Kick(ushort clientId, uint connectionId);
 
         /// <summary>
         /// Shuts down the transport 
@@ -79,6 +90,11 @@ namespace Liminal.Net.Interfaces
         public event ClientConnectionHandler OnClientConnected;         // When a remote client joins this server
         public event ClientConnectionHandler OnClientDisconnected;
         public event ClientConnectionHandler OnClientKicked;
+
+        /// <summary>
+        /// Why the transport itself ended a connection (protocol violation, bad size, timeout, overflow). Local only, never sent to the peer.
+        /// </summary>
+        public event Action<ushort, DisconnectReason, string> OnTransportDisconnectReason;
         #endregion
     }
 }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Liminal.Net.BasePackets;
@@ -18,7 +19,6 @@ namespace Liminal.Net.Core
     {
         private readonly ILiminalTransport _transport;
         private readonly LiminalPacketInterpreter _interpreter;
-        private readonly ILiminalTransportDisconnectDiagnostics _diagnostics;
         private readonly LiminalNetworkConfig _config;
 
         private readonly ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message)> _resolved = new();
@@ -38,9 +38,7 @@ namespace Liminal.Net.Core
 
             _config = _transport.Config;
 
-            _diagnostics = transport as ILiminalTransportDisconnectDiagnostics;
-            if (_diagnostics != null)
-                _diagnostics.OnTransportDisconnectReason += HandleTransportReason;
+            _transport.OnTransportDisconnectReason += HandleTransportReason;
 
             _interpreter.Subscribe<DisconnectNoticePacket>(HandleNoticePacket, this);
             _interpreter.Subscribe<DisconnectAckPacket>(HandleAckPacket, this);
@@ -76,6 +74,9 @@ namespace Liminal.Net.Core
         {
             if (_disposed) return;
 
+            //Taken now, the kick below runs after the grace period and must only hit this connection
+            uint connection = _transport.GetConnectionId(clientId);
+
             _resolved[clientId] = (reason, message);
 
             var ackTcs = _pendingAcks.GetOrAdd(clientId, _ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
@@ -87,7 +88,7 @@ namespace Liminal.Net.Core
             catch
             {
                 LiminalLogger.Log($"[DisconnectReasonCoordinator] Failed to send kick notice to {clientId}. Socket unusable.");
-                _transport.Kick(clientId);
+                KickConnection(clientId, connection);
                 return;
             }
 
@@ -119,8 +120,8 @@ namespace Liminal.Net.Core
                 }
                 finally
                 {
-                    _pendingAcks.TryRemove(clientId, out _);
-                    _transport.Kick(clientId);
+                    RemovePendingAck(clientId, ackTcs);
+                    KickConnection(clientId, connection);
                 }
             });
         }
@@ -171,11 +172,23 @@ namespace Liminal.Net.Core
                 }
                 finally
                 {
-                    _pendingAcks.TryRemove(ILiminalTransport.SERVER_ID, out _);
+                    RemovePendingAck(ILiminalTransport.SERVER_ID, ackTcs);
                     Resolve(myId);
                     _transport.Disconnect();
                 }
             });
+        }
+
+        //A newer kick for the same id may have put its own ack in, only ours goes
+        private void RemovePendingAck(ushort id, TaskCompletionSource<bool> ackTcs) =>
+            ((ICollection<KeyValuePair<ushort, TaskCompletionSource<bool>>>)_pendingAcks)
+                .Remove(new KeyValuePair<ushort, TaskCompletionSource<bool>>(id, ackTcs));
+
+        //No connection when the kick started means the client was already gone, nothing to kick
+        private void KickConnection(ushort clientId, uint connection)
+        {
+            if (connection != 0)
+                _transport.Kick(clientId, connection);
         }
 
         public void RecordReason(ushort clientId, DisconnectReason reason, string message)
@@ -318,8 +331,7 @@ namespace Liminal.Net.Core
                 if (_disposed) return;
                 _disposed = true;
 
-                if (_diagnostics != null)
-                    _diagnostics.OnTransportDisconnectReason -= HandleTransportReason;
+                _transport.OnTransportDisconnectReason -= HandleTransportReason;
 
                 _transport.OnClientConnected -= HandleClientConnected;
                 _transport.OnLocalClientConnected -= HandleLocalClientConnected;

@@ -22,7 +22,7 @@ namespace Liminal.Net.Transports
     public readonly struct EmptyFramingContext { }
     public class TcpTransport : TcpTransport<EmptyFramingContext> { }
 
-    public class TcpTransport<TContext> : ILiminalTransport, ITransportTelemetryProvider, ILiminalTransportDisconnectDiagnostics where TContext : struct
+    public class TcpTransport<TContext> : ILiminalTransport, ITransportTelemetryProvider where TContext : struct
     {
         protected volatile ushort _localClientId = 0;
         public ushort LocalClientId => _localClientId;
@@ -137,9 +137,13 @@ namespace Liminal.Net.Transports
         private readonly ConcurrentDictionary<TcpClient, byte> _finalizedConnections = new();
         private bool TryClaimDisconnect(TcpClient client) => _finalizedConnections.TryAdd(client, 0);
 
-        private int _isShuttingDown = 0;
+        //Only bumped under _connectionLifecycleLock
+        private uint _lastConnectionId;
 
         public bool IsClientConnected(ushort clientId) => _sockets.ContainsKey(clientId);
+
+        public uint GetConnectionId(ushort clientId) =>
+            _sendQueues.TryGetValue(clientId, out var state) ? state.ConnectionId : 0;
         public int ConnectedClientCount => _sockets.Count;
         public int TotalConnections => Volatile.Read(ref _totalConnections);
 
@@ -175,51 +179,56 @@ namespace Liminal.Net.Transports
 
         public virtual void StartServer(string ip, int port)
         {
-            if (_listener != null)
-            {
-                try { _listener.Stop(); } catch { }
-                _listener = null;
-            }
-
             bool isWildcard = string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0" || ip == "::" || ip == "::0";
             if (!isWildcard && IPAddress.TryParse(ip, out var parsedBind))
             {
                 isWildcard = parsedBind.Equals(IPAddress.Any) || parsedBind.Equals(IPAddress.IPv6Any);
             }
 
-            if (isWildcard)
-            {
-                _listener = Socket.OSSupportsIPv6 ? TcpListener.Create(port) : new TcpListener(IPAddress.Any, port);
-            }
-            else
-            {
-                _listener = new TcpListener(IPAddress.Parse(ip), port);
-            }
+            var listener = isWildcard
+                ? (Socket.OSSupportsIPv6 ? TcpListener.Create(port) : new TcpListener(IPAddress.Any, port))
+                : new TcpListener(IPAddress.Parse(ip), port);
 
             try
             {
-                _listener.ExclusiveAddressUse = true;
+                listener.ExclusiveAddressUse = true;
             }
             catch { }
 
+            TcpListener previous;
+            lock (_connectionLifecycleLock)
+            {
+                previous = _listener;
+                _listener = null;
+            }
+
+            if (previous != null)
+            {
+                try { previous.Stop(); } catch { }
+            }
+
             try
             {
-                _listener.Start(100);
+                listener.Start(100);
             }
             catch
             {
-                try { _listener.Stop(); } catch { }
-                _listener = null;
+                try { listener.Stop(); } catch { }
                 throw;
             }
 
-            _isServer = true;
-            _isConnected = true;
+            lock (_connectionLifecycleLock)
+            {
+                _listener = listener;
+                _isServer = true;
+                _isConnected = true;
+            }
+
             _onServerStarted?.Invoke();
 
-            _ = Task.Run(() => AcceptConnectionsAsync(_listener));
+            _ = Task.Run(() => AcceptConnectionsAsync(listener));
             string dualModeInfo = (isWildcard && Socket.OSSupportsIPv6) ? " (Dual-Mode: IPv4 + IPv6)" : "";
-            LiminalLogger.Log($"Server started on {_listener.LocalEndpoint}{dualModeInfo}");
+            LiminalLogger.Log($"Server started on {listener.LocalEndpoint}{dualModeInfo}");
         }
 
         public virtual void StartClient(string ip, int port)
@@ -234,6 +243,7 @@ namespace Liminal.Net.Transports
                     _clientConnectCts = new CancellationTokenSource();
                     token = _clientConnectCts.Token;
                     _pendingLocalEndpoint = null;
+                    _isClient = true;
                 }
 
                 string targetIp = ip;
@@ -264,8 +274,6 @@ namespace Liminal.Net.Transports
                 }
                 client.NoDelay = true;
 
-                _isClient = true;
-
                 _ = Task.Run(() => TryToConnectAsync(client, (targetIp, port), token), token);
             }
             catch (Exception ex)
@@ -276,53 +284,54 @@ namespace Liminal.Net.Transports
         #endregion
 
         #region Shutdown & Disconnect & Kick
+        //Every way this transport ends goes through ResetLocked under _connectionLifecycleLock, whoever ends something checks under that
+        //same lock that it is still current, a late failure of an old connection finds its socket gone and does nothing
+        //so a shutdown never has to be waited for and cant reach into a run started after it
         public virtual void Disconnect()
         {
-            if (_isServer)
-            {
-                LiminalLogger.Log("[Transport] Server initiated Shutdown.");
-                Shutdown();
-                return;
-            }
+            bool clientSide;
+            ushort disconnectedId = 0;
+            bool wasConnected = false;
+            LocalAnnouncement announcement = null;
 
-            if (_isClient)
+            lock (_connectionLifecycleLock)
             {
-                ushort disconnectedId;
-                bool wasConnected;
-                LocalAnnouncement announcement;
-
-                //Claimed before anything wakes the reader, under the lock its lost connection check uses
-                //so the reader stays quiet and this is the only shutdown, finished before Disconnect returns
-                lock (_connectionLifecycleLock)
+                clientSide = _isClient && !_isServer;
+                if (clientSide)
                 {
-                    if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
-                    {
-                        return;
-                    }
-
                     disconnectedId = _localClientId;
                     wasConnected = _isConnected;
-                    _isConnected = false;
                     announcement = _localAnnouncement;
                     _localAnnouncement = null;
-                    _clientConnectCts?.Cancel();
                 }
 
-                bool raiseDisconnected = announcement != null ? announcement.TryHandOffDisconnect() : wasConnected;
+                ResetLocked();
+            }
+
+            try
+            {
+                bool raiseDisconnected = clientSide && (announcement != null ? announcement.TryHandOffDisconnect() : wasConnected);
                 if (raiseDisconnected)
                 {
                     _onLocalClientDisconnected?.Invoke(disconnectedId);
                 }
-
-                ShutdownClaimed();
-                LiminalLogger.Log("[Transport] Disconnected from server.");
-                return;
+            }
+            finally
+            {
+                FinishShutdown();
             }
 
-            Shutdown();
+            LiminalLogger.Log(clientSide ? "[Transport] Disconnected from server." : "[Transport] Shut down.");
         }
 
         public virtual void Kick(ushort clientId) => KickConnection(clientId, null);
+
+        //The send state is read once and its own socket kicked, a replacement after the read turns KickConnection into a no op
+        public virtual void Kick(ushort clientId, uint connectionId)
+        {
+            if (connectionId != 0 && _sendQueues.TryGetValue(clientId, out var state) && state.ConnectionId == connectionId)
+                KickConnection(clientId, state.Client);
+        }
 
         //expected set means only that socket may be kicked, a late failure of a replaced connection must not kick the new one
         internal void KickConnection(ushort clientId, TcpClient expected)
@@ -338,6 +347,22 @@ namespace Liminal.Net.Transports
 
             if (clientId == LocalClientId && LocalClientId != ILiminalTransport.SERVER_ID)
             {
+                if (expected != null)
+                {
+                    //Connections are only added under this lock so a match here cant be a newer host session that reused the id
+                    lock (_connectionLifecycleLock)
+                    {
+                        if (!_sockets.TryGetValue(clientId, out var current) || !ReferenceEquals(current, expected))
+                            return;
+
+                        ResetLocked();
+                    }
+
+                    LiminalLogger.LogWarning($"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
+                    FinishShutdown();
+                    return;
+                }
+
                 LiminalLogger.LogWarning($"[Transport] Host local client {clientId} was kicked. Shutting down host session.");
                 Shutdown();
                 return;
@@ -384,16 +409,15 @@ namespace Liminal.Net.Transports
 
         public virtual void Shutdown()
         {
-            if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+            lock (_connectionLifecycleLock)
             {
-                return;
+                ResetLocked();
             }
 
-            ShutdownClaimed();
+            FinishShutdown();
         }
 
-        //For late failures from a connection's own loops, checked and claimed under the lock new connections register under
-        //so an old socket failing late cant tear down a newer connection
+        //For late failures from a connection's own loops, an old socket failing late finds a newer connection in its place and leaves it alone
         private void ShutdownIfCurrent(TcpClient connection)
         {
             lock (_connectionLifecycleLock)
@@ -403,90 +427,91 @@ namespace Liminal.Net.Transports
                     return;
                 }
 
-                if (Interlocked.Exchange(ref _isShuttingDown, 1) == 1)
+                ResetLocked();
+            }
+
+            FinishShutdown();
+        }
+
+        //Subclasses release their own resources here, runs after the reset and before OnShutdown
+        protected virtual void OnShutdownCompleted()
+        {
+        }
+
+        //Caller holds _connectionLifecycleLock
+        private void ResetLocked()
+        {
+            _clientConnectCts?.Cancel();
+            _clientConnectCts?.Dispose();
+            _clientConnectCts = null;
+
+            _isConnected = false;
+            _isServer = false;
+            _isClient = false;
+            _localClientId = 0;
+            _pendingLocalEndpoint = null;
+            _localAnnouncement?.TryCancelPending();
+            _localAnnouncement = null;
+
+            foreach (var id in _sockets.Keys)
+            {
+                TeardownSendQueue(id);
+
+                if (_sockets.TryRemove(id, out var clientSocket))
                 {
-                    return;
+                    //Removing it from _sockets makes this its disconnect, its late reader finds it gone and stays quiet
+                    //a client's own connection to the server was never counted
+                    if (id != ILiminalTransport.SERVER_ID && TryClaimDisconnect(clientSocket))
+                    {
+                        Interlocked.Decrement(ref _totalConnections);
+                    }
+                    try { clientSocket.Close(); } catch { }
+                    LiminalLogger.Log($"[Transport] Client {id} cleared.");
                 }
             }
 
-            ShutdownClaimed();
+            foreach (var id in _sendQueues.Keys)
+            {
+                TeardownSendQueue(id);
+            }
+
+            if (_listener != null)
+            {
+                try { _listener.Stop(); } catch { }
+                _listener = null;
+            }
+
+            _finalizedConnections.Clear();
+            lock (_wireLock)
+            {
+                _wireInFlight.Clear();
+                _wireRttMap.Clear();
+            }
         }
 
-        //Subclasses release their own resources here, only runs when the transport really shuts down
-        protected virtual void OnShutdownClaimed()
+        //After the lock is let go so neither the subclass cleanup nor OnShutdown handlers run under it
+        private void FinishShutdown()
         {
-        }
-
-        private void ShutdownClaimed()
-        {
-            LiminalLogger.Log($"[Transport-Debug] Shutdown initiated by thread '{Thread.CurrentThread.Name ?? Thread.CurrentThread.ManagedThreadId.ToString()}'. Stack:\n{Environment.StackTrace}", LiminalLogger.LogLevel.Detailed);
+            LiminalLogger.Log($"[Transport-Debug] Shutdown by thread '{Thread.CurrentThread.Name ?? Thread.CurrentThread.ManagedThreadId.ToString()}'. Stack:\n{Environment.StackTrace}", LiminalLogger.LogLevel.Detailed);
 
             try
             {
-                try
-                {
-                    OnShutdownClaimed();
-                }
-                catch (Exception ex)
-                {
-                    LiminalLogger.LogError($"[Transport] Shutdown cleanup failed: {ex.Message}");
-                }
-
-                lock (_connectionLifecycleLock)
-                {
-                    _clientConnectCts?.Cancel();
-                    _clientConnectCts?.Dispose();
-                    _clientConnectCts = null;
-
-                    _isConnected = false;
-                    _isServer = false;
-                    _isClient = false;
-                    _localClientId = 0;
-                    _pendingLocalEndpoint = null;
-                    _localAnnouncement?.TryCancelPending();
-                    _localAnnouncement = null;
-
-                    foreach (var id in _sockets.Keys)
-                    {
-                        TeardownSendQueue(id);
-
-                        if (_sockets.TryRemove(id, out var clientSocket))
-                        {
-                            //Removing it from _sockets makes this its disconnect, its late reader finds it gone and stays quiet
-                            //a client's own connection to the server was never counted
-                            if (id != ILiminalTransport.SERVER_ID && TryClaimDisconnect(clientSocket))
-                            {
-                                Interlocked.Decrement(ref _totalConnections);
-                            }
-                            try { clientSocket.Close(); } catch { }
-                            LiminalLogger.Log($"[Transport] Client {id} cleared.");
-                        }
-                    }
-
-                    foreach (var id in _sendQueues.Keys)
-                    {
-                        TeardownSendQueue(id);
-                    }
-
-                    if (_listener != null)
-                    {
-                        try { _listener.Stop(); } catch { }
-                        _listener = null;
-                    }
-                }
-
-                _onShutdown?.Invoke();
+                OnShutdownCompleted();
             }
-            finally
+            catch (Exception ex)
             {
-                Interlocked.Exchange(ref _isShuttingDown, 0);
-                _finalizedConnections.Clear();
-                lock (_wireLock)
-                {
-                    _wireInFlight.Clear();
-                    _wireRttMap.Clear();
-                }
+                LiminalLogger.LogError($"[Transport] Shutdown cleanup failed: {ex.Message}");
             }
+
+            _onShutdown?.Invoke();
+        }
+
+        //Caller holds _connectionLifecycleLock
+        private uint NextConnectionIdLocked()
+        {
+            if (++_lastConnectionId == 0)
+                _lastConnectionId = 1;
+            return _lastConnectionId;
         }
 
         private void TeardownSendQueue(ushort clientId, ClientSendState ownedState = null)
@@ -533,16 +558,11 @@ namespace Liminal.Net.Transports
 
         protected virtual void SendInternal(Span<byte> data, ushort targetId, TransportFlags flags)
         {
+            //No queue means that connection already ended and whoever ended it raised its events, kicking by id here could hit a newer one
             if (!_sendQueues.TryGetValue(targetId, out var sendState))
             {
-                if ((flags & TransportFlags.WirePing) != 0)
-                {
-                    return;
-                }
-
-                LiminalLogger.LogError($"[Transport] Cannot send: no outbound queue for client {targetId}");
-                if (IsServer) Kick(targetId);
-                else Shutdown();
+                if ((flags & TransportFlags.WirePing) == 0)
+                    LiminalLogger.LogWarning($"[Transport] Dropped send to client {targetId}, it has no open connection.", LiminalLogger.LogLevel.Detailed);
                 return;
             }
 
@@ -720,7 +740,7 @@ namespace Liminal.Net.Transports
                 await client.ConnectAsync(connectionInfo.ip, connectionInfo.port).ConfigureAwait(false);
 #endif
 
-                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                if (cancelToken.IsCancellationRequested)
                 {
                     try { client.Close(); } catch { }
                     return;
@@ -728,7 +748,7 @@ namespace Liminal.Net.Transports
 
                 lock (_connectionLifecycleLock)
                 {
-                    if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                    if (!cancelToken.IsCancellationRequested)
                     {
                         _pendingLocalEndpoint = client.Client.LocalEndPoint;
                     }
@@ -738,7 +758,7 @@ namespace Liminal.Net.Transports
 
                 HandshakeResult result = await ClientHandshaker(client, _config).ConfigureAwait(false);
 
-                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                if (cancelToken.IsCancellationRequested)
                 {
                     try { client.Close(); } catch { }
                     return;
@@ -746,64 +766,60 @@ namespace Liminal.Net.Transports
 
                 if (result.Success)
                 {
-                    PromoteLocalClient(result.ClientId, client);
+                    PromoteLocalClient(result.ClientId, client, cancelToken);
                 }
                 else
                 {
                     try { client.Close(); } catch { }
 
-                    if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                    if (!TryResetForAttempt(cancelToken))
                         return;
 
-                    lock (_connectionLifecycleLock)
+                    try
                     {
-                        if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
-                        {
-                            _localClientId = 0;
-                        }
+                        OnTransportDisconnectReason?.Invoke(ILiminalTransport.SERVER_ID, result.FailureReason, result.FailureMessage);
+                        _onLocalClientDisconnected?.Invoke(0);
                     }
-
-                    OnTransportDisconnectReason?.Invoke(ILiminalTransport.SERVER_ID, result.FailureReason, result.FailureMessage);
-
-                    _onLocalClientDisconnected?.Invoke(0);
-                    Shutdown();
+                    finally
+                    {
+                        FinishShutdown();
+                    }
                 }
             }
             catch (OperationCanceledException)
             {
                 try { client.Close(); } catch { }
-                if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
+                if (TryResetForAttempt(cancelToken))
                 {
-                    lock (_connectionLifecycleLock)
-                    {
-                        if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
-                        {
-                            _localClientId = 0;
-                        }
-                    }
                     LiminalLogger.LogError("[Transport] Connection timed out.");
-                    Shutdown();
+                    FinishShutdown();
                 }
             }
             catch (Exception ex)
             {
                 try { client.Close(); } catch { }
-                if (cancelToken.IsCancellationRequested || _isShuttingDown != 0)
+                if (!TryResetForAttempt(cancelToken))
                     return;
 
-                lock (_connectionLifecycleLock)
-                {
-                    if (!cancelToken.IsCancellationRequested && _isShuttingDown == 0)
-                    {
-                        _localClientId = 0;
-                    }
-                }
-
                 LiminalLogger.LogError($"[Transport] Connection failed: {ex.Message}");
-                Shutdown();
+                FinishShutdown();
             }
         }
         #endregion
+
+        //A failed connect attempt may only shut down the run it belongs to, StartClient and every reset cancel the attempt under this lock
+        //so checking the token and resetting together here cant hit a run that started after the game restarted
+        private bool TryResetForAttempt(CancellationToken attempt)
+        {
+            lock (_connectionLifecycleLock)
+            {
+                if (attempt.IsCancellationRequested)
+                    return false;
+
+                ResetLocked();
+                return true;
+            }
+        }
 
         #region Receiving
         private int _totalConnections = 0;
@@ -941,14 +957,14 @@ namespace Liminal.Net.Transports
 
             lock (_connectionLifecycleLock)
             {
-                if (_isShuttingDown != 0 || !_isConnected)
+                if (!_isConnected)
                 {
                     try { client.Close(); } catch { }
                     sendState = null;
                     return;
                 }
 
-                var newSendState = new ClientSendState(maxPacketCount);
+                var newSendState = new ClientSendState(NextConnectionIdLocked(), client, maxPacketCount);
 
                 _sendQueues.AddOrUpdate(clientId, newSendState, (k, old) =>
                 {
@@ -1028,7 +1044,7 @@ namespace Liminal.Net.Transports
             PostPromoteClient(clientId, client, sendState);
         }
 
-        internal void PromoteLocalClient(ushort assignedId, TcpClient client)
+        internal void PromoteLocalClient(ushort assignedId, TcpClient client, CancellationToken attempt = default)
         {
             client.SendTimeout = (int)_config.SendResponseTimeout * 1000;
 
@@ -1036,14 +1052,15 @@ namespace Liminal.Net.Transports
             LocalAnnouncement announcement;
             lock (_connectionLifecycleLock)
             {
-                if (_isShuttingDown != 0 || !_isClient)
+                //A cancelled attempt finished its handshake after a restart, its socket is not this run's connection
+                if (!_isClient || attempt.IsCancellationRequested)
                 {
                     try { client.Close(); } catch { }
                     return;
                 }
 
                 _localClientId = assignedId;
-                sendState = new ClientSendState();
+                sendState = new ClientSendState(NextConnectionIdLocked(), client);
                 _sendQueues[ILiminalTransport.SERVER_ID] = sendState;
                 _sockets[ILiminalTransport.SERVER_ID] = client;
                 _isConnected = true;
@@ -1214,67 +1231,70 @@ namespace Liminal.Net.Transports
             {
                 recvWatchdog?.Dispose();
 
-                if (_isShuttingDown == 0)
+                bool isServerConn = incomingId == ILiminalTransport.SERVER_ID;
+
+                try { client.Close(); } catch { }
+
+                TeardownSendQueue(incomingId, ownedSendState);
+
+                if (!isServerConn)
                 {
-                    bool isServerConn = incomingId == ILiminalTransport.SERVER_ID;
+                    //A reset, a kick or a replacement may have removed this socket already, then its disconnect is theirs
+                    bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
 
-                    try { client.Close(); } catch { }
-
-                    TeardownSendQueue(incomingId, ownedSendState);
-
-                    if (!isServerConn)
+                    if (removed && TryClaimDisconnect(client))
                     {
-                        //Shutdown, a kick or a replacement may have removed this socket already, then its disconnect is theirs
-                        bool removed = ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(incomingId, client));
-
-                        if (removed && TryClaimDisconnect(client))
+                        Interlocked.Decrement(ref _totalConnections);
+                        if (_sockets.TryGetValue(incomingId, out var activeClient) && !ReferenceEquals(activeClient, client))
                         {
-                            Interlocked.Decrement(ref _totalConnections);
-                            if (_sockets.TryGetValue(incomingId, out var activeClient) && !ReferenceEquals(activeClient, client))
-                            {
-                                LiminalLogger.Log($"[Transport] Old socket for client {incomingId} closed after replacement.");
-                            }
-                            else
-                            {
-                                _onClientDisconnected?.Invoke(incomingId);
-                                LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
-                            }
+                            LiminalLogger.Log($"[Transport] Old socket for client {incomingId} closed after replacement.");
+                        }
+                        else
+                        {
+                            _onClientDisconnected?.Invoke(incomingId);
+                            LiminalLogger.Log($"[Transport] Client {incomingId} disconnected.");
                         }
                     }
-                    else
+                }
+                else
+                {
+                    bool isCurrent = false;
+                    ushort disconnectedId = 0;
+                    LocalAnnouncement announcement = null;
+
+                    //Decided and reset in the same lock, a Disconnect and restart in between would otherwise let this old socket end the new run
+                    lock (_connectionLifecycleLock)
                     {
-                        bool isCurrent = false;
-                        ushort disconnectedId = 0;
-                        LocalAnnouncement announcement = null;
-
-                        lock (_connectionLifecycleLock)
+                        if (_isClient &&
+                            _sockets.TryGetValue(ILiminalTransport.SERVER_ID, out var activeClient) &&
+                            ReferenceEquals(activeClient, client))
                         {
-                            if (_isShuttingDown == 0 && _isClient &&
-                                _sockets.TryGetValue(ILiminalTransport.SERVER_ID, out var activeClient) &&
-                                ReferenceEquals(activeClient, client))
-                            {
-                                ((ICollection<KeyValuePair<ushort, TcpClient>>)_sockets).Remove(new KeyValuePair<ushort, TcpClient>(ILiminalTransport.SERVER_ID, client));
-                                disconnectedId = _localClientId;
-                                _isConnected = false;
-                                isCurrent = true;
-                                announcement = _localAnnouncement;
-                                _localAnnouncement = null;
-                            }
+                            disconnectedId = _localClientId;
+                            isCurrent = true;
+                            announcement = _localAnnouncement;
+                            _localAnnouncement = null;
+                            ResetLocked();
                         }
+                    }
 
-                        if (isCurrent)
+                    if (isCurrent)
+                    {
+                        LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
+                        try
                         {
-                            LiminalLogger.Log("[Transport] Local client connection to server was lost. Shutting down.");
                             if (announcement == null || announcement.TryHandOffDisconnect())
                             {
                                 _onLocalClientDisconnected?.Invoke(disconnectedId);
                             }
-                            Shutdown();
+                        }
+                        finally
+                        {
+                            FinishShutdown();
                         }
                     }
-
-                    _finalizedConnections.TryRemove(client, out _);
                 }
+
+                _finalizedConnections.TryRemove(client, out _);
             }
         }
 
@@ -1552,12 +1572,16 @@ namespace Liminal.Net.Transports
 
         internal sealed class ClientSendState
         {
+            public readonly uint ConnectionId;
+            public readonly TcpClient Client;
             public readonly Channel<OutboundPacket> Channel;
             public readonly CancellationTokenSource LifetimeCts;
             public Task WriterTask;
 
-            public ClientSendState(int capacity = 1024)
+            public ClientSendState(uint connectionId, TcpClient client, int capacity = 1024)
             {
+                ConnectionId = connectionId;
+                Client = client;
                 Channel = System.Threading.Channels.Channel.CreateBounded<OutboundPacket>(
                     new BoundedChannelOptions(capacity)
                     {

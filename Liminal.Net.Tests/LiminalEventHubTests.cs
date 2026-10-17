@@ -50,6 +50,7 @@ namespace Liminal.Net.Tests
             };
 
             transport.TriggerClientConnected(connectingClientId);
+            manager.SessionManager.Poll();
 
             Assert.That(sessionExistedWhenHighLevelRan, Is.True, "SessionManager did not create the session before high-level events fired.");
             Assert.That(canRoutePacketImmediately, Is.True, "Failed to route packet in OnClientConnected handler.");
@@ -72,6 +73,7 @@ namespace Liminal.Net.Tests
             };
 
             transport.TriggerLocalClientConnected(1);
+            manager.SessionManager.Poll();
 
             Assert.That(sessionExistedForServer, Is.True, "Session for Server was not created before OnLocalClientConnected fired.");
         }
@@ -169,6 +171,7 @@ namespace Liminal.Net.Tests
                 };
 
                 transport.TriggerClientConnected(clientForCycle);
+                SpinWait.SpinUntil(() => Volatile.Read(ref orderCheck) == 1, 2000);
                 Assert.That(orderCheck, Is.EqualTo(1), $"Cycle {cycle}: Session did not exist when OnClientConnected fired.");
 
                 manager.Disconnect();

@@ -59,9 +59,10 @@ namespace Liminal.Net.Core
             else
                 _transport.Disconnect();
         }
-        internal HiccupEnableResult TryEnableInbound(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason)
+        internal HiccupEnableResult TryEnableInbound(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason, out ServerStarvationEvent? starvation)
         {
             failureReason = null;
+            starvation = null;
 
             if (!Enabled)
             {
@@ -102,13 +103,14 @@ namespace Liminal.Net.Core
             if (session.EnterRecovery(LiminalSessionRecoveryState.InboundDirectionBit))
                 Interlocked.Increment(ref _activeRecoverySessions);
 
-            EmitStarvationEventIfNecessary(clientId, LiminalRecoveryDirection.Inbound, now);
+            starvation = CaptureStarvationEvent(clientId, LiminalRecoveryDirection.Inbound, now);
             return HiccupEnableResult.Success;
         }
 
-        internal HiccupEnableResult TryEnableOutbound(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason)
+        internal HiccupEnableResult TryEnableOutbound(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason, out ServerStarvationEvent? starvation)
         {
             failureReason = null;
+            starvation = null;
 
             if (!Enabled)
             {
@@ -156,7 +158,7 @@ namespace Liminal.Net.Core
             if (session.EnterRecovery(LiminalSessionRecoveryState.OutboundDirectionBit))
                 Interlocked.Increment(ref _activeRecoverySessions);
 
-            EmitStarvationEventIfNecessary(clientId, LiminalRecoveryDirection.Outbound, now);
+            starvation = CaptureStarvationEvent(clientId, LiminalRecoveryDirection.Outbound, now);
             return HiccupEnableResult.Success;
         }
 
@@ -256,19 +258,25 @@ namespace Liminal.Net.Core
                    _config.Hiccup.StarvationThreshold;
         }
 
-        private void EmitStarvationEventIfNecessary(ushort clientId, LiminalRecoveryDirection direction, long now)
+        //Built under the session lock, raised by the caller after it lets go so handlers never run under SendLock or ReceiveLock
+        private ServerStarvationEvent? CaptureStarvationEvent(ushort clientId, LiminalRecoveryDirection direction, long now)
         {
             int total = _sessions.Count;
             if (total == 0)
-                return;
+                return null;
 
             int active = Volatile.Read(ref _activeRecoverySessions);
             double ratio = (double)active / total;
             if (ratio < _config.Hiccup.StarvationThreshold)
-                return;
+                return null;
 
-            OnServerStarvation?.Invoke(new ServerStarvationEvent(
-                clientId, direction, active, total, ratio, now));
+            return new ServerStarvationEvent(clientId, direction, active, total, ratio, now);
+        }
+
+        internal void RaiseStarvation(ServerStarvationEvent? starvation)
+        {
+            if (starvation.HasValue)
+                OnServerStarvation?.Invoke(starvation.Value);
         }
 
         public void Dispose()

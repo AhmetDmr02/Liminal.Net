@@ -9,7 +9,6 @@ namespace Liminal.Net.Core
     {
         private readonly ILiminalTransport _transport;
         private volatile LiminalSessionManager _sessionManager;
-        private volatile DisconnectReasonCoordinator _disconnectCoordinator;
 
         private volatile bool _disposed;
 
@@ -126,13 +125,8 @@ namespace Liminal.Net.Core
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
 
-            _transport.OnClientConnected += HandleTransportClientConnected;
-            _transport.OnClientDisconnected += HandleTransportClientDisconnected;
-            _transport.OnLocalClientConnected += HandleTransportLocalClientConnected;
-            _transport.OnLocalClientDisconnected += HandleTransportLocalClientDisconnected;
-            _transport.OnClientKicked += HandleTransportClientKicked;
+            //Connection events and shutdown come in through the run's session manager and the manager's drain, not straight from the transport
             _transport.OnServerStarted += HandleTransportServerStarted;
-            _transport.OnShutdown += HandleTransportShutdown;
         }
 
         #region Core Binding
@@ -145,13 +139,16 @@ namespace Liminal.Net.Core
         /// </summary>
         public void BindCoreSystems(
             LiminalSessionManager sessionManager,
-            DisconnectReasonCoordinator disconnectCoordinator = null,
             Action<ushort> onPreLocalClientConnected = null,
             Action<ushort> onPostLocalClientConnected = null,
             Action<ushort> onPreLocalClientDisconnected = null)
         {
+            if (sessionManager != null)
+            {
+                sessionManager.LifecycleSink = DispatchLifecycle;
+            }
+
             _sessionManager = sessionManager;
-            _disconnectCoordinator = disconnectCoordinator;
             _onPreLocalClientConnected = onPreLocalClientConnected;
             _onPostLocalClientConnected = onPostLocalClientConnected;
             _onPreLocalClientDisconnected = onPreLocalClientDisconnected;
@@ -163,70 +160,43 @@ namespace Liminal.Net.Core
         public void UnbindCoreSystems()
         {
             _sessionManager = null;
-            _disconnectCoordinator = null;
             _onPreLocalClientConnected = null;
             _onPostLocalClientConnected = null;
             _onPreLocalClientDisconnected = null;
         }
         #endregion
 
-        #region Staged Transport Event Handlers
-        private void HandleTransportClientConnected(ushort clientId)
+        #region Lifecycle Dispatch
+        //Raised by the session manager on the tick thread, or by teardown while it drains, so state changes and game events never run on a transport thread
+        private void DispatchLifecycle(LiminalLifecycleEntry entry)
         {
             if (_disposed) return;
 
-            var sessionManager = _sessionManager;
-            sessionManager?.HandleClientConnected(clientId);
-
-            LiminalAtomicHelpers.SafeInvoke(_onClientConnected, clientId);
-        }
-
-        private void HandleTransportLocalClientConnected(ushort clientId)
-        {
-            if (_disposed) return;
-
-            var sessionManager = _sessionManager;
-            sessionManager?.HandleLocalConnection(clientId);
-
-            LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientConnected, clientId);
-
-            LiminalAtomicHelpers.SafeInvoke(_onLocalClientConnected, clientId);
-
-            LiminalAtomicHelpers.SafeInvoke(_onPostLocalClientConnected, clientId);
-        }
-
-        private void HandleTransportClientDisconnected(ushort clientId)
-        {
-            if (_disposed) return;
-
-            var sessionManager = _sessionManager;
-            sessionManager?.HandleClientDisconnected(clientId);
-
-            LiminalAtomicHelpers.SafeInvoke(_onClientDisconnected, clientId);
-        }
-
-        private void HandleTransportLocalClientDisconnected(ushort clientId)
-        {
-            if (_disposed) return;
-
-            LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientDisconnected, clientId);
-
-            var sessionManager = _sessionManager;
-            sessionManager?.HandleClientDisconnected(clientId);
-            sessionManager?.HandleClientDisconnected(ILiminalTransport.SERVER_ID);
-
-            LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, clientId);
-        }
-
-        private void HandleTransportClientKicked(ushort clientId)
-        {
-            //Read once, teardown can unbind it between a null check and the call
-            var sessionManager = _sessionManager;
-            if (_disposed || sessionManager == null) return;
-
-            sessionManager.HandleClientDisconnected(clientId);
-
-            LiminalAtomicHelpers.SafeInvoke(_onClientKicked, clientId);
+            switch (entry.Kind)
+            {
+                case LiminalLifecycleKind.ClientConnected:
+                    LiminalAtomicHelpers.SafeInvoke(_onClientConnected, entry.ClientId);
+                    break;
+                case LiminalLifecycleKind.ClientDisconnected:
+                    LiminalAtomicHelpers.SafeInvoke(_onClientDisconnected, entry.ClientId);
+                    break;
+                case LiminalLifecycleKind.ClientKicked:
+                    LiminalAtomicHelpers.SafeInvoke(_onClientKicked, entry.ClientId);
+                    break;
+                case LiminalLifecycleKind.LocalClientConnected:
+                    //Lifecycle state goes Connected first so the handlers already see it
+                    LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientConnected, entry.ClientId);
+                    LiminalAtomicHelpers.SafeInvoke(_onLocalClientConnected, entry.ClientId);
+                    LiminalAtomicHelpers.SafeInvoke(_onPostLocalClientConnected, entry.ClientId);
+                    break;
+                case LiminalLifecycleKind.LocalClientDisconnected:
+                    LiminalAtomicHelpers.SafeInvoke(_onPreLocalClientDisconnected, entry.ClientId);
+                    LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, entry.ClientId);
+                    break;
+                case LiminalLifecycleKind.DisconnectResolved:
+                    LiminalAtomicHelpers.SafeInvoke(_onDisconnectResolved, entry.ClientId, entry.Reason, entry.Message);
+                    break;
+            }
         }
 
         private void HandleTransportServerStarted()
@@ -234,18 +204,20 @@ namespace Liminal.Net.Core
             if (_disposed || _sessionManager == null) return;
             LiminalAtomicHelpers.SafeInvoke(_onServerStarted);
         }
+        #endregion
 
-        private void HandleTransportShutdown()
+        #region Internal Dispatchers for Manager
+        internal void RaiseTransportShutdown()
         {
             if (_disposed) return;
             LiminalAtomicHelpers.SafeInvoke(_onTransportShutdown);
         }
-        #endregion
 
-        #region Internal Dispatchers for Manager
-        internal void RaiseDisconnectResolved(ushort id, DisconnectReason reason, string message)
+        //Only for a local disconnect that arrived after its run was torn down
+        internal void RaiseLocalClientDisconnected(ushort clientId)
         {
-            LiminalAtomicHelpers.SafeInvoke(_onDisconnectResolved, id, reason, message);
+            if (_disposed) return;
+            LiminalAtomicHelpers.SafeInvoke(_onLocalClientDisconnected, clientId);
         }
 
         internal void RaiseManagerPreInitialize() => LiminalAtomicHelpers.SafeInvoke(_onManagerPreInitialize);
@@ -282,13 +254,7 @@ namespace Liminal.Net.Core
             if (_disposed) return;
             _disposed = true;
 
-            _transport.OnClientConnected -= HandleTransportClientConnected;
-            _transport.OnClientDisconnected -= HandleTransportClientDisconnected;
-            _transport.OnLocalClientConnected -= HandleTransportLocalClientConnected;
-            _transport.OnLocalClientDisconnected -= HandleTransportLocalClientDisconnected;
-            _transport.OnClientKicked -= HandleTransportClientKicked;
             _transport.OnServerStarted -= HandleTransportServerStarted;
-            _transport.OnShutdown -= HandleTransportShutdown;
 
             UnbindCoreSystems();
             Clear();

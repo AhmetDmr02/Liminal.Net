@@ -34,6 +34,9 @@ namespace Liminal.Net.Core
         internal int RawSendCursorReliable;
         internal int RawSendCursorUnreliable;
 
+        //Set on the tick thread once its connect event was raised, Poll leaves its packets alone until then
+        internal volatile bool Announced;
+
         internal bool InboundRecoveryActive => Recovery.InboundActive;
         internal bool OutboundRecoveryActive => Recovery.OutboundActive;
         internal bool IsAnyRecoveryActive => Recovery.AnyActive;

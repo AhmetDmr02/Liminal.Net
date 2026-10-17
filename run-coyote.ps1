@@ -18,6 +18,8 @@ $extraArgs = @{
     'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_RapidRestart_OldReceiveLoop_NeverShutsDownNewSession' = '--skip-potential-deadlocks'
     'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_HandshakeGap_ServerSessionMustExistWhenLocalClientConnectedFires' = '--skip-potential-deadlocks'
     'Liminal.Net.Tests.Coyote.ConnectionHandshakePromotionGapCoyoteTests.Coyote_HandshakeGap_ServerToClientPacketDroppedIfSentImmediatelyOnLocalConnect' = '--skip-potential-deadlocks'
+    'Liminal.Net.Tests.Coyote.TransportRestartCoyoteTests.Coyote_OldConnectionShutdown_VsDisconnectAndRestart_NewSessionSurvives' = '--skip-potential-deadlocks'
+    'Liminal.Net.Tests.Coyote.TransportRestartCoyoteTests.Coyote_StaleConnectAttemptFailure_VsDisconnectAndRestart_NewSessionSurvives' = '--skip-potential-deadlocks'
 }
 
 if (-not $NoBuild) {

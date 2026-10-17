@@ -21,7 +21,7 @@ namespace Liminal.Net.Unity
 
         public override void Stop()
         {
-            _isRunning = false;
+            MarkStopped();
             _nextTickTimestamp = 0;
             Interlocked.Exchange(ref _slewAdjustmentTicks, 0);
 
@@ -49,7 +49,8 @@ namespace Liminal.Net.Unity
 
                 try
                 {
-                    InvokeTick();
+                    if (!TryInvokeTick())
+                        break;
                 }
                 catch (Exception ex)
                 {

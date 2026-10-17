@@ -3935,7 +3935,7 @@ namespace Liminal.Net.Tests.Coyote
                 {
                     for (int i = 0; i < 15; i++)
                     {
-                        sessionManager.ProcessPendingDisconnects();
+                        sessionManager.ProcessLifecycleEvents();
                     }
                 }
                 catch (Exception ex)

@@ -197,6 +197,7 @@ namespace Liminal.Net.Tests
             _serverManager.StartHost();
 
             Assert.That(SpinWait.SpinUntil(() => _serverManager.LifecycleState == NetworkLifecycleState.HostActive, 3000), Is.True);
+            SpinWait.SpinUntil(() => _serverManager.ClientRegistry.LocalClient != null, 3000);
 
             var registry = _serverManager.ClientRegistry;
             Assert.That(registry, Is.Not.Null);
@@ -223,6 +224,7 @@ namespace Liminal.Net.Tests
             Assert.That(started, Is.True);
 
             Assert.That(SpinWait.SpinUntil(() => _serverManager.LifecycleState == NetworkLifecycleState.HostActive, 3000), Is.True);
+            SpinWait.SpinUntil(() => Volatile.Read(ref readyClient) != null, 3000);
 
             var registry = _serverManager.ClientRegistry;
             Assert.That(registry.Count, Is.EqualTo(1));
@@ -388,6 +390,7 @@ namespace Liminal.Net.Tests
             var client = CreateClientManager();
             client.StartClient("127.0.0.1", _currentTestPort);
             Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            SpinWait.SpinUntil(() => client.ClientRegistry.Count >= 1, 3000);
             Assert.That(client.ClientRegistry.Count, Is.GreaterThanOrEqualTo(1));
 
             client.Disconnect();
@@ -493,6 +496,7 @@ namespace Liminal.Net.Tests
             client.StartClient("127.0.0.1", _currentTestPort);
 
             Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            SpinWait.SpinUntil(() => Volatile.Read(ref secondSubscriberRan), 3000);
             Assert.That(secondSubscriberRan, Is.True);
         }
 
@@ -514,6 +518,8 @@ namespace Liminal.Net.Tests
             client.StartClient("127.0.0.1", _currentTestPort);
 
             Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            //Server events reach the bridge from the server tick, keep draining like Update would until they arrive
+            SpinWait.SpinUntil(() => { bridge.DrainEvents(); return Volatile.Read(ref secondSubscriberRan) && Volatile.Read(ref subsequentEventRan); }, 3000);
 
             Assert.DoesNotThrow(() => bridge.DrainEvents());
             Assert.That(secondSubscriberRan, Is.True);
@@ -534,6 +540,7 @@ namespace Liminal.Net.Tests
             client.StartClient("127.0.0.1", _currentTestPort);
 
             Assert.That(SpinWait.SpinUntil(() => client.IsConnected, 3000), Is.True);
+            SpinWait.SpinUntil(() => Volatile.Read(ref secondJoinedRan), 3000);
             Assert.That(secondJoinedRan, Is.True);
         }
 
@@ -579,6 +586,7 @@ namespace Liminal.Net.Tests
             Assert.That(hostB.IsServer, Is.False);
             Assert.That(hostB.IsClient, Is.False);
 
+            SpinWait.SpinUntil(() => _serverManager.ClientRegistry.Count == 1, 3000);
             Assert.That(_serverManager.ClientRegistry.Count, Is.EqualTo(1));
             Assert.That(_serverManager.IsConnected, Is.True);
 

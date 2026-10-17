@@ -35,8 +35,8 @@ namespace Liminal.Net.Core
         public static volatile LiminalNetworkManager Instance;
         #endregion
 
-        private volatile int _role = (int)NetworkRole.None;
-        private volatile int _lifecycleState = (int)NetworkLifecycleState.Stopped;
+        private int _role = (int)NetworkRole.None;
+        private int _lifecycleState = (int)NetworkLifecycleState.Stopped;
 
         public NetworkRole Role
         {
@@ -95,7 +95,7 @@ namespace Liminal.Net.Core
                 && localID != 0
                 && SessionManager != null
                 && SessionManager.HasSession(ILiminalTransport.SERVER_ID)
-                && _isShuttingDown == 0;
+                && Volatile.Read(ref _isShutDown) == 0;
         }
 
         private bool ValidateHostOperational()
@@ -105,7 +105,7 @@ namespace Liminal.Net.Core
                 && _transport.IsConnected
                 && localID != 0
                 && SessionManager != null
-                && _isShuttingDown == 0;
+                && Volatile.Read(ref _isShutDown) == 0;
         }
 
         private bool ValidateServerOperational()
@@ -113,7 +113,7 @@ namespace Liminal.Net.Core
             return _transport != null
                 && _transport.IsServer
                 && SessionManager != null
-                && _isShuttingDown == 0;
+                && Volatile.Read(ref _isShutDown) == 0;
         }
 
         private readonly ILiminalTransport _transport;
@@ -253,58 +253,40 @@ namespace Liminal.Net.Core
             _config = config;
             _telemetryConfig = telemetryConfig ?? new LiminalTelemetryConfig { Flags = TelemetryFlags.None };
             _customTicker = customTicker;
+            _manualPollBody = ManualPollBody;
 
             Interpreter = new LiminalPacketInterpreter(this, _config);
 
             _eventHub = new LiminalEventHub(_transport);
 
             _transport.InitializeTransport(config);
-            _transport.OnShutdown += HandleTransportShutdown;
 
             ClientRegistry = new Liminal.Net.Registry.ClientRegistry(this);
 
             InitializeSystems();
         }
 
-        private void HandleTransportShutdown()
-        {
-            if (!TryEnterTeardownLock()) return;
-            try
-            {
-                if (Volatile.Read(ref _isDisconnecting) != 0) return;
-                if (Volatile.Read(ref _isShuttingDown) != 0) return;
-                if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped && DisconnectCoordinator == null) return;
-
-                TeardownSession();
-                CompleteRequestedShutdownLocked();
-            }
-            finally
-            {
-                Monitor.Exit(_teardownLock);
-            }
-        }
-
-        //Transport thread, decided under the lock teardown and shutdown hold so a connect landing during or after them cant bring the state back
+        //A CAS so a connect landing after a teardown already moved the state on cant bring it back
+        //runs from the transport thread right away and again on the drain before the event, whichever is first moves it
         private void HandlePreLocalClientConnected(ushort clientId)
         {
-            if (!TryEnterTeardownLock()) return;
-            try
+            NetworkLifecycleState from, to;
+            switch (Role)
             {
-                if (Volatile.Read(ref _isDisconnecting) != 0 || Volatile.Read(ref _isTearingDown) != 0 || Volatile.Read(ref _isShuttingDown) != 0)
+                case NetworkRole.Client:
+                    from = NetworkLifecycleState.Connecting;
+                    to = NetworkLifecycleState.Connected;
+                    break;
+                case NetworkRole.Host:
+                    from = NetworkLifecycleState.StartingHost;
+                    to = NetworkLifecycleState.HostActive;
+                    break;
+                default:
                     return;
-
-                NetworkLifecycleState next;
-                if (Role == NetworkRole.Client) next = NetworkLifecycleState.Connected;
-                else if (Role == NetworkRole.Host) next = NetworkLifecycleState.HostActive;
-                else return;
-
-                LifecycleState = next;
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, next);
             }
-            finally
-            {
-                Monitor.Exit(_teardownLock);
-            }
+
+            if (Interlocked.CompareExchange(ref _lifecycleState, (int)to, (int)from) == (int)from)
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, to);
         }
 
         private void HandlePostLocalClientConnected(ushort clientId)
@@ -312,23 +294,58 @@ namespace Liminal.Net.Core
             LiminalAtomicHelpers.SafeInvoke(_onConnectedAndReady);
         }
 
+        //So OnLocalClientDisconnected handlers already see Stopping, never overwrites a teardown's own state
         private void HandlePreLocalClientDisconnected(ushort clientId)
         {
-            if (!TryEnterTeardownLock()) return;
-            try
+            while (true)
             {
-                if (Volatile.Read(ref _isDisconnecting) != 0 || Volatile.Read(ref _isShuttingDown) != 0)
+                int current = Volatile.Read(ref _lifecycleState);
+                if (current == (int)NetworkLifecycleState.Stopped || current == (int)NetworkLifecycleState.Stopping)
                     return;
 
-                if (LifecycleState != NetworkLifecycleState.Stopped)
+                if (Interlocked.CompareExchange(ref _lifecycleState, (int)NetworkLifecycleState.Stopping, current) == current)
                 {
-                    LifecycleState = NetworkLifecycleState.Stopping;
-                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, NetworkLifecycleState.Stopping);
+                    return;
                 }
+            }
+        }
+
+        //Transport thread, only for the run that queued it, a restart after the queue took it must not have its state moved by the old run
+        //skipped when the tick thread cant get the lock, the drain moves the state before raising the event anyway
+        private void ApplyLocalStateFromTransport(LiminalSessionManager owner, Action<ushort> apply, ushort clientId)
+        {
+            if (!TryEnterStateLock())
+                return;
+
+            try
+            {
+                if (!_inTeardown && ReferenceEquals(SessionManager, owner))
+                    apply(clientId);
             }
             finally
             {
-                Monitor.Exit(_teardownLock);
+                Monitor.Exit(_stateLock);
+            }
+        }
+
+        //Transport thread, a local disconnect that missed its run's queue still reaches the game unless a newer run already started
+        private void HandleOrphanLocalClientDisconnected(LiminalSessionManager owner, ushort clientId)
+        {
+            if (!TryEnterStateLock())
+                return;
+
+            try
+            {
+                if (!ReferenceEquals(SessionManager, owner) || Role != NetworkRole.None)
+                    return;
+
+                _eventHub.RaiseLocalClientDisconnected(clientId);
+                CompleteRequestedShutdownLocked();
+            }
+            finally
+            {
+                Monitor.Exit(_stateLock);
             }
         }
 
@@ -338,20 +355,31 @@ namespace Liminal.Net.Core
 
             ShutdownSystems();
 
+            //The previous run's late transport events stop here, until now its closed session manager dropped them
+            SessionManager?.DetachTransport();
+
             LiminalLogger.Log("[Manager] Initializing Network Systems...");
 
             _pipeline = new LiminalPacketFramerPipeline(_config);
-            SessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
-            DisconnectCoordinator = new DisconnectReasonCoordinator(_transport, Interpreter);
+            var sessionManager = new LiminalSessionManager(_transport, Interpreter, _config, _pipeline);
+            sessionManager.OrphanLocalClientDisconnected = id => HandleOrphanLocalClientDisconnected(sessionManager, id);
+            sessionManager.LocalClientConnectedQueued = id => ApplyLocalStateFromTransport(sessionManager, HandlePreLocalClientConnected, id);
+            sessionManager.LocalClientDisconnectedQueued = id => ApplyLocalStateFromTransport(sessionManager, HandlePreLocalClientDisconnected, id);
+            SessionManager = sessionManager;
+
+            //Created after the session manager so it hears a disconnect after it, the resolve then queues behind the disconnect
+            var coordinator = new DisconnectReasonCoordinator(_transport, Interpreter);
+            DisconnectCoordinator = coordinator;
 
             _eventHub.BindCoreSystems(
-                SessionManager,
-                DisconnectCoordinator,
+                sessionManager,
                 HandlePreLocalClientConnected,
                 HandlePostLocalClientConnected,
                 HandlePreLocalClientDisconnected);
 
-            DisconnectCoordinator.OnResolved += HandleDisconnectResolved;
+            //Into this run's own queue, a resolve landing after the run ended finds it closed and is dropped
+            coordinator.OnResolved += (id, reason, message) =>
+                sessionManager.EnqueueLifecycle(LiminalLifecycleEntry.Resolved(id, reason, message));
 
             _ticker = _customTicker ?? new LiminalTicker(_config);
 
@@ -369,22 +397,32 @@ namespace Liminal.Net.Core
             _eventHub.RaiseManagerPostInitialize();
         }
 
-        private void HandleDisconnectResolved(ushort id, DisconnectReason reason, string message)
-        {
-            _eventHub.RaiseDisconnectResolved(id, reason, message);
-        }
-
         private void ShutdownSystems()
         {
-            _eventHub.UnbindCoreSystems();
-
             if (_ticker != null)
             {
                 _ticker.OnTick -= HostTick;
                 _ticker.OnTick -= ServerTick;
                 _ticker.OnTick -= ClientBackgroundTick;
-                _ticker.Stop();
+                StopTicker();
             }
+
+            //Tick is stopped, connection events still queued (like the drop that started this teardown) are raised here with their packets
+            //a kick notice in there still reaches the coordinator so it knows the reason before it goes
+            SessionManager?.ProcessLifecycleEvents();
+
+            //Reasons it resolves on dispose are queued while still bound and raised by the second drain, nothing gets raised once unbound
+            //cleared first, its dispose can re-enter teardown through the transport and that nested pass must not dispose it again
+            var coordinator = DisconnectCoordinator;
+            if (coordinator != null)
+            {
+                DisconnectCoordinator = null;
+                coordinator.Dispose();
+            }
+
+            SessionManager?.ProcessLifecycleEvents();
+
+            _eventHub.UnbindCoreSystems();
 
             TelemetryManager?.Dispose();
             TelemetryManager = null;
@@ -393,13 +431,6 @@ namespace Liminal.Net.Core
 
             // Last flush to trigger internal dispose
             SessionManager?.Flush();
-
-            if (DisconnectCoordinator != null)
-            {
-                DisconnectCoordinator.Dispose();
-                DisconnectCoordinator.OnResolved -= HandleDisconnectResolved;
-                DisconnectCoordinator = null;
-            }
 
             //We actually wanna keep subscriptions around
             //Interpreter?.ClearAllHandlers();
@@ -413,6 +444,124 @@ namespace Liminal.Net.Core
             _config.ClientIdResolver?.ResetResolver();
         }
 
+        #region Lifecycle Lock & Drain
+        //One plain lock for every start, stop and teardown. Nothing holding it ever waits on a transport thread, transport events only
+        //queue into the run's session manager and get acted on when the manager drains, so a transport thread cant deadlock against it
+        //the tick thread never blocks on it, a teardown holding it may be waiting for that very tick
+        private readonly object _stateLock = new();
+
+        //Only touched under _stateLock, a call coming back in from a handler while this thread tears down leaves it to that teardown
+        private bool _inTeardown;
+
+        //Requests set without the lock so one made from the tick thread while someone else holds it is never lost, the next drain does it
+        private int _isShutDown;
+        private int _shutdownCompleted;
+        private int _disconnectRequested;
+
+        //False only on the tick thread when the lock is taken, the caller then leaves its request to the next drain
+        private bool TryEnterStateLock()
+        {
+            var ticker = _ticker;
+            if (ticker != null && ticker.IsTickingOnCurrentThread)
+                return Monitor.TryEnter(_stateLock);
+
+            Monitor.Enter(_stateLock);
+            return true;
+        }
+
+        //Caller holds _stateLock, acts on what came in since the last drain, true once the run is over
+        private bool DrainLocked()
+        {
+            if (_inTeardown)
+                return false;
+
+            if (Volatile.Read(ref _isShutDown) != 0)
+            {
+                CompleteRequestedShutdownLocked();
+                return true;
+            }
+
+            if (Volatile.Read(ref _disconnectRequested) != 0)
+            {
+                DisconnectLocked();
+                return true;
+            }
+
+            var sessionManager = SessionManager;
+            if (sessionManager != null && sessionManager.TransportShutDown && Role != NetworkRole.None)
+            {
+                TeardownSession();
+                CompleteRequestedShutdownLocked();
+                return true;
+            }
+
+            return false;
+        }
+
+        //Never blocks, whoever holds the lock is starting or tearing down and drains on its own
+        //the peek only spares quiet ticks the lock, DrainLocked decides again under it and a request set right after the peek waits one tick
+        private bool DrainFromTick()
+        {
+            var sessionManager = SessionManager;
+            bool pending = Volatile.Read(ref _isShutDown) != 0 ||
+                           Volatile.Read(ref _disconnectRequested) != 0 ||
+                           (sessionManager != null && sessionManager.TransportShutDown);
+            if (!pending)
+                return false;
+
+            if (!Monitor.TryEnter(_stateLock))
+                return false;
+
+            try
+            {
+                return DrainLocked();
+            }
+            finally
+            {
+                Monitor.Exit(_stateLock);
+            }
+        }
+
+        private void StopTicker()
+        {
+            _ticker?.Stop();
+        }
+
+        //Caller holds _stateLock
+        private bool CanStartLocked(string call)
+        {
+            if (_inTeardown)
+            {
+                LiminalLogger.LogError($"[Manager] Cannot {call} from inside a teardown, start again once OnLifecycleStateChanged reports Stopped.");
+                return false;
+            }
+
+            DrainLocked();
+
+            if (Volatile.Read(ref _isShutDown) != 0)
+            {
+                LiminalLogger.LogError($"[Manager] Cannot {call}: this manager was shut down, create a new LiminalNetworkManager.");
+                return false;
+            }
+
+            if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
+            {
+                LiminalLogger.LogWarning($"[Manager] Cannot {call}: Manager is in state '{LifecycleState}' (Role: {Role}).");
+                return false;
+            }
+
+            Volatile.Write(ref _disconnectRequested, 0);
+            return true;
+        }
+
+        private void RaiseTransportShutdownIfPending()
+        {
+            var sessionManager = SessionManager;
+            if (sessionManager != null && sessionManager.TryTakeTransportShutdownEvent())
+                _eventHub.RaiseTransportShutdown();
+        }
+        #endregion
+
         #region Start Methods
 
         public bool StartHost() => StartHost(_config.Default_Host, _config.Default_Port);
@@ -421,20 +570,11 @@ namespace Liminal.Net.Core
 
         public bool StartHost(string host, int port)
         {
-            if (!TryEnterTeardownLock()) return false;
+            if (!TryEnterStateLock()) return false;
             try
             {
-                if (Volatile.Read(ref _isShutDown) != 0)
-                {
-                    LiminalLogger.LogError("[Manager] Cannot StartHost: this manager was shut down, create a new LiminalNetworkManager.");
+                if (!CanStartLocked("StartHost"))
                     return false;
-                }
-
-                if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
-                {
-                    LiminalLogger.LogWarning($"[Manager] Cannot StartHost: Manager is in state '{LifecycleState}' (Role: {Role}).");
-                    return false;
-                }
 
                 LifecycleState = NetworkLifecycleState.StartingHost;
                 Role = NetworkRole.Host;
@@ -483,7 +623,7 @@ namespace Liminal.Net.Core
             }
             finally
             {
-                Monitor.Exit(_teardownLock);
+                Monitor.Exit(_stateLock);
             }
         }
 
@@ -493,20 +633,11 @@ namespace Liminal.Net.Core
 
         public bool StartServer(string ip, int port)
         {
-            if (!TryEnterTeardownLock()) return false;
+            if (!TryEnterStateLock()) return false;
             try
             {
-                if (Volatile.Read(ref _isShutDown) != 0)
-                {
-                    LiminalLogger.LogError("[Manager] Cannot StartServer: this manager was shut down, create a new LiminalNetworkManager.");
+                if (!CanStartLocked("StartServer"))
                     return false;
-                }
-
-                if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
-                {
-                    LiminalLogger.LogWarning($"[Manager] Cannot StartServer: Manager is in state '{LifecycleState}' (Role: {Role}).");
-                    return false;
-                }
 
                 LifecycleState = NetworkLifecycleState.StartingServer;
                 Role = NetworkRole.Server;
@@ -542,7 +673,7 @@ namespace Liminal.Net.Core
             }
             finally
             {
-                Monitor.Exit(_teardownLock);
+                Monitor.Exit(_stateLock);
             }
         }
 
@@ -554,20 +685,11 @@ namespace Liminal.Net.Core
 
         public bool StartClient(string ip, int port)
         {
-            if (!TryEnterTeardownLock()) return false;
+            if (!TryEnterStateLock()) return false;
             try
             {
-                if (Volatile.Read(ref _isShutDown) != 0)
-                {
-                    LiminalLogger.LogError("[Manager] Cannot StartClient: this manager was shut down, create a new LiminalNetworkManager.");
+                if (!CanStartLocked("StartClient"))
                     return false;
-                }
-
-                if (LifecycleState != NetworkLifecycleState.Stopped || Role != NetworkRole.None)
-                {
-                    LiminalLogger.LogWarning($"[Manager] Cannot StartClient: Manager is in state '{LifecycleState}' (Role: {Role}).");
-                    return false;
-                }
 
                 LifecycleState = NetworkLifecycleState.Connecting;
                 Role = NetworkRole.Client;
@@ -597,234 +719,223 @@ namespace Liminal.Net.Core
             }
             finally
             {
-                Monitor.Exit(_teardownLock);
+                Monitor.Exit(_stateLock);
             }
         }
-
-        private readonly object _teardownLock = new();
-
-        //A teardown holding this lock stops the ticker and waits for its tick, a tick blocked here would stall that wait
-        //so on the tick thread give up once the ticker is being stopped, the teardown in progress covers what was asked
-        private bool TryEnterTeardownLock()
-        {
-            var ticker = _ticker;
-            if (ticker == null || !ticker.IsTickingOnCurrentThread)
-            {
-                Monitor.Enter(_teardownLock);
-                return true;
-            }
-
-            while (!Monitor.TryEnter(_teardownLock, 1))
-            {
-                if (!ticker.IsRunning)
-                    return false;
-            }
-            return true;
-        }
-        private int _isDisconnecting;
-        private int _isTearingDown;
-        private int _isShuttingDown;
-        //Set the moment Shutdown is asked for, _shutdownCompleted once ShutdownInternal actually ran
-        private int _isShutDown;
-        private int _shutdownCompleted;
 
         public void Disconnect()
         {
-            if (!TryEnterTeardownLock()) return;
+            if (!TryEnterStateLock())
+            {
+                Volatile.Write(ref _disconnectRequested, 1);
+                return;
+            }
+
             try
             {
-                if (LifecycleState == NetworkLifecycleState.Stopping) return;
-                if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
+                if (_inTeardown) return;
 
-                Volatile.Write(ref _isDisconnecting, 1);
-                try
-                {
-                    if (Role == NetworkRole.Client && _transport.LocalClientId != 0)
-                    {
-                        DisconnectCoordinator?.RecordLocalLeave(_transport.LocalClientId, "Disconnect() was called.");
-                    }
-
-                    _ticker?.Stop();
-                    _transport.Disconnect();
-
-                    TeardownSession();
-                }
-                catch (Exception ex)
-                {
-                    LiminalLogger.LogError($"[Manager] Error during Disconnect: {ex.Message}");
-                    LifecycleState = NetworkLifecycleState.Stopped;
-                }
-                finally
-                {
-                    Volatile.Write(ref _isDisconnecting, 0);
-                }
-
+                DisconnectLocked();
                 CompleteRequestedShutdownLocked();
             }
             finally
             {
-                Monitor.Exit(_teardownLock);
+                Monitor.Exit(_stateLock);
             }
         }
 
-        private void TeardownSession()
+        //Caller holds _stateLock
+        private void DisconnectLocked()
         {
-            // Must be called while holding _teardownLock
-            Volatile.Write(ref _isTearingDown, 1);
+            Volatile.Write(ref _disconnectRequested, 0);
+
+            if (Role == NetworkRole.None && LifecycleState == NetworkLifecycleState.Stopped) return;
+
             try
             {
-                bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
-                bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
-                LifecycleState = NetworkLifecycleState.Stopping;
+                if (Role == NetworkRole.Client && _transport.LocalClientId != 0)
+                {
+                    DisconnectCoordinator?.RecordLocalLeave(_transport.LocalClientId, "Disconnect() was called.");
+                }
 
+                StopTicker();
+                _transport.Disconnect();
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] Error during Disconnect: {ex.Message}");
+            }
+
+            TeardownSession();
+        }
+
+        //Caller holds _stateLock
+        private void TeardownSession()
+        {
+            bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped;
+            bool stopped = false;
+
+            _inTeardown = true;
+            try
+            {
+                RaiseTransportShutdownIfPending();
+
+                bool alreadyStopping = Interlocked.Exchange(ref _lifecycleState, (int)NetworkLifecycleState.Stopping) == (int)NetworkLifecycleState.Stopping;
                 if (!alreadyStopping)
                 {
-                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, NetworkLifecycleState.Stopping);
                 }
 
                 try
                 {
-                    _ticker?.Stop();
-
+                    StopTicker();
                     ShutdownSystems();
-
-                    Role = NetworkRole.None;
-                    LifecycleState = NetworkLifecycleState.Stopped;
-
-                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
-                    if (wasActive)
-                    {
-                        LiminalLogger.Log("[Manager] Network State Disconnected.");
-                    }
+                    stopped = true;
                 }
                 catch (Exception ex)
                 {
                     LiminalLogger.LogError($"[Manager] Error during session teardown: {ex.Message}");
-                    Role = NetworkRole.None;
-                    LifecycleState = NetworkLifecycleState.Stopped;
                 }
-            }
-            finally
-            {
-                Volatile.Write(ref _isTearingDown, 0);
-            }
-        }
 
-        //Undoes a failed start only, the manager and the game's subscriptions stay so it can be started again
-        private void AbortStart()
-        {
-            Volatile.Write(ref _isDisconnecting, 1);
-            try
-            {
-                _ticker?.Stop();
-                _transport.Shutdown();
-                TeardownSession();
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Manager] Error while undoing a failed start: {ex.Message}");
                 Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;
             }
             finally
             {
-                Volatile.Write(ref _isDisconnecting, 0);
+                _inTeardown = false;
             }
 
+            //Out of the teardown so a handler starting again from here is allowed to
+            if (stopped)
+            {
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, NetworkLifecycleState.Stopped);
+
+                if (wasActive)
+                {
+                    LiminalLogger.Log("[Manager] Network State Disconnected.");
+                }
+            }
+        }
+
+        //Caller holds _stateLock, undoes a failed start only, the manager and the game's subscriptions stay so it can be started again
+        private void AbortStart()
+        {
+            try
+            {
+                StopTicker();
+                _transport.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError($"[Manager] Error while undoing a failed start: {ex.Message}");
+            }
+
+            TeardownSession();
             CompleteRequestedShutdownLocked();
         }
 
         //Final, after this the manager cant be started again, Disconnect is the call for leaving and reconnecting
         public void Shutdown()
         {
-            //Final from here on even if it cant run yet, so Start* refuses and the running teardown finishes it
-            Volatile.Write(ref _isShutDown, 1);
-            if (!TryEnterTeardownLock()) return;
+            if (!TryEnterStateLock())
+            {
+                //Tick thread while someone else holds the lock, the next drain or the running teardown finishes it
+                Volatile.Write(ref _isShutDown, 1);
+                return;
+            }
+
             try
             {
-                //All of these are only set while _teardownLock is held, seeing one here means this thread is inside that teardown
-                if (Volatile.Read(ref _isDisconnecting) != 0) return;
-                if (Volatile.Read(ref _isTearingDown) != 0) return;
-                if (Volatile.Read(ref _isShuttingDown) != 0) return;
+                //Set under the lock so a tick only ever sees it once this thread is done or while it still holds the lock
+                //final from here on even if a teardown is running, it finishes the shutdown on its way out
+                Volatile.Write(ref _isShutDown, 1);
+                if (_inTeardown) return;
 
                 CompleteRequestedShutdownLocked();
             }
             finally
             {
-                Monitor.Exit(_teardownLock);
+                Monitor.Exit(_stateLock);
             }
         }
 
         public void Dispose() => Shutdown();
 
-        //Must hold _teardownLock, every teardown path calls this on its way out so a Shutdown that came in during it is not lost
+        //Caller holds _stateLock, every teardown path calls this on its way out so a Shutdown that came in during it is not lost
         private void CompleteRequestedShutdownLocked()
         {
+            if (_inTeardown) return;
             if (Volatile.Read(ref _isShutDown) == 0) return;
-            if (Volatile.Read(ref _shutdownCompleted) != 0) return;
+            if (Interlocked.Exchange(ref _shutdownCompleted, 1) != 0) return;
 
             ShutdownInternal();
         }
 
+        //Caller holds _stateLock
         private void ShutdownInternal()
         {
-            Volatile.Write(ref _shutdownCompleted, 1);
-            Volatile.Write(ref _isShuttingDown, 1);
             bool wasActive = Role != NetworkRole.None || LifecycleState != NetworkLifecycleState.Stopped || _transport.IsConnected;
-            //A dropped connection already raised Stopping, this shutdown is what closes it
-            bool alreadyStopping = LifecycleState == NetworkLifecycleState.Stopping;
-            LifecycleState = NetworkLifecycleState.Stopping;
+            bool stopped = false;
 
-            if (!alreadyStopping)
-            {
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-            }
-
+            _inTeardown = true;
             try
             {
-                if (Role == NetworkRole.Client && _transport.LocalClientId != 0)
+                //A dropped connection already raised Stopping, this shutdown is what closes it
+                bool alreadyStopping = Interlocked.Exchange(ref _lifecycleState, (int)NetworkLifecycleState.Stopping) == (int)NetworkLifecycleState.Stopping;
+                if (!alreadyStopping)
                 {
-                    DisconnectCoordinator?.ResolveLocalLeave(_transport.LocalClientId, "Shutdown() was called.");
+                    LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, NetworkLifecycleState.Stopping);
                 }
 
-                _ticker?.Stop();
-
-                _transport.Shutdown();
-
-                _eventHub.RaiseManagerShutdown();
-                //Disconnect already unhooked it from OnManagerShutdown so tear it down directly or no new manager can adopt its syncvars
-                SyncVarManager?.FullTeardown();
-
-                ShutdownSystems();
-
-                //Final, so the manager lets go of the transport, a transport the game keeps must not keep this manager alive
-                _transport.OnShutdown -= HandleTransportShutdown;
-                _eventHub.Clear();
-                if (_transport is ITransportTelemetryProvider telemetryProvider)
+                try
                 {
-                    telemetryProvider.NextTickProvider = null;
+                    if (Role == NetworkRole.Client && _transport.LocalClientId != 0)
+                    {
+                        DisconnectCoordinator?.ResolveLocalLeave(_transport.LocalClientId, "Shutdown() was called.");
+                    }
+
+                    StopTicker();
+
+                    _transport.Shutdown();
+                    RaiseTransportShutdownIfPending();
+
+                    _eventHub.RaiseManagerShutdown();
+                    //Disconnect already unhooked it from OnManagerShutdown so tear it down directly or no new manager can adopt its syncvars
+                    SyncVarManager?.FullTeardown();
+
+                    ShutdownSystems();
+
+                    //Final, so the manager lets go of the transport, a transport the game keeps must not keep this manager alive
+                    SessionManager?.DetachTransport();
+                    _eventHub.Clear();
+                    if (_transport is ITransportTelemetryProvider telemetryProvider)
+                    {
+                        telemetryProvider.NextTickProvider = null;
+                    }
+
+                    stopped = true;
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[Manager] Error during Shutdown: {ex.Message}");
                 }
 
-                Role = NetworkRole.None;
-                LifecycleState = NetworkLifecycleState.Stopped;
-
-                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, LifecycleState);
-
-                if (wasActive)
-                {
-                    LiminalLogger.Log("[Manager] Network State Reset.");
-                }
-            }
-            catch (Exception ex)
-            {
-                LiminalLogger.LogError($"[Manager] Error during Shutdown: {ex.Message}");
                 Role = NetworkRole.None;
                 LifecycleState = NetworkLifecycleState.Stopped;
             }
             finally
             {
-                Volatile.Write(ref _isShuttingDown, 0);
+                _inTeardown = false;
+            }
+
+            if (stopped)
+            {
+                LiminalAtomicHelpers.SafeInvoke(_onLifecycleStateChanged, NetworkLifecycleState.Stopped);
+
+                if (wasActive)
+                {
+                    LiminalLogger.Log("[Manager] Network State Reset.");
+                }
             }
         }
         #endregion
@@ -833,6 +944,8 @@ namespace Liminal.Net.Core
 
         private void HostTick()
         {
+            if (DrainFromTick()) return;
+
             var sm = SessionManager;
 
             _eventHub.RaisePrePoll();
@@ -846,6 +959,8 @@ namespace Liminal.Net.Core
 
         private void ServerTick()
         {
+            if (DrainFromTick()) return;
+
             var sm = SessionManager;
 
             _eventHub.RaisePrePoll();
@@ -859,6 +974,8 @@ namespace Liminal.Net.Core
 
         private void ClientBackgroundTick()
         {
+            if (DrainFromTick()) return;
+
             //For now
             var sm = SessionManager;
 
@@ -893,10 +1010,20 @@ namespace Liminal.Net.Core
         {
             if (Role == NetworkRole.Client)
             {
-                _eventHub.RaisePrePoll();
-                SessionManager?.Poll();
-                _eventHub.RaisePostPoll();
+                //Counted like a tick so a teardown on another thread waits for it instead of running under it
+                _ticker?.TryRunTracked(_manualPollBody);
             }
+        }
+
+        private readonly Action _manualPollBody;
+
+        private void ManualPollBody()
+        {
+            if (DrainFromTick()) return;
+
+            _eventHub.RaisePrePoll();
+            SessionManager?.Poll();
+            _eventHub.RaisePostPoll();
         }
 
         #endregion

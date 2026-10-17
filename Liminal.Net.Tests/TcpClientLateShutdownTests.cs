@@ -29,7 +29,7 @@ namespace Liminal.Net.Tests
         //Runs the client send loop on its own socket and makes its next write fail, like an old connection's writer failing late
         private static async Task RunFailingSendLoop(TcpTransport transport, TcpClient socket)
         {
-            var state = new TcpTransport<EmptyFramingContext>.ClientSendState();
+            var state = new TcpTransport<EmptyFramingContext>.ClientSendState(1, socket);
             var sendLoop = typeof(TcpTransport<EmptyFramingContext>).GetMethod("ProcessSendQueueAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             var loop = (Task)sendLoop.Invoke(transport, new object[] { ILiminalTransport.SERVER_ID, socket, state })!;
 
@@ -123,7 +123,7 @@ namespace Liminal.Net.Tests
             }
         }
 
-        //Subclass cleanup moved from a Shutdown override to OnShutdownClaimed, it still has to run on every real shutdown
+        //Subclass cleanup lives in OnShutdownCompleted, it still has to run on every real shutdown
         [Test]
         public void LatencySimulator_Shutdown_StopsItsDrainThread()
         {

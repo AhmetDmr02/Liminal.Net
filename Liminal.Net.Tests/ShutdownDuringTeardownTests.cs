@@ -83,6 +83,8 @@ namespace Liminal.Net.Tests
             {
                 transport.TriggerLocalClientDisconnected(transport.LocalClientId);
                 transport.Shutdown();
+                //A drop the transport reports itself is torn down by the next tick, the disconnect handler runs there
+                manager.Ticker.TickOnce();
 
                 AssertShutDown(manager);
             }
@@ -90,6 +92,7 @@ namespace Liminal.Net.Tests
         }
 
         //Handler runs on the tearing down thread while it holds the lifecycle lock, the shutdown is finished once that teardown ends
+        //a lost connection is torn down by the tick that drains it
         [TestCase("ConnectionLost")]
         [TestCase("Disconnect")]
         public void Shutdown_FromLifecycleHandlerDuringTeardown_IsCompleted(string howEnded)
@@ -103,8 +106,15 @@ namespace Liminal.Net.Tests
             };
             try
             {
-                if (howEnded == "Disconnect") manager.Disconnect();
-                else transport.Shutdown();
+                if (howEnded == "Disconnect")
+                {
+                    manager.Disconnect();
+                }
+                else
+                {
+                    transport.Shutdown();
+                    manager.Ticker.TickOnce();
+                }
 
                 AssertShutDown(manager);
 

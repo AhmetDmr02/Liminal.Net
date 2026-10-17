@@ -20,10 +20,16 @@ namespace Liminal.Net.Core
 
         protected bool TryMarkRunning() => Interlocked.CompareExchange(ref _running, 1, 0) == 0;
 
+        //Full fence, the in flight read after this must not move above it or a tracked run and Stop can both miss each other
+        protected void MarkStopped() => Interlocked.Exchange(ref _running, 0);
+
         private Thread _tickThread;
 
         [ThreadStatic]
         private static LiminalTicker _tickingOnThisThread;
+        //How many of _ticksInFlight belong to _tickingOnThisThread on this thread, a Stop from inside them must not wait for those
+        [ThreadStatic]
+        private static int _ownTicksOnThisThread;
         private int _ticksInFlight;
 
         //True inside OnTick on this thread, a teardown asked for from here cant wait for its own tick
@@ -38,9 +44,12 @@ namespace Liminal.Net.Core
 
         private const int StopWaitMilliseconds = 500;
 
+        private readonly Action _raiseTick;
+
         public LiminalTicker(LiminalNetworkConfig config)
         {
             _config = config;
+            _raiseTick = () => OnTick?.Invoke();
         }
 
         public void ApplySlew(long adjustmentTicks)
@@ -69,28 +78,58 @@ namespace Liminal.Net.Core
         protected void InvokeTick()
         {
             var previous = _tickingOnThisThread;
-            _tickingOnThisThread = this;
+            int previousOwn = _ownTicksOnThisThread;
             Interlocked.Increment(ref _ticksInFlight);
+            _tickingOnThisThread = this;
+            _ownTicksOnThisThread = (ReferenceEquals(previous, this) ? previousOwn : 0) + 1;
             try
             {
                 OnTick?.Invoke();
             }
             finally
             {
-                Interlocked.Decrement(ref _ticksInFlight);
                 _tickingOnThisThread = previous;
+                _ownTicksOnThisThread = previousOwn;
+                Interlocked.Decrement(ref _ticksInFlight);
             }
         }
 
-        //Teardown must not run under a tick still going on another thread
+        //For tick loops Stop cant join like Unity's Update, checking _isRunning before InvokeTick lets Stop land in between and miss the tick
+        protected bool TryInvokeTick() => TryRunTracked(_raiseTick);
+
+        //Work outside OnTick that teardown must still wait for, counted before the running check so Stop either waits for it or it sees Stop
+        internal bool TryRunTracked(Action action)
+        {
+            var previous = _tickingOnThisThread;
+            int previousOwn = _ownTicksOnThisThread;
+            Interlocked.Increment(ref _ticksInFlight);
+            try
+            {
+                if (!_isRunning)
+                    return false;
+
+                _tickingOnThisThread = this;
+                _ownTicksOnThisThread = (ReferenceEquals(previous, this) ? previousOwn : 0) + 1;
+                action();
+                return true;
+            }
+            finally
+            {
+                _tickingOnThisThread = previous;
+                _ownTicksOnThisThread = previousOwn;
+                Interlocked.Decrement(ref _ticksInFlight);
+            }
+        }
+
+        //Teardown must not run under a tick still going on another thread, a Stop from inside a tick only skips its own
+        //a drop is torn down on the tick thread while a ManualPoll on the main thread may still be running
         protected void WaitForTicksToFinish()
         {
-            if (IsTickingOnCurrentThread)
-                return;
+            int own = IsTickingOnCurrentThread ? _ownTicksOnThisThread : 0;
 
             long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * StopWaitMilliseconds / 1000;
             var spinner = new SpinWait();
-            while (Volatile.Read(ref _ticksInFlight) > 0)
+            while (Volatile.Read(ref _ticksInFlight) > own)
             {
                 if (Stopwatch.GetTimestamp() > deadline)
                 {
@@ -117,7 +156,7 @@ namespace Liminal.Net.Core
 
         public virtual void Stop()
         {
-            _isRunning = false;
+            MarkStopped();
 
             var thread = Volatile.Read(ref _tickThread);
 

@@ -143,7 +143,7 @@ namespace Liminal.Net.Core
         {
             private readonly object _lock = new();
 
-            private sealed class StickySubscription
+            internal sealed class StickySubscription
             {
                 public readonly Action<T, ushort> Callback;
                 public long DeliveredVersion;
@@ -156,10 +156,13 @@ namespace Liminal.Net.Core
                     DeliveredVersion = initialVersion;
                 }
 
+                //Only drops a pending entry the clear disposed, one queued by a dispatch after the clear must still be delivered
+                //DeliveredVersion stays, sticky versions only go up so a value sent after the clear is always newer
                 public void Reset()
                 {
-                    Interlocked.Exchange(ref PendingEntry, null);
-                    Volatile.Write(ref DeliveredVersion, 0);
+                    var pending = Volatile.Read(ref PendingEntry);
+                    if (pending != null && pending.IsDisposed)
+                        Interlocked.CompareExchange(ref PendingEntry, null, pending);
                 }
 
                 public void EnqueueAndDrain(StickyPacketEntry entry, MessagePackSerializerOptions options)
@@ -526,14 +529,13 @@ namespace Liminal.Net.Core
                 }
             }
 
-            public void SubscribeSticky(Action<T, ushort> callback, Func<StickyPacketEntry?> getSticky, MessagePackSerializerOptions options)
+            //Caller holds _subscriptionGate so an unsubscribe cant see this dispatcher empty and drop it before the add lands
+            //the replay is left to the caller so no handler runs under the gate
+            public StickySubscription AddSticky(Action<T, ushort> callback, Func<StickyPacketEntry?> getSticky, out StickyPacketEntry? currentSticky)
             {
-                StickySubscription sub;
-                StickyPacketEntry? currentSticky;
-
                 lock (_lock)
                 {
-                    sub = new StickySubscription(callback, 0);
+                    var sub = new StickySubscription(callback, 0);
 
                     var current = _stickySubscriptions;
                     var next = new StickySubscription[current.Length + 1];
@@ -542,8 +544,12 @@ namespace Liminal.Net.Core
                     Volatile.Write(ref _stickySubscriptions, next);
 
                     currentSticky = getSticky();
+                    return sub;
                 }
+            }
 
+            public static void ReplaySticky(StickySubscription sub, StickyPacketEntry? currentSticky, MessagePackSerializerOptions options)
+            {
                 if (currentSticky != null && currentSticky.HasData)
                 {
                     sub.EnqueueAndDrain(currentSticky, options);
@@ -668,6 +674,8 @@ namespace Liminal.Net.Core
             var subscription = new Subscription { PacketId = packetId, Callback = callback };
             bool isSticky = LiminalPacketLibrary.IsSticky(packetId);
             TypedPacketDispatcher<T> dispatcher;
+            TypedPacketDispatcher<T>.StickySubscription? stickySub = null;
+            StickyPacketEntry? currentSticky = null;
 
             lock (_subscriptionGate)
             {
@@ -682,7 +690,11 @@ namespace Liminal.Net.Core
                     }
 
                     dispatcher = GetOrCreateDispatcher<T>(packetId);
-                    if (!isSticky)
+                    if (isSticky)
+                    {
+                        stickySub = dispatcher.AddSticky(callback, () => _stickyPackets.TryGetValue(packetId, out var entry) ? entry : null, out currentSticky);
+                    }
+                    else
                     {
                         dispatcher.Add(callback);
                     }
@@ -692,9 +704,9 @@ namespace Liminal.Net.Core
                 LiminalLogger.Log($"[Interpreter] {subscriber.GetType().Name} subscribed to {typeof(T).Name} (ID: {packetId})", LiminalLogger.LogLevel.Detailed);
             }
 
-            if (isSticky)
+            if (stickySub != null)
             {
-                dispatcher.SubscribeSticky(callback, () => _stickyPackets.TryGetValue(packetId, out var entry) ? entry : null, _options);
+                TypedPacketDispatcher<T>.ReplaySticky(stickySub, currentSticky, _options);
             }
         }
 
@@ -1755,7 +1767,9 @@ namespace Liminal.Net.Core
                     {
                         if (entry.IsDisposed)
                         {
-                            _stickyPackets.TryRemove(packetId, out _);
+                            //Only this disposed entry, another dispatch may already have put a live one under the id
+                            ((ICollection<KeyValuePair<ushort, StickyPacketEntry>>)_stickyPackets)
+                                .Remove(new KeyValuePair<ushort, StickyPacketEntry>(packetId, entry));
                             continue;
                         }
                     }

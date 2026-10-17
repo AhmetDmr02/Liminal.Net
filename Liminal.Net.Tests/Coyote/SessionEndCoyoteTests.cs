@@ -112,6 +112,9 @@ namespace Liminal.Net.Tests.Coyote
             var teardown = RunCapturing(() => transport.Shutdown(), ex => failure = ex);
             await Task.WhenAll(drop, teardown);
 
+            //A drop the transport reports itself is torn down by the next tick, the disconnect handler runs there
+            manager.Ticker.TickOnce();
+
             Specification.Assert(failure == null, $"Unexpected exception: {failure}");
             AssertShutDown(manager, states);
         }

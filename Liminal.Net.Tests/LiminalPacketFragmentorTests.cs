@@ -700,12 +700,18 @@ namespace Liminal.Net.Tests
             public int ConnectedClientCount => ConnectedClients.Count;
 
             public bool IsClientConnected(ushort clientId) => ConnectedClients.Contains(clientId);
+            public uint GetConnectionId(ushort clientId) => ConnectedClients.Contains(clientId) ? 1u : 0u;
 
             public void InitializeTransport(LiminalNetworkConfig config) { }
             public void StartServer(string ip, int port) => IsServer = true;
             public void StartClient(string ip, int port) => IsServer = false;
             public void Disconnect() { }
             public void Shutdown() { }
+
+            public void Kick(ushort clientId, uint connectionId)
+            {
+                if (connectionId != 0) Kick(clientId);
+            }
 
             public void Kick(ushort clientId)
             {
@@ -741,6 +747,7 @@ namespace Liminal.Net.Tests
             public event ClientConnectionHandler OnClientConnected;
             public event ClientConnectionHandler OnClientDisconnected;
             public event ClientConnectionHandler OnClientKicked;
+            public event Action<ushort, DisconnectReason, string> OnTransportDisconnectReason;
         }
 
         public readonly struct SecureFramingContext

@@ -3,6 +3,7 @@ using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Liminal.Net.Tests
 {
@@ -76,6 +77,9 @@ namespace Liminal.Net.Tests
         public event ClientConnectionHandler? OnClientConnected;
         public event ClientConnectionHandler? OnClientDisconnected;
         public event ClientConnectionHandler? OnClientKicked;
+        public event Action<ushort, DisconnectReason, string>? OnTransportDisconnectReason;
+
+        public void TriggerTransportDisconnectReason(ushort id, DisconnectReason reason, string message) => OnTransportDisconnectReason?.Invoke(id, reason, message);
 
         public Action<byte[], ushort, TransportFlags>? OnSendHook;
 
@@ -88,8 +92,37 @@ namespace Liminal.Net.Tests
 
         public void StartServer(string ip, int port) => OnServerStarted?.Invoke();
         public void StartClient(string ip, int port) { }
-        public void Disconnect() => OnShutdown?.Invoke();
-        public void Shutdown() => OnShutdown?.Invoke();
+        //New id per connection so tests can tell a reconnect under the same client id from the old connection
+        private readonly ConcurrentDictionary<ushort, uint> _connections = new();
+        private int _lastConnectionId;
+
+        private uint NextConnectionId() => (uint)Interlocked.Increment(ref _lastConnectionId);
+
+        //Like a real transport every connection is gone once it shuts down
+        public void Disconnect()
+        {
+            _connections.Clear();
+            OnShutdown?.Invoke();
+        }
+
+        public void Shutdown()
+        {
+            _connections.Clear();
+            OnShutdown?.Invoke();
+        }
+
+        public uint GetConnectionId(ushort clientId) => _connections.TryGetValue(clientId, out var connection) ? connection : 0;
+
+        public void Kick(ushort clientId, uint connectionId)
+        {
+            if (connectionId == 0 ||
+                !((ICollection<KeyValuePair<ushort, uint>>)_connections).Remove(new KeyValuePair<ushort, uint>(clientId, connectionId)))
+                return;
+
+            KickedClients.Add(clientId);
+            ConnectedClients.Remove(clientId);
+            OnClientKicked?.Invoke(clientId);
+        }
 
         public void Send(Span<byte> data, ushort clientId, TransportFlags flags)
         {
@@ -104,6 +137,7 @@ namespace Liminal.Net.Tests
 
         public void Kick(ushort clientId)
         {
+            _connections.TryRemove(clientId, out _);
             KickedClients.Add(clientId);
             ConnectedClients.Remove(clientId);
             OnClientKicked?.Invoke(clientId);
@@ -120,12 +154,14 @@ namespace Liminal.Net.Tests
 
         public void TriggerClientConnected(ushort id)
         {
+            _connections[id] = NextConnectionId();
             ConnectedClients.Add(id);
             OnClientConnected?.Invoke(id);
         }
 
         public void TriggerClientDisconnected(ushort id)
         {
+            _connections.TryRemove(id, out _);
             ConnectedClients.Remove(id);
             OnClientDisconnected?.Invoke(id);
         }
@@ -135,8 +171,17 @@ namespace Liminal.Net.Tests
             Kick(id);
         }
 
-        public void TriggerLocalClientConnected(ushort id) => OnLocalClientConnected?.Invoke(id);
-        public void TriggerLocalClientDisconnected(ushort id) => OnLocalClientDisconnected?.Invoke(id);
+        public void TriggerLocalClientConnected(ushort id)
+        {
+            _connections[ILiminalTransport.SERVER_ID] = NextConnectionId();
+            OnLocalClientConnected?.Invoke(id);
+        }
+
+        public void TriggerLocalClientDisconnected(ushort id)
+        {
+            _connections.TryRemove(ILiminalTransport.SERVER_ID, out _);
+            OnLocalClientDisconnected?.Invoke(id);
+        }
 
         public void TriggerMessageReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);
         public void TriggerReliableReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);

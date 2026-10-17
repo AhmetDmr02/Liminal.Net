@@ -22,11 +22,33 @@ namespace Liminal.Net.Core
 
         private readonly ConcurrentQueue<(ushort SenderId, InboundPacket Packet)> _loopbackQueue = new();
 
-        private readonly ConcurrentQueue<(ushort ClientId, LiminalSession Session)> _pendingDisconnects = new();
+        //Written under _lifecycleLock together with the session map so connect and disconnect land in the order the transport raised them
+        private readonly ConcurrentQueue<LiminalLifecycleEntry> _lifecycleQueue = new();
+        private bool _lifecycleClosed;
+        private Action<LiminalLifecycleEntry> _lifecycleSink;
 
-        // Contains the exact session object that has been disconnected but has not
-        // yet had its resources cleaned up on the game thread.
-        private readonly ConcurrentDictionary<ushort, LiminalSession> _disconnectingSessions = new();
+        internal Action<LiminalLifecycleEntry> LifecycleSink
+        {
+            get => Volatile.Read(ref _lifecycleSink);
+            set => Volatile.Write(ref _lifecycleSink, value);
+        }
+
+        //A local disconnect this closed manager can no longer queue, the game is still told its own connection ended
+        private Action<ushort> _orphanLocalClientDisconnected;
+        internal Action<ushort> OrphanLocalClientDisconnected
+        {
+            get => Volatile.Read(ref _orphanLocalClientDisconnected);
+            set => Volatile.Write(ref _orphanLocalClientDisconnected, value);
+        }
+
+        //Raised on the transport thread once a local connect or disconnect made it into this run's queue, the manager moves its state right away
+        internal Action<ushort> LocalClientConnectedQueued;
+        internal Action<ushort> LocalClientDisconnectedQueued;
+
+        //0 none, 1 the transport shut down during this run, 2 and the game was told
+        private int _transportShutdown;
+        internal bool TransportShutDown => Volatile.Read(ref _transportShutdown) != 0;
+        internal bool TryTakeTransportShutdownEvent() => Interlocked.CompareExchange(ref _transportShutdown, 2, 1) == 1;
 
         private readonly ILiminalTransport _transport;
         private readonly LiminalNetworkConfig _config;
@@ -72,7 +94,26 @@ namespace Liminal.Net.Core
             _transport.OnMessageReceivedReliable += HandleReliableMessage;
             _transport.OnMessageReceivedUnreliable += HandleUnreliableMessage;
 
+            //Subscribed per run, an event raised late for this run lands here and the closed queue drops it instead of a newer run taking it
+            _transport.OnClientConnected += OnTransportClientConnected;
+            _transport.OnClientDisconnected += OnTransportClientDisconnected;
+            _transport.OnClientKicked += OnTransportClientKicked;
+            _transport.OnLocalClientConnected += OnTransportLocalClientConnected;
+            _transport.OnLocalClientDisconnected += OnTransportLocalClientDisconnected;
+            _transport.OnShutdown += OnTransportShutdown;
+
             _interpreter.OnSendRequest += BufferPacket;
+        }
+
+        //Next run or final shutdown, until then this closed manager keeps dropping its run's late transport events
+        internal void DetachTransport()
+        {
+            _transport.OnClientConnected -= OnTransportClientConnected;
+            _transport.OnClientDisconnected -= OnTransportClientDisconnected;
+            _transport.OnClientKicked -= OnTransportClientKicked;
+            _transport.OnLocalClientConnected -= OnTransportLocalClientConnected;
+            _transport.OnLocalClientDisconnected -= OnTransportLocalClientDisconnected;
+            _transport.OnShutdown -= OnTransportShutdown;
         }
 
         #region Receive Path
@@ -81,57 +122,14 @@ namespace Liminal.Net.Core
 
         private void HandleUnreliableMessage(ReadOnlySpan<byte> data, ushort id) => ProcessIncoming(id, data, DeliveryMethod.Unreliable);
 
-        private bool TryGetOrAllocateSession(ushort id, out LiminalSession session)
-        {
-            if (_sessions.TryGetValue(id, out session))
-                return true;
-
-            if (_sessionManagerDisposed)
-            {
-                session = null;
-                return false;
-            }
-
-            lock (_lifecycleLock)
-            {
-                if (_sessionManagerDisposed)
-                {
-                    session = null;
-                    return false;
-                }
-
-                if (_sessions.TryGetValue(id, out session))
-                    return true;
-
-                if (_transport != null && _transport.IsClientConnected(id))
-                {
-                    if (id == ILiminalTransport.SERVER_ID && !_transport.IsServer)
-                    {
-                        HandleLocalConnection(id);
-                    }
-                    else
-                    {
-                        HandleClientConnected(id);
-                    }
-
-                    return _sessions.TryGetValue(id, out session);
-                }
-
-                session = null;
-                return false;
-            }
-        }
-
         private void ProcessIncoming(ushort ownerId, ReadOnlySpan<byte> transportData, DeliveryMethod deliveryMethod)
         {
             if (_sessionManagerDisposed)
                 return;
 
+            //Transports raise connect before their reader starts, no session here means the client is gone
             if (!_sessions.TryGetValue(ownerId, out var session))
-            {
-                if (!TryGetOrAllocateSession(ownerId, out session))
-                    return;
-            }
+                return;
 
             TelemetryFlags activeFlags = _telemetryConfig?.Flags ?? TelemetryFlags.None;
             bool countPackets = (activeFlags & TelemetryFlags.PacketCounting) != 0;
@@ -139,6 +137,7 @@ namespace Liminal.Net.Core
 
             bool shouldKick = false;
             string kickReason = null;
+            ServerStarvationEvent? starvation = null;
 
             try
             {
@@ -243,7 +242,7 @@ namespace Liminal.Net.Core
                         if (transportData.Length > _config.MaxPacketSizePerBatch ||
                             session.InboundPacketCount >= _config.MaxPacketCount)
                         {
-                            if (!EnsureInboundRecoveryLocked(session, ownerId, transportData.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                            if (!EnsureInboundRecoveryLocked(session, ownerId, transportData.Length, Stopwatch.GetTimestamp(), out string failureReason, ref starvation))
                             {
                                 shouldKick = true;
                                 kickReason = failureReason;
@@ -294,7 +293,7 @@ namespace Liminal.Net.Core
 
                             if (session.InboundPacketCount >= GetInboundPacketLimit(session))
                             {
-                                if (!EnsureInboundRecoveryLocked(session, ownerId, processedReliableBatch.Length, Stopwatch.GetTimestamp(), out string failureReason))
+                                if (!EnsureInboundRecoveryLocked(session, ownerId, processedReliableBatch.Length, Stopwatch.GetTimestamp(), out string failureReason, ref starvation))
                                 {
                                     shouldKick = true;
                                     kickReason = failureReason;
@@ -376,6 +375,9 @@ namespace Liminal.Net.Core
                 if (inboundBatchCount > 0)
                     Interlocked.Add(ref _totalPacketsInbound, inboundBatchCount);
 
+                if (starvation.HasValue)
+                    EnqueueLifecycle(LiminalLifecycleEntry.Starved(starvation.Value));
+
                 if (shouldKick)
                 {
                     _hiccup.Kick(ownerId, LiminalRecoveryDirection.Inbound, kickReason);
@@ -441,22 +443,17 @@ namespace Liminal.Net.Core
                 }
             }
 
-            if (_disconnectingSessions.ContainsKey(targetId))
-                return;
-
             if (!_sessions.TryGetValue(targetId, out var session))
             {
-                if (!TryGetOrAllocateSession(targetId, out session))
-                {
-                    LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
-                    return;
-                }
+                LiminalLogger.LogWarning($"[SessionManager] Cannot route packet. Target {targetId} does not exist.");
+                return;
             }
 
             int frameSize = 4 + 2 + payload.Length;
 
             bool shouldKick = false;
             string kickReason = null;
+            ServerStarvationEvent? starvation = null;
 
             int bufferedSize = 0;
             bool raiseBufferedEvent = false;
@@ -558,7 +555,8 @@ namespace Liminal.Net.Core
                                         targetId,
                                         required,
                                         Stopwatch.GetTimestamp(),
-                                        out string failureReason))
+                                        out string failureReason,
+                                        ref starvation))
                                 {
                                     session.RawSendCursorReliable = 0;
                                     session.RawSendCursorUnreliable = 0;
@@ -622,6 +620,9 @@ namespace Liminal.Net.Core
             }
             finally
             {
+                if (starvation.HasValue)
+                    EnqueueLifecycle(LiminalLifecycleEntry.Starved(starvation.Value));
+
                 if (shouldKick)
                 {
                     _hiccup.Kick(
@@ -646,8 +647,6 @@ namespace Liminal.Net.Core
             for (int i = 0; i < activeSessions.Length; i++)
             {
                 var session = activeSessions[i];
-                if (_disconnectingSessions.ContainsKey(session.Id))
-                    continue;
 
                 try
                 {
@@ -816,6 +815,9 @@ namespace Liminal.Net.Core
             {
                 _fragmentor.PruneStaleAssemblies();
 
+                //Before any packet so a session's connect event is always raised ahead of its first packet
+                ProcessLifecycleEvents();
+
                 while (!_loopbackQueue.IsEmpty &&
                        _loopbackQueue.TryDequeue(out var loopbackItem))
                 {
@@ -842,60 +844,16 @@ namespace Liminal.Net.Core
                 for (int i = 0; i < activeSessions.Length; i++)
                 {
                     var session = activeSessions[i];
-                    if (session.IsDisposed())
+                    if (session.IsDisposed() || !session.Announced)
                         continue;
 
                     if (!_sessions.TryGetValue(session.Id, out var current) || !ReferenceEquals(current, session))
                         continue;
 
-                    while (session.InboundQueueUnreliable.TryDequeue(out var packet))
-                    {
-                        session.ReleaseInboundPacketUnreliable();
-
-                        try
-                        {
-                            _interpreter.Dispatch(
-                                packet.PacketId,
-                                session.Id,
-                                packet.AsMemory());
-                        }
-                        catch (Exception ex)
-                        {
-                            LiminalLogger.LogError(
-                                $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
-                        }
-                        finally
-                        {
-                            ReturnPacketBuffer(packet);
-                        }
-                    }
-
-                    while (session.InboundQueueReliable.TryDequeue(out var packet))
-                    {
-                        session.ReleaseInboundPacketReliable();
-
-                        try
-                        {
-                            _interpreter.Dispatch(
-                                packet.PacketId,
-                                session.Id,
-                                packet.AsMemory());
-                        }
-                        catch (Exception ex)
-                        {
-                            LiminalLogger.LogError(
-                                $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
-                        }
-                        finally
-                        {
-                            ReturnPacketBuffer(packet);
-                        }
-                    }
+                    DrainInbound(session, dispatch: true);
 
                     _hiccup.ReleaseInboundWhenSafe(session, now);
                 }
-
-                ProcessPendingDisconnects();
             }
             finally
             {
@@ -903,10 +861,48 @@ namespace Liminal.Net.Core
             }
         }
 
+        private void DrainInbound(LiminalSession session, bool dispatch)
+        {
+            while (session.InboundQueueUnreliable.TryDequeue(out var packet))
+            {
+                session.ReleaseInboundPacketUnreliable();
+                DispatchAndReturn(session.Id, packet, dispatch);
+            }
+
+            while (session.InboundQueueReliable.TryDequeue(out var packet))
+            {
+                session.ReleaseInboundPacketReliable();
+                DispatchAndReturn(session.Id, packet, dispatch);
+            }
+        }
+
+        private void DispatchAndReturn(ushort sessionId, InboundPacket packet, bool dispatch)
+        {
+            try
+            {
+                if (dispatch)
+                {
+                    _interpreter.Dispatch(
+                        packet.PacketId,
+                        sessionId,
+                        packet.AsMemory());
+                }
+            }
+            catch (Exception ex)
+            {
+                LiminalLogger.LogError(
+                    $"[SessionManager] Error in handler for ID {packet.PacketId}: {ex}");
+            }
+            finally
+            {
+                ReturnPacketBuffer(packet);
+            }
+        }
+
         #endregion
 
         #region Lifecycle
- 
+
         public bool HasSession(ushort sessionId)
         {
             return !_sessionManagerDisposed && _sessions.ContainsKey(sessionId);
@@ -920,84 +916,156 @@ namespace Liminal.Net.Core
             return false;
         }
 
-        internal void HandleLocalConnection(ushort clientId)
-        {
-            if (_sessionManagerDisposed)
-                return;
+        private void OnTransportClientConnected(ushort clientId) => HandleClientConnected(clientId);
 
+        private void OnTransportClientDisconnected(ushort clientId) => HandleClientDisconnected(clientId);
+
+        private void OnTransportClientKicked(ushort clientId) => HandleClientDisconnected(clientId, LiminalLifecycleKind.ClientKicked);
+
+        private void OnTransportLocalClientDisconnected(ushort clientId)
+        {
+            if (HandleLocalClientDisconnected(clientId))
+                LocalClientDisconnectedQueued?.Invoke(clientId);
+            else
+                OrphanLocalClientDisconnected?.Invoke(clientId);
+        }
+
+        //Acted on by the manager's next drain, not here on the transport thread
+        private void OnTransportShutdown()
+        {
             lock (_lifecycleLock)
             {
-                if (_sessionManagerDisposed)
+                if (_lifecycleClosed)
                     return;
 
-                if (_disconnectingSessions.TryRemove(ILiminalTransport.SERVER_ID, out var staleServerSession))
-                {
-                    DisposeDisconnectedSession(staleServerSession);
-                }
+                Interlocked.CompareExchange(ref _transportShutdown, 1, 0);
+            }
+        }
+
+        //Server session is created now so the reader that starts after this finds it
+        private void OnTransportLocalClientConnected(ushort clientId)
+        {
+            if (QueueLocalConnection(clientId))
+                LocalClientConnectedQueued?.Invoke(clientId);
+        }
+
+        private bool QueueLocalConnection(ushort clientId)
+        {
+            lock (_lifecycleLock)
+            {
+                if (_sessionManagerDisposed || _lifecycleClosed)
+                    return false;
 
                 if (_sessions.TryRemove(ILiminalTransport.SERVER_ID, out var existingServerSession))
                 {
-                    DisposeDisconnectedSession(existingServerSession);
+                    EndSession(existingServerSession, dispatch: false);
                 }
 
-                _sessions[ILiminalTransport.SERVER_ID] = new LiminalSession(
+                var session = new LiminalSession(
                     ILiminalTransport.SERVER_ID,
                     _config.MaxPacketSizePerBatch);
+
+                _sessions[ILiminalTransport.SERVER_ID] = session;
 
                 UpdateActiveSessionsArrayLocked();
 
                 LiminalLogger.Log(
                     $"[SessionManager] Created session for Server (ID: {ILiminalTransport.SERVER_ID})");
+
+                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(LiminalLifecycleKind.LocalClientConnected, clientId, session));
+                return true;
             }
         }
 
-        internal void HandleClientConnected(ushort id)
+        //False once this run's lifecycle is closed, the event belongs to a run thats over and is dropped
+        internal bool HandleClientConnected(ushort id)
         {
-            if (_sessionManagerDisposed)
-                return;
-
             lock (_lifecycleLock)
             {
-                if (_sessionManagerDisposed)
-                    return;
+                if (_sessionManagerDisposed || _lifecycleClosed)
+                    return false;
 
-                if (_transport != null && !_transport.IsClientConnected(id))
-                    return;
+                LiminalSession session = null;
 
-                if (_disconnectingSessions.TryRemove(id, out var staleSession))
+                if (_transport == null || _transport.IsClientConnected(id))
                 {
-                    DisposeDisconnectedSession(staleSession);
+                    //Replaced without a disconnect, its leftovers belong to a connection that no longer exists
+                    if (_sessions.TryRemove(id, out var existingSession))
+                    {
+                        EndSession(existingSession, dispatch: false);
+                    }
+
+                    session = new LiminalSession(
+                        id,
+                        _config.MaxPacketSizePerBatch);
+
+                    _sessions[id] = session;
+
+                    UpdateActiveSessionsArrayLocked();
                 }
 
-                if (_sessions.TryRemove(id, out var existingSession))
-                {
-                    DisposeDisconnectedSession(existingSession);
-                }
-
-                _sessions[id] = new LiminalSession(
-                    id,
-                    _config.MaxPacketSizePerBatch);
-
-                UpdateActiveSessionsArrayLocked();
+                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(LiminalLifecycleKind.ClientConnected, id, session));
+                return true;
             }
         }
 
-        internal void HandleClientDisconnected(ushort id)
+        //Session leaves the map now so no more packets reach it, what it already has is dispatched before the event
+        internal bool HandleClientDisconnected(ushort id, LiminalLifecycleKind kind = LiminalLifecycleKind.ClientDisconnected)
         {
-            if (_sessionManagerDisposed)
-                return;
-
             lock (_lifecycleLock)
             {
-                if (!_sessions.TryRemove(id, out var session))
-                    return;
+                if (_sessionManagerDisposed || _lifecycleClosed)
+                    return false;
 
-                UpdateActiveSessionsArrayLocked();
+                if (_sessions.TryRemove(id, out var session))
+                {
+                    UpdateActiveSessionsArrayLocked();
+                }
 
-                if (!_disconnectingSessions.TryAdd(id, session))
-                    return;
+                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(kind, id, session));
+                return true;
+            }
+        }
 
-                _pendingDisconnects.Enqueue((id, session));
+        internal bool HandleLocalClientDisconnected(ushort clientId)
+        {
+            lock (_lifecycleLock)
+            {
+                if (_sessionManagerDisposed || _lifecycleClosed)
+                    return false;
+
+                bool changed = false;
+
+                if (clientId != ILiminalTransport.SERVER_ID && _sessions.TryRemove(clientId, out var ownSession))
+                {
+                    changed = true;
+                    _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(LiminalLifecycleKind.SessionClosed, clientId, ownSession));
+                }
+
+                if (_sessions.TryRemove(ILiminalTransport.SERVER_ID, out var serverSession))
+                {
+                    changed = true;
+                }
+
+                if (changed)
+                {
+                    UpdateActiveSessionsArrayLocked();
+                }
+
+                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(LiminalLifecycleKind.LocalClientDisconnected, clientId, serverSession));
+                return true;
+            }
+        }
+
+        internal bool EnqueueLifecycle(LiminalLifecycleEntry entry)
+        {
+            lock (_lifecycleLock)
+            {
+                if (_lifecycleClosed)
+                    return false;
+
+                _lifecycleQueue.Enqueue(entry);
+                return true;
             }
         }
 
@@ -1012,39 +1080,50 @@ namespace Liminal.Net.Core
             Volatile.Write(ref _activeSessions, array);
         }
 
-        internal void ProcessPendingDisconnects()
-        {
-            while (_pendingDisconnects.TryDequeue(out var pending))
-            {
-                DisposeDisconnectedSession(pending.Session);
+        //Tick thread, or teardown once the tick is stopped
+        internal void ProcessLifecycleEvents() => ProcessLifecycleEvents(dispatchPackets: true);
 
-                lock (_lifecycleLock)
+        private void ProcessLifecycleEvents(bool dispatchPackets)
+        {
+            while (_lifecycleQueue.TryDequeue(out var entry))
+            {
+                var session = entry.Session;
+                if (session != null)
                 {
-                    if (_disconnectingSessions.TryGetValue(pending.ClientId, out var currentSession) && ReferenceEquals(currentSession, pending.Session))
+                    if (entry.Kind == LiminalLifecycleKind.ClientConnected || entry.Kind == LiminalLifecycleKind.LocalClientConnected)
                     {
-                        _disconnectingSessions.TryRemove(pending.ClientId, out _);
+                        session.Announced = true;
                     }
+                    else
+                    {
+                        EndSession(session, dispatchPackets);
+                    }
+                }
+
+                try
+                {
+                    if (entry.Kind == LiminalLifecycleKind.Starvation)
+                    {
+                        _hiccup.RaiseStarvation(entry.Starvation);
+                    }
+                    else if (entry.Kind != LiminalLifecycleKind.SessionClosed)
+                    {
+                        LifecycleSink?.Invoke(entry);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LiminalLogger.LogError($"[SessionManager] Error raising {entry.Kind} for {entry.ClientId}: {ex}");
                 }
             }
         }
 
-        private void DisposeDisconnectedSession(LiminalSession session)
+        private void EndSession(LiminalSession session, bool dispatch)
         {
-            //Disposed first, after that no receive or send under the session locks can attach recovery buffers, so the release gets all of them
+            //Disposed first, it takes the session locks so a receive still running finishes before the drain and none can queue or attach recovery after it
             session.Dispose();
             ReleaseRecoveryForSession(session);
-
-            while (session.InboundQueueUnreliable.TryDequeue(out var packet))
-            {
-                session.ReleaseInboundPacketUnreliable();
-                ReturnPacketBuffer(packet);
-            }
-
-            while (session.InboundQueueReliable.TryDequeue(out var packet))
-            {
-                session.ReleaseInboundPacketReliable();
-                ReturnPacketBuffer(packet);
-            }
+            DrainInbound(session, dispatch);
         }
 
         private void ReleaseRecoveryForSession(LiminalSession session) =>
@@ -1070,21 +1149,23 @@ namespace Liminal.Net.Core
                 ReturnPacketBuffer(loopbackItem.Packet);
             }
 
-            while (_pendingDisconnects.TryDequeue(out var pending))
-            {
-                DisposeDisconnectedSession(pending.Session);
-            }
-
-            foreach (var session in _sessions.Values)
-            {
-                DisposeDisconnectedSession(session);
-            }
-
+            LiminalSession[] remaining;
             lock (_lifecycleLock)
             {
+                //Closed under the same lock sessions are created under, nothing new appears after the snapshot below
+                _lifecycleClosed = true;
+                remaining = new LiminalSession[_sessions.Count];
+                _sessions.Values.CopyTo(remaining, 0);
                 _sessions.Clear();
                 Volatile.Write(ref _activeSessions, Array.Empty<LiminalSession>());
-                _disconnectingSessions.Clear();
+            }
+
+            //Events still queued are raised once, packets of the ended sessions are dropped
+            ProcessLifecycleEvents(dispatchPackets: false);
+
+            for (int i = 0; i < remaining.Length; i++)
+            {
+                EndSession(remaining[i], dispatch: false);
             }
 
             _hiccup.Dispose();
@@ -1160,21 +1241,19 @@ namespace Liminal.Net.Core
                 ? _hiccup.RecoverySize
                 : _config.MaxPacketSizePerBatch;
 
-        private bool EnsureInboundRecoveryLocked(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason) =>
-            _hiccup.TryEnableInbound(
-                session,
-                clientId,
-                requiredBytes,
-                now,
-                out failureReason) == HiccupEnableResult.Success;
+        private bool EnsureInboundRecoveryLocked(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason, ref ServerStarvationEvent? starvation)
+        {
+            var result = _hiccup.TryEnableInbound(session, clientId, requiredBytes, now, out failureReason, out var captured);
+            if (captured.HasValue) starvation = captured;
+            return result == HiccupEnableResult.Success;
+        }
 
-        private bool EnsureOutboundRecoveryLocked(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason) =>
-            _hiccup.TryEnableOutbound(
-                session,
-                clientId,
-                requiredBytes,
-                now,
-                out failureReason) == HiccupEnableResult.Success;
+        private bool EnsureOutboundRecoveryLocked(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason, ref ServerStarvationEvent? starvation)
+        {
+            var result = _hiccup.TryEnableOutbound(session, clientId, requiredBytes, now, out failureReason, out var captured);
+            if (captured.HasValue) starvation = captured;
+            return result == HiccupEnableResult.Success;
+        }
 
         #endregion
 

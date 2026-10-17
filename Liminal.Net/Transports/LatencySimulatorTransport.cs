@@ -214,7 +214,7 @@ namespace Liminal.Net.Transports
             }
         }
 
-        protected override void OnShutdownClaimed()
+        protected override void OnShutdownCompleted()
         {
             lock (_threadLifecycleLock)
             {

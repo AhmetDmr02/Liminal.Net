@@ -167,6 +167,7 @@ namespace Liminal.Net.Tests
 
             // Trigger connection from transport
             transport.TriggerLocalClientConnected(1);
+            SpinWait.SpinUntil(() => Volatile.Read(ref canSendDuringEvent), 2000);
 
             Assert.That(canSendDuringEvent, Is.True, "CanSend MUST be true inside OnLocalClientConnected callback.");
             Assert.That(isConnectedDuringEvent, Is.True, "IsConnected MUST be true inside OnLocalClientConnected callback.");
@@ -194,6 +195,7 @@ namespace Liminal.Net.Tests
             Assert.That(serverManager.CanSend, Is.True, "Server CanSend must be true once server is active.");
 
             transport.TriggerClientConnected(42);
+            SpinWait.SpinUntil(() => Volatile.Read(ref canSendDuringEvent), 2000);
 
             Assert.That(canSendDuringEvent, Is.True, "CanSend MUST be true inside OnClientConnected callback on server.");
             Assert.That(isConnectedDuringEvent, Is.True, "IsConnected MUST be true inside OnClientConnected callback on server.");

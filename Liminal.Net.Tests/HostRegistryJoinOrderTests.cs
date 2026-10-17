@@ -33,11 +33,15 @@ namespace Liminal.Net.Tests
             var host = new LiminalNetworkManager(new TcpTransport(), config);
             var joined = new ConcurrentQueue<ConnectedClient>();
             host.ClientRegistry.OnClientJoined += joined.Enqueue;
+            int ready = 0;
+            host.ClientRegistry.OnLocalClientReady += _ => Volatile.Write(ref ready, 1);
 
             try
             {
                 host.StartHost("127.0.0.1", port);
                 Assert.That(SpinWait.SpinUntil(() => host.LifecycleState == NetworkLifecycleState.HostActive, 5000), Is.True);
+                //Local ready is raised after every join for the host's own client, a duplicate join would have landed by then
+                SpinWait.SpinUntil(() => Volatile.Read(ref ready) == 1, 5000);
 
                 var events = joined.ToArray();
                 Assert.That(events, Has.Length.EqualTo(1), "Host's own client should join exactly once.");
