@@ -18,10 +18,24 @@ namespace Liminal.Net.Core
 
         public bool IsRunning => _isRunning;
 
-        protected bool TryMarkRunning() => Interlocked.CompareExchange(ref _running, 1, 0) == 0;
+        //Set by Stop and cleared by Start, a ticker that was never started can still be stepped by hand with TickOnce
+        private int _stopped;
+
+        protected bool TryMarkRunning()
+        {
+            if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+                return false;
+
+            Interlocked.Exchange(ref _stopped, 0);
+            return true;
+        }
 
         //Full fence, the in flight read after this must not move above it or a tracked run and Stop can both miss each other
-        protected void MarkStopped() => Interlocked.Exchange(ref _running, 0);
+        protected void MarkStopped()
+        {
+            Interlocked.Exchange(ref _stopped, 1);
+            Interlocked.Exchange(ref _running, 0);
+        }
 
         private Thread _tickThread;
 
@@ -72,7 +86,7 @@ namespace Liminal.Net.Core
 
             Volatile.Write(ref _nextTickTimestamp, nextTick);
 
-            InvokeTick();
+            RunTracked(_raiseTick, allowNeverStarted: true);
         }
 
         protected void InvokeTick()
@@ -98,14 +112,17 @@ namespace Liminal.Net.Core
         protected bool TryInvokeTick() => TryRunTracked(_raiseTick);
 
         //Work outside OnTick that teardown must still wait for, counted before the running check so Stop either waits for it or it sees Stop
-        internal bool TryRunTracked(Action action)
+        internal bool TryRunTracked(Action action) => RunTracked(action, allowNeverStarted: false);
+
+        private bool RunTracked(Action action, bool allowNeverStarted)
         {
             var previous = _tickingOnThisThread;
             int previousOwn = _ownTicksOnThisThread;
             Interlocked.Increment(ref _ticksInFlight);
             try
             {
-                if (!_isRunning)
+                bool allowed = allowNeverStarted ? Volatile.Read(ref _stopped) == 0 : _isRunning;
+                if (!allowed)
                     return false;
 
                 _tickingOnThisThread = this;

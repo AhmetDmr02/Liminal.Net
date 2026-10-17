@@ -387,13 +387,10 @@ namespace Liminal.Net.Transports
             {
                 try { clientSocket.Close(); } catch { }
 
-                if (_sendQueues.TryGetValue(clientId, out var sendState))
+                //Only the kicked socket's own queue, a reconnect under the same id may already have put its own in
+                if (_sendQueues.TryGetValue(clientId, out var sendState) && ReferenceEquals(sendState.Client, clientSocket))
                 {
                     TeardownSendQueue(clientId, sendState);
-                }
-                else
-                {
-                    TeardownSendQueue(clientId);
                 }
 
                 if (TryClaimDisconnect(clientSocket))
@@ -516,12 +513,6 @@ namespace Liminal.Net.Transports
 
         private void TeardownSendQueue(ushort clientId, ClientSendState ownedState = null)
         {
-            lock (_wireLock)
-            {
-                _wireInFlight.Remove(clientId);
-                _wireRttMap.Remove(clientId);
-            }
-
             ClientSendState state;
 
             if (ownedState != null)
@@ -536,6 +527,13 @@ namespace Liminal.Net.Transports
             else if (!_sendQueues.TryRemove(clientId, out state))
             {
                 return;
+            }
+
+            //After the claim, a teardown that lost to a newer connection must not wipe that connection's ping state
+            lock (_wireLock)
+            {
+                _wireInFlight.Remove(clientId);
+                _wireRttMap.Remove(clientId);
             }
 
             try { state.LifetimeCts.Cancel(); } catch (ObjectDisposedException) { }
@@ -966,23 +964,16 @@ namespace Liminal.Net.Transports
 
                 var newSendState = new ClientSendState(NextConnectionIdLocked(), client, maxPacketCount);
 
-                _sendQueues.AddOrUpdate(clientId, newSendState, (k, old) =>
-                {
-                    oldSendState = old;
-                    return newSendState;
-                });
-
+                //A kick or reader can remove the old entry without this lock, so the old value only counts when our swap actually replaced it
+                //AddOrUpdate's factory would keep an old value from a try that lost and the add that won would then tear down a state it never owned
+                oldSendState = SwapIn(_sendQueues, clientId, newSendState);
                 sendState = newSendState;
 
-                _sockets.AddOrUpdate(clientId, client, (key, old) =>
+                oldClient = SwapIn(_sockets, clientId, client);
+                if (oldClient != null && TryClaimDisconnect(oldClient))
                 {
-                    oldClient = old;
-                    if (TryClaimDisconnect(old))
-                    {
-                        Interlocked.Decrement(ref _totalConnections);
-                    }
-                    return client;
-                });
+                    Interlocked.Decrement(ref _totalConnections);
+                }
 
                 _clientIdResolver.ConfirmRegistration(clientId);
 
@@ -1021,6 +1012,23 @@ namespace Liminal.Net.Transports
                 try { client.Close(); } catch { }
                 sendState = null;
                 return;
+            }
+        }
+
+        //Returns the value it replaced, null when it added
+        private static TValue SwapIn<TValue>(ConcurrentDictionary<ushort, TValue> map, ushort key, TValue value) where TValue : class
+        {
+            while (true)
+            {
+                if (map.TryGetValue(key, out var current))
+                {
+                    if (map.TryUpdate(key, value, current))
+                        return current;
+                }
+                else if (map.TryAdd(key, value))
+                {
+                    return null;
+                }
             }
         }
 
