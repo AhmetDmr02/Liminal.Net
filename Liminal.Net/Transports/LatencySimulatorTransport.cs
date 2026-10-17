@@ -27,6 +27,7 @@ namespace Liminal.Net.Transports
             public byte[] Buffer;
             public int Length;
             public ushort TargetId;
+            public uint Generation;
             public TransportFlags Flags;
         }
 
@@ -87,11 +88,11 @@ namespace Liminal.Net.Transports
             base.StartClient(ip, port);
         }
 
-        protected override void SendInternal(Span<byte> data, ushort targetId, TransportFlags flags)
+        protected override void SendInternal(Span<byte> data, ushort targetId, uint generation, TransportFlags flags)
         {
             if (OneWayDelayMs <= 0.0)
             {
-                base.SendInternal(data, targetId, flags);
+                base.SendInternal(data, targetId, generation, flags);
                 return;
             }
 
@@ -123,6 +124,8 @@ namespace Liminal.Net.Transports
                     Buffer = rented,
                     Length = data.Length,
                     TargetId = targetId,
+                    //Kept with the packet so a delay that outlives the connection cant hand it to a reconnect under the same id
+                    Generation = generation,
                     Flags = flags
                 }, deliverTimestamp);
 
@@ -200,7 +203,7 @@ namespace Liminal.Net.Transports
                 {
                     try
                     {
-                        base.SendInternal(packet.Buffer.AsSpan(0, packet.Length), packet.TargetId, packet.Flags);
+                        base.SendInternal(packet.Buffer.AsSpan(0, packet.Length), packet.TargetId, packet.Generation, packet.Flags);
                     }
                     catch (Exception ex)
                     {

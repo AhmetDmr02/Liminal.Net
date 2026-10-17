@@ -7,9 +7,11 @@ using System.Threading.Tasks;
 
 namespace Liminal.Net.Interfaces
 {
-    public delegate void DataReceivedHandler(ReadOnlySpan<byte> data, ushort clientId);
+    public delegate void DataReceivedHandler(ReadOnlySpan<byte> data, LiminalConnection from);
     public delegate void TransportEventHandler();
-    public delegate void ClientConnectionHandler(ushort clientId);
+    public delegate void ClientConnectionHandler(LiminalConnection client);
+    //localClientId is the id the server gave this instance, server is the connection to it, default when it never got that far
+    public delegate void LocalConnectionHandler(ushort localClientId, LiminalConnection server);
 
     public delegate Task<HandshakeResult> ClientHandshakeOrchestrator<T>(T connection, LiminalNetworkConfig config);
     public delegate Task<HandshakeResult> ServerHandshakeOrchestrator<T>(T connection, LiminalNetworkConfig config, Func<bool> canAccept);
@@ -34,9 +36,9 @@ namespace Liminal.Net.Interfaces
         public int ConnectedClientCount { get; }
 
         /// <summary>
-        /// Id of the client's current connection, 0 when it has none. Never reused by this transport, a reconnect under the same client id gets a new one.
+        /// The client's current connection, default when it has none. On a client SERVER_ID gives the connection to the server.
         /// </summary>
-        public uint GetConnectionId(ushort clientId);
+        public LiminalConnection GetConnection(ushort clientId);
         #endregion
 
         #region Initialization
@@ -55,15 +57,21 @@ namespace Liminal.Net.Interfaces
         public void Disconnect();
 
         /// <summary>
+        /// Client Only: disconnects only if the connection to the server is still this one, decided and done atomically.
+        /// Anything acting for one connection uses this so it cant end a newer one after a restart.
+        /// </summary>
+        public void Disconnect(LiminalConnection server);
+
+        /// <summary>
         /// Server Only: Forcibly removes a specific client.
         /// </summary>
         public void Kick(ushort clientId);
 
         /// <summary>
-        /// Server Only: kicks the client only if its current connection is still connectionId, decided and claimed atomically.
+        /// Server Only: kicks only if the client's current connection is still this one, decided and claimed atomically.
         /// A delayed kick uses this so it cant hit a newer connection that reused the client id.
         /// </summary>
-        public void Kick(ushort clientId, uint connectionId);
+        public void Kick(LiminalConnection client);
 
         /// <summary>
         /// Shuts down the transport 
@@ -72,7 +80,10 @@ namespace Liminal.Net.Interfaces
         #endregion
 
         #region Sending
-        public void Send(Span<byte> data, ushort clientId, TransportFlags flags);
+        /// <summary>
+        /// Sent only if the connection is still current, data meant for an ended connection never reaches one that reused the id.
+        /// </summary>
+        public void Send(Span<byte> data, LiminalConnection to, TransportFlags flags);
         #endregion
 
         #region Events
@@ -85,8 +96,8 @@ namespace Liminal.Net.Interfaces
         public event TransportEventHandler OnShutdown;
         public event TransportEventHandler OnHandshakeInitialized;
 
-        public event ClientConnectionHandler OnLocalClientConnected;    // When this instance connects to a server
-        public event ClientConnectionHandler OnLocalClientDisconnected; // When this instance's local connection drops
+        public event LocalConnectionHandler OnLocalClientConnected;     // When this instance connects to a server
+        public event LocalConnectionHandler OnLocalClientDisconnected;  // When this instance's local connection drops
         public event ClientConnectionHandler OnClientConnected;         // When a remote client joins this server
         public event ClientConnectionHandler OnClientDisconnected;
         public event ClientConnectionHandler OnClientKicked;
@@ -94,7 +105,7 @@ namespace Liminal.Net.Interfaces
         /// <summary>
         /// Why the transport itself ended a connection (protocol violation, bad size, timeout, overflow). Local only, never sent to the peer.
         /// </summary>
-        public event Action<ushort, DisconnectReason, string> OnTransportDisconnectReason;
+        public event Action<LiminalConnection, DisconnectReason, string> OnTransportDisconnectReason;
         #endregion
     }
 }

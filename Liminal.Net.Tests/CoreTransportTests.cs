@@ -648,7 +648,7 @@ namespace Liminal.Net.Tests
             BinaryPrimitives.WriteUInt16LittleEndian(framed.Slice(4, 2), (ushort)LiminalPacketLibrary.GetId<FilePacket>());
             oversizedPayload.CopyTo(framed.Slice(6));
 
-            client.Transport.Send(framed, ILiminalTransport.SERVER_ID, TransportFlags.Unreliable);
+            client.Transport.Send(framed, client.Transport.GetConnection(ILiminalTransport.SERVER_ID), TransportFlags.Unreliable);
 
             Thread.Sleep(150);
 

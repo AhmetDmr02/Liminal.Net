@@ -37,6 +37,7 @@ namespace Liminal.Net.Tests.Coyote
         private static List<byte[]> Fragment(LiminalNetworkConfig config, params byte[][] payloads)
         {
             var senderTransport = new MockTransport();
+            senderTransport.ConnectedClients.Add(1);
             var sender = new LiminalPacketFragmentor(senderTransport, config, Mtu);
             foreach (var payload in payloads)
             {
@@ -113,7 +114,7 @@ namespace Liminal.Net.Tests.Coyote
 
             fragmentor.OnMessageReassembled += (data, sender) =>
             {
-                if (sender == 1)
+                if (sender.ClientId == 1)
                 {
                     //Kick peer 1 inside its own delivery then let peer 2 rent buffers before peer 1's bytes get read
                     transport.Kick(1);
@@ -194,7 +195,7 @@ namespace Liminal.Net.Tests.Coyote
 
             var received = new ConcurrentDictionary<ushort, ConcurrentQueue<byte[]>>();
             fragmentor.OnMessageReassembled += (data, sender) =>
-                received.GetOrAdd(sender, _ => new ConcurrentQueue<byte[]>()).Enqueue(data.ToArray());
+                received.GetOrAdd(sender.ClientId, _ => new ConcurrentQueue<byte[]>()).Enqueue(data.ToArray());
 
             var tasks = new List<Task>();
             for (ushort id = 1; id <= 3; id++)
@@ -328,6 +329,7 @@ namespace Liminal.Net.Tests.Coyote
             var smallBatch = CreateChatBatch("SMALL");
 
             var senderTransport = new MockTransport();
+            senderTransport.ConnectedClients.Add(5);
             var sender = new LiminalPacketFragmentor(senderTransport, config);
             sender.Send(bigBatch, 5, TransportFlags.Reliable);
             var bigFragments = new List<byte[]>();

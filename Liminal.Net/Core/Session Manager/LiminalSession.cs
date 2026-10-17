@@ -1,3 +1,4 @@
+using Liminal.Net.Interfaces;
 using System;
 using System.Collections.Concurrent;
 using System.Threading;
@@ -7,6 +8,9 @@ namespace Liminal.Net.Core
     public sealed class LiminalSession : IDisposable
     {
         public ushort Id { get; }
+
+        //The transport connection this session belongs to, anything acting for it later goes through this so it cant reach a reconnect under the same id
+        public LiminalConnection Connection { get; }
 
         private int _disposed;
 
@@ -63,9 +67,10 @@ namespace Liminal.Net.Core
         internal int InboundPacketCountUnreliable => Volatile.Read(ref _inboundPacketCountUnreliable);
         internal int InboundPacketCount => InboundPacketCountReliable + InboundPacketCountUnreliable;
 
-        public LiminalSession(ushort id, int bufferSize)
+        public LiminalSession(LiminalConnection connection, int bufferSize)
         {
-            Id = id;
+            Id = connection.ClientId;
+            Connection = connection;
 
             RawSendBufferReliable = new LiminalNativeBuffer(bufferSize);
             RawSendBufferUnreliable = new LiminalNativeBuffer(bufferSize);

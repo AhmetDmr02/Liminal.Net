@@ -23,7 +23,11 @@ namespace Liminal.Net.Core
 
         private readonly ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message)> _resolved = new();
         private readonly ConcurrentDictionary<ushort, TaskCompletionSource<bool>> _pendingAcks = new();
-        private readonly ConcurrentDictionary<ushort, bool> _alreadyFired = new();
+
+        //Newest connection seen per client id, an event of an older one belongs to a connection the id already moved on from and is ignored
+        private readonly ConcurrentDictionary<ushort, uint> _latestGeneration = new();
+        //Newest connection a resolve fired for, each connection resolves once and an old one can never block a newer one
+        private readonly ConcurrentDictionary<ushort, uint> _resolvedGeneration = new();
 
         private readonly object _disposeLock = new();
         private volatile bool _disposed;
@@ -45,29 +49,51 @@ namespace Liminal.Net.Core
 
             _transport.OnClientConnected += HandleClientConnected;
             _transport.OnLocalClientConnected += HandleLocalClientConnected;
-            _transport.OnClientDisconnected += HandleDisconnected;
-            _transport.OnClientKicked += HandleDisconnected;
+            _transport.OnClientDisconnected += HandleClientDisconnected;
+            _transport.OnClientKicked += HandleClientDisconnected;
             _transport.OnLocalClientDisconnected += HandleLocalClientDisconnected;
         }
 
-        private void HandleClientConnected(ushort clientId)
+        //Moves the stored generation up to generation, false when it is already there or past it
+        private static bool TryRaiseGeneration(ConcurrentDictionary<ushort, uint> map, ushort clientId, uint generation)
         {
-            _alreadyFired.TryRemove(clientId, out _);
-            _resolved.TryRemove(clientId, out _);
+            while (true)
+            {
+                if (map.TryGetValue(clientId, out var current))
+                {
+                    if (current >= generation) return false;
+                    if (map.TryUpdate(clientId, generation, current)) return true;
+                }
+                else if (map.TryAdd(clientId, generation))
+                {
+                    return true;
+                }
+            }
         }
 
-        private void HandleLocalClientConnected(ushort localId)
+        private bool IsStale(ushort clientId, uint generation) =>
+            generation != 0 && _latestGeneration.TryGetValue(clientId, out var latest) && latest > generation;
+
+        private void HandleClientConnected(LiminalConnection client)
         {
-            _alreadyFired.TryRemove(localId, out _);
+            TryRaiseGeneration(_latestGeneration, client.ClientId, client.Generation);
+            _resolved.TryRemove(client.ClientId, out _);
+        }
+
+        private void HandleLocalClientConnected(ushort localId, LiminalConnection server)
+        {
+            TryRaiseGeneration(_latestGeneration, localId, server.Generation);
             _resolved.TryRemove(localId, out _);
         }
 
-        private void HandleLocalClientDisconnected(ushort localId)
+        private void HandleLocalClientDisconnected(ushort localId, LiminalConnection server)
         {
+            if (IsStale(localId, server.Generation)) return;
+
             // If the client never received a specific reason from the server,
             // resolve under its local ID as ConnectionLost.
             _resolved.TryAdd(localId, (DisconnectReason.ConnectionLost, "Connection to server was lost."));
-            HandleDisconnected(localId);
+            HandleDisconnected(localId, server.Generation);
         }
 
         public void ServerKickWithReason(ushort clientId, DisconnectReason reason, string message = null, int? graceSeconds = null)
@@ -75,7 +101,7 @@ namespace Liminal.Net.Core
             if (_disposed) return;
 
             //Taken now, the kick below runs after the grace period and must only hit this connection
-            uint connection = _transport.GetConnectionId(clientId);
+            LiminalConnection connection = _transport.GetConnection(clientId);
 
             _resolved[clientId] = (reason, message);
 
@@ -88,7 +114,7 @@ namespace Liminal.Net.Core
             catch
             {
                 LiminalLogger.Log($"[DisconnectReasonCoordinator] Failed to send kick notice to {clientId}. Socket unusable.");
-                KickConnection(clientId, connection);
+                KickConnection(connection);
                 return;
             }
 
@@ -121,7 +147,7 @@ namespace Liminal.Net.Core
                 finally
                 {
                     RemovePendingAck(clientId, ackTcs);
-                    KickConnection(clientId, connection);
+                    KickConnection(connection);
                 }
             });
         }
@@ -135,6 +161,8 @@ namespace Liminal.Net.Core
             }
 
             ushort myId = _transport.LocalClientId;
+            //Taken now, the disconnect below runs after the grace period and must only end this connection, not one a restart made since
+            LiminalConnection server = _transport.GetConnection(ILiminalTransport.SERVER_ID);
             _resolved[myId] = (reason, message);
 
             var ackTcs = _pendingAcks.GetOrAdd(ILiminalTransport.SERVER_ID, _ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
@@ -173,8 +201,8 @@ namespace Liminal.Net.Core
                 finally
                 {
                     RemovePendingAck(ILiminalTransport.SERVER_ID, ackTcs);
-                    Resolve(myId);
-                    _transport.Disconnect();
+                    Resolve(myId, server.Generation);
+                    _transport.Disconnect(server);
                 }
             });
         }
@@ -185,10 +213,10 @@ namespace Liminal.Net.Core
                 .Remove(new KeyValuePair<ushort, TaskCompletionSource<bool>>(id, ackTcs));
 
         //No connection when the kick started means the client was already gone, nothing to kick
-        private void KickConnection(ushort clientId, uint connection)
+        private void KickConnection(LiminalConnection connection)
         {
-            if (connection != 0)
-                _transport.Kick(clientId, connection);
+            if (connection.IsValid)
+                _transport.Kick(connection);
         }
 
         public void RecordReason(ushort clientId, DisconnectReason reason, string message)
@@ -208,7 +236,7 @@ namespace Liminal.Net.Core
         internal void ResolveLocalLeave(ushort localId, string message)
         {
             RecordLocalLeave(localId, message);
-            Resolve(localId);
+            Resolve(localId, _transport.GetConnection(ILiminalTransport.SERVER_ID).Generation);
         }
 
         public bool TryGetResolvedReason(ushort id, out DisconnectReason reason, out string message)
@@ -224,8 +252,11 @@ namespace Liminal.Net.Core
             return false;
         }
 
-        internal void HandleTransportReason(ushort id, DisconnectReason reason, string msg)
+        internal void HandleTransportReason(LiminalConnection connection, DisconnectReason reason, string msg)
         {
+            if (IsStale(connection.ClientId, connection.Generation)) return;
+
+            ushort id = connection.ClientId;
             while (true)
             {
                 if (_resolved.TryGetValue(id, out var existing))
@@ -284,7 +315,14 @@ namespace Liminal.Net.Core
                 serverTcs.TrySetResult(true);
         }
 
-        private void HandleDisconnected(ushort id)
+        private void HandleClientDisconnected(LiminalConnection client)
+        {
+            if (IsStale(client.ClientId, client.Generation)) return;
+
+            HandleDisconnected(client.ClientId, client.Generation);
+        }
+
+        private void HandleDisconnected(ushort id, uint generation)
         {
             if (_pendingAcks.TryRemove(id, out var tcs))
                 tcs.TrySetCanceled();
@@ -292,10 +330,11 @@ namespace Liminal.Net.Core
             if (_pendingAcks.TryRemove(ILiminalTransport.SERVER_ID, out var sTcs))
                 sTcs.TrySetCanceled();
 
-            Resolve(id);
+            Resolve(id, generation);
         }
 
-        private void Resolve(ushort id)
+        //generation 0 is a leave with no connection behind it, like a connect that failed, it fires only when nothing fired for the id yet
+        private void Resolve(ushort id, uint generation)
         {
             Action<ushort, DisconnectReason, string> handlerSnapshot;
             DisconnectReason reason;
@@ -305,7 +344,7 @@ namespace Liminal.Net.Core
             {
                 if (_disposed) return;
 
-                if (!_alreadyFired.TryAdd(id, true))
+                if (!TryRaiseGeneration(_resolvedGeneration, id, generation))
                     return;
 
                 var (r, m) = _resolved.TryRemove(id, out var recorded)
@@ -335,14 +374,14 @@ namespace Liminal.Net.Core
 
                 _transport.OnClientConnected -= HandleClientConnected;
                 _transport.OnLocalClientConnected -= HandleLocalClientConnected;
-                _transport.OnClientDisconnected -= HandleDisconnected;
-                _transport.OnClientKicked -= HandleDisconnected;
+                _transport.OnClientDisconnected -= HandleClientDisconnected;
+                _transport.OnClientKicked -= HandleClientDisconnected;
                 _transport.OnLocalClientDisconnected -= HandleLocalClientDisconnected;
 
                 handlerSnapshot = OnResolved;
 
                 // If local client dropped and was never resolved, ensure it fires ConnectionLost before dying
-                if (!_transport.IsServer && _transport.LocalClientId != 0 && !_alreadyFired.ContainsKey(_transport.LocalClientId))
+                if (!_transport.IsServer && _transport.LocalClientId != 0 && !_resolvedGeneration.ContainsKey(_transport.LocalClientId))
                 {
                     _resolved.TryAdd(_transport.LocalClientId, (DisconnectReason.ConnectionLost, "Connection to server was lost."));
                 }
@@ -354,7 +393,8 @@ namespace Liminal.Net.Core
 
             foreach (var kvp in remaining)
             {
-                if (_alreadyFired.TryAdd(kvp.Key, true))
+                _latestGeneration.TryGetValue(kvp.Key, out var latest);
+                if (TryRaiseGeneration(_resolvedGeneration, kvp.Key, latest))
                 {
                     handlerSnapshot?.Invoke(kvp.Key, kvp.Value.Reason, kvp.Value.Message);
                 }
@@ -368,7 +408,8 @@ namespace Liminal.Net.Core
 
             _interpreter.UnsubscribeAll(this);
             _resolved.Clear();
-            _alreadyFired.Clear();
+            _latestGeneration.Clear();
+            _resolvedGeneration.Clear();
 
             OnResolved = null;
             _disposeCts.Dispose();

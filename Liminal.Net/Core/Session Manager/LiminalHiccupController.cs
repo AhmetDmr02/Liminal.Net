@@ -50,14 +50,15 @@ namespace Liminal.Net.Core
         internal int RecoveryPacketCount => _config.Hiccup.GetRecoveryPacketCount(_config.MaxPacketCount);
         internal int ActiveRecoverySessions => Volatile.Read(ref _activeRecoverySessions);
 
-        internal void Kick(ushort clientId, LiminalRecoveryDirection direction, string message)
+        //Runs after the session lock is let go, scoped to the session's own connection so it cant end a reconnect under the same id or a newer run
+        internal void Kick(LiminalSession session, LiminalRecoveryDirection direction, string message)
         {
-            LiminalLogger.LogWarning($"[Security/Hiccup/{direction}] Client {clientId}: {message}");
+            LiminalLogger.LogWarning($"[Security/Hiccup/{direction}] Client {session.Id}: {message}");
 
             if (_transport.IsServer)
-                _transport.Kick(clientId);
+                _transport.Kick(session.Connection);
             else
-                _transport.Disconnect();
+                _transport.Disconnect(session.Connection);
         }
         internal HiccupEnableResult TryEnableInbound(LiminalSession session, ushort clientId, int requiredBytes, long now, out string failureReason, out ServerStarvationEvent? starvation)
         {

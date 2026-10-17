@@ -3543,7 +3543,7 @@ namespace Liminal.Net.Tests.Coyote
 
             var taskGeneric = Task.Run(() =>
             {
-                coordinator.HandleTransportReason(clientId, DisconnectReason.ConnectionLost, "Generic lost");
+                coordinator.HandleTransportReason(new LiminalConnection(clientId, 0), DisconnectReason.ConnectionLost, "Generic lost");
             });
 
             var taskSpecific = Task.Run(() =>

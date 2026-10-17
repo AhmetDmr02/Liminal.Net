@@ -181,7 +181,7 @@ namespace Liminal.Net.Tests
             fragmentor.OnMessageReassembled += (data, sender) =>
             {
                 reassembledResult = data.ToArray();
-                seenSender = sender;
+                seenSender = sender.ClientId;
             };
 
             fragmentor.Send(originalPayload, targetId: 10, TransportFlags.Reliable);
@@ -481,7 +481,7 @@ namespace Liminal.Net.Tests
 
             fragmentor.OnMessageReassembled += (data, sender) =>
             {
-                receivedPayloads[sender] = data.ToArray();
+                receivedPayloads[sender.ClientId] = data.ToArray();
             };
 
             var allChunks = new List<(ushort SenderId, byte[] Buffer)>();
@@ -567,7 +567,7 @@ namespace Liminal.Net.Tests
             serverFragmentor.OnMessageReassembled += (data, sender) =>
             {
                 serverReceivedPayload = data.ToArray();
-                serverSeenSender = sender;
+                serverSeenSender = sender.ClientId;
             };
 
             clientFragmentor.Send(originalPayload, ILiminalTransport.SERVER_ID, TransportFlags.Reliable);
@@ -700,32 +700,35 @@ namespace Liminal.Net.Tests
             public int ConnectedClientCount => ConnectedClients.Count;
 
             public bool IsClientConnected(ushort clientId) => ConnectedClients.Contains(clientId);
-            public uint GetConnectionId(ushort clientId) => ConnectedClients.Contains(clientId) ? 1u : 0u;
+            //Never reconnects, one generation is enough
+            public LiminalConnection GetConnection(ushort clientId) => ConnectedClients.Contains(clientId) ? new LiminalConnection(clientId, 1) : default;
 
             public void InitializeTransport(LiminalNetworkConfig config) { }
             public void StartServer(string ip, int port) => IsServer = true;
             public void StartClient(string ip, int port) => IsServer = false;
             public void Disconnect() { }
+            public void Disconnect(LiminalConnection server) { }
             public void Shutdown() { }
 
-            public void Kick(ushort clientId, uint connectionId)
+            public void Kick(LiminalConnection client)
             {
-                if (connectionId != 0) Kick(clientId);
+                if (GetConnection(client.ClientId) == client) Kick(client.ClientId);
             }
 
             public void Kick(ushort clientId)
             {
+                var connection = new LiminalConnection(clientId, 1);
                 KickedClients.Add(clientId);
                 ConnectedClients.Remove(clientId);
-                OnClientKicked?.Invoke(clientId);
+                OnClientKicked?.Invoke(connection);
             }
 
-            public void Send(Span<byte> data, ushort clientId, TransportFlags flags)
+            public void Send(Span<byte> data, LiminalConnection to, TransportFlags flags)
             {
                 SentPackets.Add(new PacketRecord
                 {
                     Data = data.ToArray(),
-                    TargetId = clientId,
+                    TargetId = to.ClientId,
                     Flags = flags
                 });
             }
@@ -733,7 +736,7 @@ namespace Liminal.Net.Tests
             public void RaiseClientDisconnected(ushort clientId)
             {
                 ConnectedClients.Remove(clientId);
-                OnClientDisconnected?.Invoke(clientId);
+                OnClientDisconnected?.Invoke(new LiminalConnection(clientId, 1));
             }
 
             public event DataReceivedHandler OnMessageReceivedReliable;
@@ -742,12 +745,12 @@ namespace Liminal.Net.Tests
             public event TransportEventHandler OnServerStarted;
             public event TransportEventHandler OnShutdown;
             public event TransportEventHandler OnHandshakeInitialized;
-            public event ClientConnectionHandler OnLocalClientConnected;
-            public event ClientConnectionHandler OnLocalClientDisconnected;
+            public event LocalConnectionHandler OnLocalClientConnected;
+            public event LocalConnectionHandler OnLocalClientDisconnected;
             public event ClientConnectionHandler OnClientConnected;
             public event ClientConnectionHandler OnClientDisconnected;
             public event ClientConnectionHandler OnClientKicked;
-            public event Action<ushort, DisconnectReason, string> OnTransportDisconnectReason;
+            public event Action<LiminalConnection, DisconnectReason, string> OnTransportDisconnectReason;
         }
 
         public readonly struct SecureFramingContext

@@ -50,9 +50,9 @@ namespace Liminal.Net.Tests
                     Interlocked.Increment(ref shutdowns);
                     if (Environment.CurrentManagedThreadId != callerThread) Interlocked.Increment(ref shutdownsOffCaller);
                 };
-                transport.OnLocalClientDisconnected += _ => Interlocked.Increment(ref localDisconnects);
+                transport.OnLocalClientDisconnected += (_, _) => Interlocked.Increment(ref localDisconnects);
                 //Stands in for the manager's own disconnect handlers and logging, they take a few ms in a real game
-                transport.OnLocalClientDisconnected += _ => Thread.Sleep(5);
+                transport.OnLocalClientDisconnected += (_, _) => Thread.Sleep(5);
 
                 transport.Disconnect();
                 int shutdownsWhenReturned = Volatile.Read(ref shutdowns);

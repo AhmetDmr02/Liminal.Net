@@ -133,8 +133,15 @@ namespace Liminal.Net.Core
 
         public TickPacketSizeTelemetrySnapshot GetLatestTickPayloadSizeSnapshot() => _tickPayloadSizeDiagnostics.GetLatestTickSnapshot();
 
-        private void HandleClientDisconnected(ushort clientId)
+        private void HandleClientDisconnected(LiminalConnection client)
         {
+            ushort clientId = client.ClientId;
+
+            //An old connection's late disconnect, the id already belongs to a reconnect whose measurements stay
+            //only RTT bookkeeping, a reconnect landing right after this check just starts measuring from scratch
+            if (_networkManager.Transport.GetConnection(clientId).Generation > client.Generation)
+                return;
+
             lock (_rttLock)
             {
                 _serverInFlightPings.Remove(clientId);
@@ -142,12 +149,12 @@ namespace Liminal.Net.Core
             }
         }
 
-        private void HandleLocalClientDisconnected(ushort localId)
+        private void HandleLocalClientDisconnected(ushort localId, LiminalConnection server)
         {
             ResetAllState();
         }
 
-        private void HandleLocalClientConnected(ushort localId)
+        private void HandleLocalClientConnected(ushort localId, LiminalConnection server)
         {
             ResetAllState();
         }

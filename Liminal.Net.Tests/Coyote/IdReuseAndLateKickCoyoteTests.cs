@@ -81,10 +81,10 @@ namespace Liminal.Net.Tests.Coyote
             var server = CreateTcpServer(out var transport);
             try
             {
-                transport.PrePromoteClient(ClientId, oldPair.ServerSide, out _);
+                transport.PrePromoteClient(ClientId, oldPair.ServerSide, out var oldState);
 
-                //Old connection's own reader failing on a bad frame, it kicks only its own socket
-                var oldReader = Task.Run(() => transport.KickConnection(ClientId, oldPair.ServerSide));
+                //Old connection's own reader failing on a bad frame, it kicks only its own connection
+                var oldReader = Task.Run(() => transport.KickConnection(ClientId, oldState));
                 var reconnect = Task.Run(() => transport.PrePromoteClient(ClientId, newPair.ServerSide, out _));
                 await Task.WhenAll(oldReader, reconnect);
 
@@ -114,9 +114,9 @@ namespace Liminal.Net.Tests.Coyote
             var server = CreateTcpServer(out var transport);
             try
             {
-                transport.PrePromoteClient(ClientId, oldPair.ServerSide, out _);
+                transport.PrePromoteClient(ClientId, oldPair.ServerSide, out var oldState);
 
-                var oldReader = Task.Run(() => transport.KickConnection(ClientId, oldPair.ServerSide));
+                var oldReader = Task.Run(() => transport.KickConnection(ClientId, oldState));
                 var reconnect = Task.Run(() => transport.PrePromoteClient(ClientId, newPair.ServerSide, out _));
                 await Task.WhenAll(oldReader, reconnect);
 
@@ -217,7 +217,7 @@ namespace Liminal.Net.Tests.Coyote
                 });
                 await Task.WhenAll(tickThread, transportThread);
 
-                Specification.Assert(transport.GetConnectionId(ClientId) != 0,
+                Specification.Assert(transport.GetConnection(ClientId).IsValid,
                     $"A flush failure on client {ClientId}'s old session kicked the new connection that reused the id.");
             }
             finally
@@ -255,7 +255,7 @@ namespace Liminal.Net.Tests.Coyote
             });
             await Task.WhenAll(tickThread, transportThread);
 
-            Specification.Assert(transport.GetConnectionId(ClientId) != 0,
+            Specification.Assert(transport.GetConnection(ClientId).IsValid,
                 $"A stale fragment assembly of client {ClientId}'s old connection got the new connection that reused the id kicked.");
         }
 
@@ -293,17 +293,27 @@ namespace Liminal.Net.Tests.Coyote
             public int HeldThread;
             public readonly TaskCompletionSource<bool> Restarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            public void RaiseReliable(ReadOnlySpan<byte> data, ushort senderId) => _onReliable?.Invoke(data, senderId);
+            public void RaiseReliable(ReadOnlySpan<byte> data, LiminalConnection from) => _onReliable?.Invoke(data, from);
 
-            public override void Disconnect()
+            private void HoldOnOldRunThread()
             {
                 if (Environment.CurrentManagedThreadId == Volatile.Read(ref HeldThread))
                 {
                     for (int i = 0; i < 5000 && !Restarted.Task.IsCompleted; i++)
                         Task.Delay(1).Wait();
                 }
+            }
 
+            public override void Disconnect()
+            {
+                HoldOnOldRunThread();
                 base.Disconnect();
+            }
+
+            public override void Disconnect(LiminalConnection server)
+            {
+                HoldOnOldRunThread();
+                base.Disconnect(server);
             }
         }
 
@@ -331,6 +341,7 @@ namespace Liminal.Net.Tests.Coyote
                 oldSocket.Connect(IPAddress.Loopback, port);
                 serverSide = listener.AcceptTcpClient();
                 transport.PromoteLocalClient(1, oldSocket);
+                var oldConnection = transport.GetConnection(ILiminalTransport.SERVER_ID);
 
                 //Bigger than a batch with Hiccup off, the session manager kicks for it
                 byte[] oversized = new byte[config.MaxPacketSizePerBatch + 1];
@@ -338,7 +349,7 @@ namespace Liminal.Net.Tests.Coyote
                 var oldReceiveThread = Task.Run(() =>
                 {
                     Volatile.Write(ref transport.HeldThread, Environment.CurrentManagedThreadId);
-                    transport.RaiseReliable(oversized, ILiminalTransport.SERVER_ID);
+                    transport.RaiseReliable(oversized, oldConnection);
                 });
                 var gameRestarts = Task.Run(() =>
                 {

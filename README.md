@@ -166,23 +166,37 @@ Implement `ILiminalTransport` to wrap custom protocols (UDP/ENet/QUIC/WebSockets
 ```csharp
 public interface ILiminalTransport
 {
-    void InitializeTransport(LiminalTransportConfig config);
+    void InitializeTransport(LiminalNetworkConfig config);
     void StartServer(string ip, int port);
     void StartClient(string ip, int port);
-    void SendReliable(Span<byte> data, ushort clientId);
-    void SendUnreliable(Span<byte> data, ushort clientId);
+
+    LiminalConnection GetConnection(ushort clientId);
+    void Send(Span<byte> data, LiminalConnection to, TransportFlags flags);
+
     void Disconnect();
+    void Disconnect(LiminalConnection server);
     void Kick(ushort clientId);
+    void Kick(LiminalConnection client);
     void Shutdown();
 
-    event DataReceivedHandler OnMessageReceivedReliable;
+    event DataReceivedHandler OnMessageReceivedReliable;    // (data, LiminalConnection from)
     event DataReceivedHandler OnMessageReceivedUnreliable;
-    event ClientConnectionHandler OnClientConnected;
+    event ClientConnectionHandler OnClientConnected;        // (LiminalConnection client)
     event ClientConnectionHandler OnClientDisconnected;
+    event ClientConnectionHandler OnClientKicked;
+    event LocalConnectionHandler OnLocalClientConnected;    // (ushort localClientId, LiminalConnection server)
+    event LocalConnectionHandler OnLocalClientDisconnected;
+    event TransportEventHandler OnShutdown;
+    event Action<LiminalConnection, DisconnectReason, string> OnTransportDisconnectReason;
+    // ...plus the remaining members of ILiminalTransport
 }
 ```
 
-*Contract:* The underlying connection handshake must be complete and assign a valid `ushort` client ID before invoking `OnClientConnected`.
+*Contract:*
+- The handshake must be complete and the client must have a valid `ushort` id before `OnClientConnected` is raised.
+- `LiminalConnection` is the client id plus a generation that is never reused by the transport, a reconnect under the same id gets a new one. Every event and every scoped call carries it so late work for an old connection can never reach a new one.
+- `Send`, `Kick(LiminalConnection)` and `Disconnect(LiminalConnection)` must check that the connection is still current and act in one atomic step, otherwise do nothing.
+- Raise events without holding the transport's own locks, the library may call back into the transport from them.
 
 ---
 

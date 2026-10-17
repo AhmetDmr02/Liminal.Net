@@ -138,8 +138,8 @@ namespace Liminal.Net.Tests.Coyote
             transport.SetConnectedForTesting(isConnected: false, isServer: false, isClient: true);
 
             var events = new ConcurrentQueue<string>();
-            transport.OnLocalClientConnected += _ => events.Enqueue("connected");
-            transport.OnLocalClientDisconnected += _ => events.Enqueue("disconnected");
+            transport.OnLocalClientConnected += (_, _) => events.Enqueue("connected");
+            transport.OnLocalClientDisconnected += (_, _) => events.Enqueue("disconnected");
 
             var socket = new TcpClient();
             var promote = Task.Run(() => transport.PromoteLocalClient(ClientId, socket));

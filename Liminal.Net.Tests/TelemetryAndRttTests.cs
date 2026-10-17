@@ -530,7 +530,7 @@ namespace Liminal.Net.Tests
             BinaryPrimitives.WriteInt64LittleEndian(maliciousPongPayload.Slice(4, 8), Stopwatch.GetTimestamp() - (Stopwatch.Frequency * 10));
 
             var serverTransport = (TcpTransport)_serverManager.Transport;
-            serverTransport.Send(maliciousPongPayload, client.localID,TransportFlags.Reliable);
+            serverTransport.Send(maliciousPongPayload, serverTransport.GetConnection(client.localID), TransportFlags.Reliable);
 
             Thread.Sleep(100);
 

@@ -168,9 +168,9 @@ namespace Liminal.Net.Tests.Coyote
 
             int reconnected = 0;
             int newConnectionKicked = 0;
-            transport.OnClientKicked += id =>
+            transport.OnClientKicked += client =>
             {
-                if (id == ClientId && Volatile.Read(ref reconnected) == 1)
+                if (client.ClientId == ClientId && Volatile.Read(ref reconnected) == 1)
                     Interlocked.Increment(ref newConnectionKicked);
             };
 

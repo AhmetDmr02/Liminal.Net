@@ -383,6 +383,7 @@ namespace Liminal.Net.Tests
             };
 
             var mockTransport = new MockTransport();
+            mockTransport.ConnectedClients.Add(1);
             var fragmentor = new LiminalPacketFragmentor(mockTransport, config, mtu: 500);
 
             int sendCount = 0;

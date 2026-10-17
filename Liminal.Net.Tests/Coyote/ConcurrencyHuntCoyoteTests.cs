@@ -150,12 +150,12 @@ namespace Liminal.Net.Tests.Coyote
             var config = CreateConfig();
             var server = StartMockServer(config, out var transport);
             transport.TriggerClientConnected(ClientId);
-            uint oldConnection = transport.GetConnectionId(ClientId);
+            uint oldConnection = transport.GetConnection(ClientId).Generation;
 
             int sentToNewConnection = 0;
             transport.OnSendHook = (_, target, _) =>
             {
-                uint current = transport.GetConnectionId(target);
+                uint current = transport.GetConnection(target).Generation;
                 if (target == ClientId && current != 0 && current != oldConnection)
                     Interlocked.Increment(ref sentToNewConnection);
             };

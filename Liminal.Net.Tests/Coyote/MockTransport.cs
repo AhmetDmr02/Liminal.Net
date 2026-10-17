@@ -52,9 +52,50 @@ namespace Liminal.Net.Tests
             System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
         }
 
+        //View over the mock's connections, adding a client opens its connection and removing one closes it in the same step
+        //the local client's own connection to the server is not listed, like a real server's client list
+        public sealed class ConnectionSet : IEnumerable<ushort>
+        {
+            private readonly MockTransport _owner;
+
+            internal ConnectionSet(MockTransport owner) => _owner = owner;
+
+            public bool Add(ushort clientId) => clientId != ILiminalTransport.SERVER_ID && _owner.OpenIfAbsent(clientId);
+
+            public bool Remove(ushort clientId) => clientId != ILiminalTransport.SERVER_ID && _owner.Close(clientId).IsValid;
+
+            public bool Contains(ushort clientId) => clientId != ILiminalTransport.SERVER_ID && _owner._connections.ContainsKey(clientId);
+
+            public int Count
+            {
+                get
+                {
+                    int count = 0;
+                    foreach (var clientId in this) count++;
+                    return count;
+                }
+            }
+
+            public IEnumerator<ushort> GetEnumerator()
+            {
+                foreach (var clientId in _owner._connections.Keys)
+                {
+                    if (clientId != ILiminalTransport.SERVER_ID)
+                        yield return clientId;
+                }
+            }
+
+            System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+        }
+
         public readonly ThreadSafeList<PacketRecord> SentPackets = new();
-        public readonly ThreadSafeSet<ushort> ConnectedClients = new();
+        public readonly ConnectionSet ConnectedClients;
         public readonly ThreadSafeSet<ushort> KickedClients = new();
+
+        public MockTransport()
+        {
+            ConnectedClients = new ConnectionSet(this);
+        }
 
         public ushort LocalClientId { get; set; } = 1;
         public bool IsServer { get; set; } = true;
@@ -72,14 +113,14 @@ namespace Liminal.Net.Tests
         public event TransportEventHandler? OnShutdown;
         public event TransportEventHandler? OnHandshakeInitialized;
 
-        public event ClientConnectionHandler? OnLocalClientConnected;
-        public event ClientConnectionHandler? OnLocalClientDisconnected;
+        public event LocalConnectionHandler? OnLocalClientConnected;
+        public event LocalConnectionHandler? OnLocalClientDisconnected;
         public event ClientConnectionHandler? OnClientConnected;
         public event ClientConnectionHandler? OnClientDisconnected;
         public event ClientConnectionHandler? OnClientKicked;
-        public event Action<ushort, DisconnectReason, string>? OnTransportDisconnectReason;
+        public event Action<LiminalConnection, DisconnectReason, string>? OnTransportDisconnectReason;
 
-        public void TriggerTransportDisconnectReason(ushort id, DisconnectReason reason, string message) => OnTransportDisconnectReason?.Invoke(id, reason, message);
+        public void TriggerTransportDisconnectReason(ushort id, DisconnectReason reason, string message) => OnTransportDisconnectReason?.Invoke(CurrentOrStale(id), reason, message);
 
         public Action<byte[], ushort, TransportFlags>? OnSendHook;
 
@@ -92,55 +133,118 @@ namespace Liminal.Net.Tests
 
         public void StartServer(string ip, int port) => OnServerStarted?.Invoke();
         public void StartClient(string ip, int port) { }
-        //New id per connection so tests can tell a reconnect under the same client id from the old connection
+        //New generation per connection so tests can tell a reconnect under the same client id from the old connection
+        //connections change and scoped sends decide under _gate, as atomic as TcpTransport so the mock adds no races of its own
         private readonly ConcurrentDictionary<ushort, uint> _connections = new();
+        private readonly object _gate = new();
         private int _lastConnectionId;
 
         private uint NextConnectionId() => (uint)Interlocked.Increment(ref _lastConnectionId);
 
+        private LiminalConnection Open(ushort clientId, ushort key)
+        {
+            lock (_gate)
+            {
+                uint generation = NextConnectionId();
+                _connections[key] = generation;
+                return new LiminalConnection(key, generation);
+            }
+        }
+
+        private bool OpenIfAbsent(ushort clientId)
+        {
+            lock (_gate)
+            {
+                return _connections.TryAdd(clientId, NextConnectionId());
+            }
+        }
+
+        private LiminalConnection Close(ushort key)
+        {
+            lock (_gate)
+            {
+                return _connections.TryRemove(key, out var generation) ? new LiminalConnection(key, generation) : new LiminalConnection(key, 0);
+            }
+        }
+
+        private bool CloseIfCurrent(LiminalConnection connection)
+        {
+            lock (_gate)
+            {
+                return connection.IsValid &&
+                       ((ICollection<KeyValuePair<ushort, uint>>)_connections).Remove(new KeyValuePair<ushort, uint>(connection.ClientId, connection.Generation));
+            }
+        }
+
+        //Events raised for an id with no connection carry generation 0 so they match nothing
+        private LiminalConnection CurrentOrStale(ushort clientId)
+        {
+            var current = GetConnection(clientId);
+            return current.IsValid ? current : new LiminalConnection(clientId, 0);
+        }
+
         //Like a real transport every connection is gone once it shuts down
         public void Disconnect()
         {
-            _connections.Clear();
+            lock (_gate) _connections.Clear();
             OnShutdown?.Invoke();
+        }
+
+        public void Disconnect(LiminalConnection server)
+        {
+            if (!CloseIfCurrent(server))
+                return;
+
+            Disconnect();
         }
 
         public void Shutdown()
         {
-            _connections.Clear();
+            lock (_gate) _connections.Clear();
             OnShutdown?.Invoke();
         }
 
-        public uint GetConnectionId(ushort clientId) => _connections.TryGetValue(clientId, out var connection) ? connection : 0;
-
-        public void Kick(ushort clientId, uint connectionId)
+        public LiminalConnection GetConnection(ushort clientId)
         {
-            if (connectionId == 0 ||
-                !((ICollection<KeyValuePair<ushort, uint>>)_connections).Remove(new KeyValuePair<ushort, uint>(clientId, connectionId)))
-                return;
+            if (IsClientConnectedFunc != null && !IsClientConnectedFunc(clientId))
+                return default;
 
-            KickedClients.Add(clientId);
-            ConnectedClients.Remove(clientId);
-            OnClientKicked?.Invoke(clientId);
+            return _connections.TryGetValue(clientId, out var generation) ? new LiminalConnection(clientId, generation) : default;
         }
 
-        public void Send(Span<byte> data, ushort clientId, TransportFlags flags)
+        public void Kick(LiminalConnection client)
         {
-            SentPackets.Add(new PacketRecord
+            if (!CloseIfCurrent(client))
+                return;
+
+            KickedClients.Add(client.ClientId);
+            OnClientKicked?.Invoke(client);
+        }
+
+        public void Send(Span<byte> data, LiminalConnection to, TransportFlags flags)
+        {
+            byte[] copy = data.ToArray();
+            lock (_gate)
             {
-                Data = data.ToArray(),
-                TargetId = clientId,
-                Flags = flags
-            });
-            OnSendHook?.Invoke(data.ToArray(), clientId, flags);
+                //Like TcpTransport, data for a connection that is no longer current never goes out
+                if (!to.IsValid || !_connections.TryGetValue(to.ClientId, out var generation) || generation != to.Generation)
+                    return;
+
+                SentPackets.Add(new PacketRecord
+                {
+                    Data = copy,
+                    TargetId = to.ClientId,
+                    Flags = flags
+                });
+                OnSendHook?.Invoke(copy, to.ClientId, flags);
+            }
         }
 
         public void Kick(ushort clientId)
         {
-            _connections.TryRemove(clientId, out _);
+            var kicked = Close(clientId);
             KickedClients.Add(clientId);
-            ConnectedClients.Remove(clientId);
-            OnClientKicked?.Invoke(clientId);
+            OnClientKicked?.Invoke(kicked);
         }
 
         public Func<ushort, bool>? IsClientConnectedFunc;
@@ -154,16 +258,21 @@ namespace Liminal.Net.Tests
 
         public void TriggerClientConnected(ushort id)
         {
-            _connections[id] = NextConnectionId();
-            ConnectedClients.Add(id);
-            OnClientConnected?.Invoke(id);
+            var connection = Open(id, id);
+            OnClientConnected?.Invoke(connection);
         }
 
         public void TriggerClientDisconnected(ushort id)
         {
-            _connections.TryRemove(id, out _);
-            ConnectedClients.Remove(id);
-            OnClientDisconnected?.Invoke(id);
+            var connection = Close(id);
+            OnClientDisconnected?.Invoke(connection);
+        }
+
+        //Raises a disconnect for a connection the test kept, like an old socket's reader finishing after a reconnect
+        public void TriggerClientDisconnected(LiminalConnection connection)
+        {
+            CloseIfCurrent(connection);
+            OnClientDisconnected?.Invoke(connection);
         }
 
         public void TriggerClientKicked(ushort id)
@@ -173,20 +282,21 @@ namespace Liminal.Net.Tests
 
         public void TriggerLocalClientConnected(ushort id)
         {
-            _connections[ILiminalTransport.SERVER_ID] = NextConnectionId();
-            OnLocalClientConnected?.Invoke(id);
+            var server = Open(id, ILiminalTransport.SERVER_ID);
+            OnLocalClientConnected?.Invoke(id, server);
         }
 
         public void TriggerLocalClientDisconnected(ushort id)
         {
-            _connections.TryRemove(ILiminalTransport.SERVER_ID, out _);
-            OnLocalClientDisconnected?.Invoke(id);
+            var server = Close(ILiminalTransport.SERVER_ID);
+            OnLocalClientDisconnected?.Invoke(id, server.IsValid ? server : default);
         }
 
-        public void TriggerMessageReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);
-        public void TriggerReliableReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, id);
-        public void TriggerUnreliableReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedUnreliable?.Invoke(data, id);
-        public void TriggerFragmentReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedFragmented?.Invoke(data, id);
+        public void TriggerMessageReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, CurrentOrStale(id));
+        public void TriggerReliableReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedReliable?.Invoke(data, CurrentOrStale(id));
+        public void TriggerReliableReceived(ReadOnlySpan<byte> data, LiminalConnection from) => OnMessageReceivedReliable?.Invoke(data, from);
+        public void TriggerUnreliableReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedUnreliable?.Invoke(data, CurrentOrStale(id));
+        public void TriggerFragmentReceived(ReadOnlySpan<byte> data, ushort id) => OnMessageReceivedFragmented?.Invoke(data, CurrentOrStale(id));
 
         public void TriggerShutdown() => OnShutdown?.Invoke();
 
