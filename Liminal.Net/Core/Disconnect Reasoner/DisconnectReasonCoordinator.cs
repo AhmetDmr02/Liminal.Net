@@ -21,7 +21,8 @@ namespace Liminal.Net.Core
         private readonly LiminalPacketInterpreter _interpreter;
         private readonly LiminalNetworkConfig _config;
 
-        private readonly ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message)> _resolved = new();
+        //Generation is the connection the reason belongs to, a reason left over from an older connection never resolves a newer one
+        private readonly ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message, uint Generation)> _resolved = new();
         private readonly ConcurrentDictionary<ushort, TaskCompletionSource<bool>> _pendingAcks = new();
 
         //Newest connection seen per client id, an event of an older one belongs to a connection the id already moved on from and is ignored
@@ -92,7 +93,7 @@ namespace Liminal.Net.Core
 
             // If the client never received a specific reason from the server,
             // resolve under its local ID as ConnectionLost.
-            _resolved.TryAdd(localId, (DisconnectReason.ConnectionLost, "Connection to server was lost."));
+            _resolved.TryAdd(localId, (DisconnectReason.ConnectionLost, "Connection to server was lost.", server.Generation));
             HandleDisconnected(localId, server.Generation);
         }
 
@@ -103,7 +104,7 @@ namespace Liminal.Net.Core
             //Taken now, the kick below runs after the grace period and must only hit this connection
             LiminalConnection connection = _transport.GetConnection(clientId);
 
-            _resolved[clientId] = (reason, message);
+            _resolved[clientId] = (reason, message, connection.Generation);
 
             var ackTcs = _pendingAcks.GetOrAdd(clientId, _ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
 
@@ -163,7 +164,7 @@ namespace Liminal.Net.Core
             ushort myId = _transport.LocalClientId;
             //Taken now, the disconnect below runs after the grace period and must only end this connection, not one a restart made since
             LiminalConnection server = _transport.GetConnection(ILiminalTransport.SERVER_ID);
-            _resolved[myId] = (reason, message);
+            _resolved[myId] = (reason, message, server.Generation);
 
             var ackTcs = _pendingAcks.GetOrAdd(ILiminalTransport.SERVER_ID, _ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
 
@@ -222,14 +223,20 @@ namespace Liminal.Net.Core
         public void RecordReason(ushort clientId, DisconnectReason reason, string message)
         {
             if (_disposed) return;
-            _resolved[clientId] = (reason, message);
+            _resolved[clientId] = (reason, message, CurrentGeneration(clientId));
         }
+
+        //A client's own id has no connection of its own, its reasons belong to its connection to the server
+        private uint CurrentGeneration(ushort id) =>
+            !_transport.IsServer && id == _transport.LocalClientId
+                ? _transport.GetConnection(ILiminalTransport.SERVER_ID).Generation
+                : _transport.GetConnection(id).Generation;
 
         //The local side left on purpose, a reason the server already sent (a kick) is kept
         internal void RecordLocalLeave(ushort localId, string message)
         {
             if (_disposed) return;
-            _resolved.TryAdd(localId, (DisconnectReason.ClientDisconnected, message));
+            _resolved.TryAdd(localId, (DisconnectReason.ClientDisconnected, message, _transport.GetConnection(ILiminalTransport.SERVER_ID).Generation));
         }
 
         //For a local leave the transport wont report, like Shutdown
@@ -257,10 +264,19 @@ namespace Liminal.Net.Core
             if (IsStale(connection.ClientId, connection.Generation)) return;
 
             ushort id = connection.ClientId;
+            var incoming = (reason, msg, connection.Generation);
             while (true)
             {
                 if (_resolved.TryGetValue(id, out var existing))
                 {
+                    //An older connection's leftover counts as nothing on record
+                    if (existing.Generation < connection.Generation)
+                    {
+                        if (_resolved.TryUpdate(id, incoming, existing))
+                            return;
+                        continue;
+                    }
+
                     if (existing.Reason != DisconnectReason.Unknown &&
                         existing.Reason != DisconnectReason.ConnectionLost)
                     {
@@ -272,14 +288,14 @@ namespace Liminal.Net.Core
                         return;
                     }
 
-                    if (_resolved.TryUpdate(id, (reason, msg), existing))
+                    if (_resolved.TryUpdate(id, incoming, existing))
                     {
                         return;
                     }
                 }
                 else
                 {
-                    if (_resolved.TryAdd(id, (reason, msg)))
+                    if (_resolved.TryAdd(id, incoming))
                     {
                         return;
                     }
@@ -293,11 +309,11 @@ namespace Liminal.Net.Core
 
             if (!_transport.IsServer)
             {
-                _resolved[_transport.LocalClientId] = (reason, packet.Message);
+                _resolved[_transport.LocalClientId] = (reason, packet.Message, _transport.GetConnection(ILiminalTransport.SERVER_ID).Generation);
             }
             else
             {
-                _resolved[sender] = (reason, packet.Message);
+                _resolved[sender] = (reason, packet.Message, _transport.GetConnection(sender).Generation);
             }
 
             try
@@ -347,12 +363,7 @@ namespace Liminal.Net.Core
                 if (!TryRaiseGeneration(_resolvedGeneration, id, generation))
                     return;
 
-                var (r, m) = _resolved.TryRemove(id, out var recorded)
-                    ? recorded
-                    : (DisconnectReason.ConnectionLost, null);
-
-                reason = r;
-                msg = m;
+                (reason, msg) = TakeRecordedReason(id, generation);
                 handlerSnapshot = OnResolved;
             }
 
@@ -360,10 +371,30 @@ namespace Liminal.Net.Core
             handlerSnapshot?.Invoke(id, reason, msg);
         }
 
+        //A reason recorded for a newer connection stays for that connection, one for an older connection is dropped
+        //generation 0 has no connection to match against and takes whatever is on record
+        private (DisconnectReason Reason, string Message) TakeRecordedReason(ushort id, uint generation)
+        {
+            var entries = (ICollection<KeyValuePair<ushort, (DisconnectReason, string, uint)>>)_resolved;
+            while (_resolved.TryGetValue(id, out var recorded))
+            {
+                if (generation != 0 && recorded.Generation > generation)
+                    break;
+
+                if (!entries.Remove(new KeyValuePair<ushort, (DisconnectReason, string, uint)>(id, recorded)))
+                    continue;
+
+                if (generation == 0 || recorded.Generation == generation)
+                    return (recorded.Reason, recorded.Message);
+            }
+
+            return (DisconnectReason.ConnectionLost, null);
+        }
+
         public void Dispose()
         {
             Action<ushort, DisconnectReason, string> handlerSnapshot;
-            ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message)> remaining;
+            ConcurrentDictionary<ushort, (DisconnectReason Reason, string Message, uint Generation)> remaining;
 
             lock (_disposeLock)
             {
@@ -383,10 +414,10 @@ namespace Liminal.Net.Core
                 // If local client dropped and was never resolved, ensure it fires ConnectionLost before dying
                 if (!_transport.IsServer && _transport.LocalClientId != 0 && !_resolvedGeneration.ContainsKey(_transport.LocalClientId))
                 {
-                    _resolved.TryAdd(_transport.LocalClientId, (DisconnectReason.ConnectionLost, "Connection to server was lost."));
+                    _resolved.TryAdd(_transport.LocalClientId, (DisconnectReason.ConnectionLost, "Connection to server was lost.", _transport.GetConnection(ILiminalTransport.SERVER_ID).Generation));
                 }
 
-                remaining = new ConcurrentDictionary<ushort, (DisconnectReason, string)>(_resolved);
+                remaining = new ConcurrentDictionary<ushort, (DisconnectReason, string, uint)>(_resolved);
             }
 
             _disposeCts.Cancel();
@@ -394,6 +425,9 @@ namespace Liminal.Net.Core
             foreach (var kvp in remaining)
             {
                 _latestGeneration.TryGetValue(kvp.Key, out var latest);
+                if (kvp.Value.Generation != 0 && kvp.Value.Generation < latest)
+                    continue;
+
                 if (TryRaiseGeneration(_resolvedGeneration, kvp.Key, latest))
                 {
                     handlerSnapshot?.Invoke(kvp.Key, kvp.Value.Reason, kvp.Value.Message);

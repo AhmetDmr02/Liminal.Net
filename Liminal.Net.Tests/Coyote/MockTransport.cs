@@ -209,8 +209,13 @@ namespace Liminal.Net.Tests
             if (IsClientConnectedFunc != null && !IsClientConnectedFunc(clientId))
                 return default;
 
-            return _connections.TryGetValue(clientId, out var generation) ? new LiminalConnection(clientId, generation) : default;
+            var connection = _connections.TryGetValue(clientId, out var generation) ? new LiminalConnection(clientId, generation) : default;
+            OnGetConnection?.Invoke(connection);
+            return connection;
         }
+
+        //Sees exactly what GetConnection handed back, lets a test know which connection a caller snapshotted
+        public Action<LiminalConnection>? OnGetConnection;
 
         public void Kick(LiminalConnection client)
         {
