@@ -69,7 +69,7 @@ namespace Liminal.Net.Core
 
         public LiminalSession(LiminalConnection connection, int bufferSize)
         {
-            Id = connection.ClientId;
+            Id = connection.PeerId;
             Connection = connection;
 
             RawSendBufferReliable = new LiminalNativeBuffer(bufferSize);

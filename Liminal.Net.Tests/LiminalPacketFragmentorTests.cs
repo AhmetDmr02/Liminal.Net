@@ -181,7 +181,7 @@ namespace Liminal.Net.Tests
             fragmentor.OnMessageReassembled += (data, sender) =>
             {
                 reassembledResult = data.ToArray();
-                seenSender = sender.ClientId;
+                seenSender = sender.PeerId;
             };
 
             fragmentor.Send(originalPayload, targetId: 10, TransportFlags.Reliable);
@@ -481,7 +481,7 @@ namespace Liminal.Net.Tests
 
             fragmentor.OnMessageReassembled += (data, sender) =>
             {
-                receivedPayloads[sender.ClientId] = data.ToArray();
+                receivedPayloads[sender.PeerId] = data.ToArray();
             };
 
             var allChunks = new List<(ushort SenderId, byte[] Buffer)>();
@@ -567,7 +567,7 @@ namespace Liminal.Net.Tests
             serverFragmentor.OnMessageReassembled += (data, sender) =>
             {
                 serverReceivedPayload = data.ToArray();
-                serverSeenSender = sender.ClientId;
+                serverSeenSender = sender.PeerId;
             };
 
             clientFragmentor.Send(originalPayload, ILiminalTransport.SERVER_ID, TransportFlags.Reliable);
@@ -712,7 +712,7 @@ namespace Liminal.Net.Tests
 
             public void Kick(LiminalConnection client)
             {
-                if (GetConnection(client.ClientId) == client) Kick(client.ClientId);
+                if (GetConnection(client.PeerId) == client) Kick(client.PeerId);
             }
 
             public void Kick(ushort clientId)
@@ -728,7 +728,7 @@ namespace Liminal.Net.Tests
                 SentPackets.Add(new PacketRecord
                 {
                     Data = data.ToArray(),
-                    TargetId = to.ClientId,
+                    TargetId = to.PeerId,
                     Flags = flags
                 });
             }

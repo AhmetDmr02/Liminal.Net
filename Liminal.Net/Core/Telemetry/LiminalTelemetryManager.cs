@@ -135,7 +135,7 @@ namespace Liminal.Net.Core
 
         private void HandleClientDisconnected(LiminalConnection client)
         {
-            ushort clientId = client.ClientId;
+            ushort clientId = client.PeerId;
 
             //An old connection's late disconnect, the id already belongs to a reconnect whose measurements stay
             //only RTT bookkeeping, a reconnect landing right after this check just starts measuring from scratch

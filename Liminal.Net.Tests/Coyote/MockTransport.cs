@@ -172,7 +172,7 @@ namespace Liminal.Net.Tests
             lock (_gate)
             {
                 return connection.IsValid &&
-                       ((ICollection<KeyValuePair<ushort, uint>>)_connections).Remove(new KeyValuePair<ushort, uint>(connection.ClientId, connection.Generation));
+                       ((ICollection<KeyValuePair<ushort, uint>>)_connections).Remove(new KeyValuePair<ushort, uint>(connection.PeerId, connection.Generation));
             }
         }
 
@@ -222,7 +222,7 @@ namespace Liminal.Net.Tests
             if (!CloseIfCurrent(client))
                 return;
 
-            KickedClients.Add(client.ClientId);
+            KickedClients.Add(client.PeerId);
             OnClientKicked?.Invoke(client);
         }
 
@@ -232,16 +232,16 @@ namespace Liminal.Net.Tests
             lock (_gate)
             {
                 //Like TcpTransport, data for a connection that is no longer current never goes out
-                if (!to.IsValid || !_connections.TryGetValue(to.ClientId, out var generation) || generation != to.Generation)
+                if (!to.IsValid || !_connections.TryGetValue(to.PeerId, out var generation) || generation != to.Generation)
                     return;
 
                 SentPackets.Add(new PacketRecord
                 {
                     Data = copy,
-                    TargetId = to.ClientId,
+                    TargetId = to.PeerId,
                     Flags = flags
                 });
-                OnSendHook?.Invoke(copy, to.ClientId, flags);
+                OnSendHook?.Invoke(copy, to.PeerId, flags);
             }
         }
 

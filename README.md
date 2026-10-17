@@ -194,7 +194,7 @@ public interface ILiminalTransport
 
 *Contract:*
 - The handshake must be complete and the client must have a valid `ushort` id before `OnClientConnected` is raised.
-- `LiminalConnection` is the client id plus a generation that is never reused by the transport, a reconnect under the same id gets a new one. Every event and every scoped call carries it so late work for an old connection can never reach a new one.
+- `LiminalConnection` is the peer id (the client's id on a server, `SERVER_ID` on a client) plus a generation that is never reused by the transport, a reconnect under the same id gets a new one. Every event and every scoped call carries it so late work for an old connection can never reach a new one.
 - `Send`, `Kick(LiminalConnection)` and `Disconnect(LiminalConnection)` must check that the connection is still current and act in one atomic step, otherwise do nothing.
 - Raise events without holding the transport's own locks, the library may call back into the transport from them.
 

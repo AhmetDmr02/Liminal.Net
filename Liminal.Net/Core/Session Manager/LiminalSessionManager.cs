@@ -130,7 +130,7 @@ namespace Liminal.Net.Core
             if (_sessionManagerDisposed)
                 return;
 
-            ushort ownerId = from.ClientId;
+            ushort ownerId = from.PeerId;
 
             //Transports raise connect before their reader starts, no session here means the client is gone
             //a session of another connection means these bytes are an old socket's leftovers, they must not count against the new one
@@ -1010,11 +1010,11 @@ namespace Liminal.Net.Core
                     return LifecycleAccept.Closed;
 
                 //That connection already ended or was replaced before its connect got here, its disconnect finds no session either so the game hears neither
-                if (_transport != null && _transport.GetConnection(client.ClientId) != client)
+                if (_transport != null && _transport.GetConnection(client.PeerId) != client)
                     return LifecycleAccept.Ignored;
 
                 //Replaced without a disconnect, its leftovers belong to a connection that no longer exists
-                if (_sessions.TryRemove(client.ClientId, out var existingSession))
+                if (_sessions.TryRemove(client.PeerId, out var existingSession))
                 {
                     EndSession(existingSession, dispatch: false);
                 }
@@ -1023,11 +1023,11 @@ namespace Liminal.Net.Core
                     client,
                     _config.MaxPacketSizePerBatch);
 
-                _sessions[client.ClientId] = session;
+                _sessions[client.PeerId] = session;
 
                 UpdateActiveSessionsArrayLocked();
 
-                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(LiminalLifecycleKind.ClientConnected, client.ClientId, session));
+                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(LiminalLifecycleKind.ClientConnected, client.PeerId, session));
                 return LifecycleAccept.Queued;
             }
         }
@@ -1041,25 +1041,25 @@ namespace Liminal.Net.Core
                 if (_sessionManagerDisposed || _lifecycleClosed)
                     return LifecycleAccept.Closed;
 
-                if (!_sessions.TryGetValue(client.ClientId, out var session) || session.Connection != client)
+                if (!_sessions.TryGetValue(client.PeerId, out var session) || session.Connection != client)
                 {
                     //A kick is followed by that same connection's disconnect, the kick already took the session but the game still gets both
                     if (kind == LiminalLifecycleKind.ClientDisconnected && _kickedConnections.Remove(client))
                     {
-                        _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(kind, client.ClientId, null));
+                        _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(kind, client.PeerId, null));
                         return LifecycleAccept.Queued;
                     }
 
                     return LifecycleAccept.Ignored;
                 }
 
-                _sessions.TryRemove(client.ClientId, out _);
+                _sessions.TryRemove(client.PeerId, out _);
                 UpdateActiveSessionsArrayLocked();
 
                 if (kind == LiminalLifecycleKind.ClientKicked)
                     _kickedConnections.Add(client);
 
-                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(kind, client.ClientId, session));
+                _lifecycleQueue.Enqueue(new LiminalLifecycleEntry(kind, client.PeerId, session));
                 return LifecycleAccept.Queued;
             }
         }

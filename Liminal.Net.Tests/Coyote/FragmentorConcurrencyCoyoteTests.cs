@@ -114,7 +114,7 @@ namespace Liminal.Net.Tests.Coyote
 
             fragmentor.OnMessageReassembled += (data, sender) =>
             {
-                if (sender.ClientId == 1)
+                if (sender.PeerId == 1)
                 {
                     //Kick peer 1 inside its own delivery then let peer 2 rent buffers before peer 1's bytes get read
                     transport.Kick(1);
@@ -195,7 +195,7 @@ namespace Liminal.Net.Tests.Coyote
 
             var received = new ConcurrentDictionary<ushort, ConcurrentQueue<byte[]>>();
             fragmentor.OnMessageReassembled += (data, sender) =>
-                received.GetOrAdd(sender.ClientId, _ => new ConcurrentQueue<byte[]>()).Enqueue(data.ToArray());
+                received.GetOrAdd(sender.PeerId, _ => new ConcurrentQueue<byte[]>()).Enqueue(data.ToArray());
 
             var tasks = new List<Task>();
             for (ushort id = 1; id <= 3; id++)

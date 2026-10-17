@@ -77,8 +77,8 @@ namespace Liminal.Net.Core
 
         private void HandleClientConnected(LiminalConnection client)
         {
-            TryRaiseGeneration(_latestGeneration, client.ClientId, client.Generation);
-            _resolved.TryRemove(client.ClientId, out _);
+            TryRaiseGeneration(_latestGeneration, client.PeerId, client.Generation);
+            _resolved.TryRemove(client.PeerId, out _);
         }
 
         private void HandleLocalClientConnected(ushort localId, LiminalConnection server)
@@ -261,9 +261,9 @@ namespace Liminal.Net.Core
 
         internal void HandleTransportReason(LiminalConnection connection, DisconnectReason reason, string msg)
         {
-            if (IsStale(connection.ClientId, connection.Generation)) return;
+            if (IsStale(connection.PeerId, connection.Generation)) return;
 
-            ushort id = connection.ClientId;
+            ushort id = connection.PeerId;
             var incoming = (reason, msg, connection.Generation);
             while (true)
             {
@@ -333,9 +333,9 @@ namespace Liminal.Net.Core
 
         private void HandleClientDisconnected(LiminalConnection client)
         {
-            if (IsStale(client.ClientId, client.Generation)) return;
+            if (IsStale(client.PeerId, client.Generation)) return;
 
-            HandleDisconnected(client.ClientId, client.Generation);
+            HandleDisconnected(client.PeerId, client.Generation);
         }
 
         private void HandleDisconnected(ushort id, uint generation)

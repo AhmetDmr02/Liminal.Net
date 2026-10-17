@@ -159,7 +159,7 @@ namespace Liminal.Net.Core
         {
             if (Volatile.Read(ref _disposed) != 0 || !from.IsValid) return;
 
-            ushort senderId = from.ClientId;
+            ushort senderId = from.PeerId;
 
             if (fragmentSpan.Length < FragmentHeaderSize || fragmentSpan.Length > _mtu)
             {
@@ -410,21 +410,21 @@ namespace Liminal.Net.Core
         }
 
         //A replaced connection raises no disconnect, its state goes when the id shows up on a new one
-        private void HandleClientConnected(LiminalConnection connection) => DropOtherConnectionsOf(connection.ClientId, connection);
+        private void HandleClientConnected(LiminalConnection connection) => DropOtherConnectionsOf(connection.PeerId, connection);
 
         private void DropOtherConnectionsOf(ushort clientId, LiminalConnection keep)
         {
             foreach (var pair in _peers)
             {
                 var connection = pair.Value.Connection;
-                if (connection.ClientId == clientId && connection != keep)
+                if (connection.PeerId == clientId && connection != keep)
                     HandleConnectionEnded(connection);
             }
 
             foreach (var pair in _outboundSequences)
             {
                 var connection = LiminalConnection.FromKey(pair.Key);
-                if (connection.ClientId == clientId && connection != keep)
+                if (connection.PeerId == clientId && connection != keep)
                     _outboundSequences.TryRemove(pair.Key, out _);
             }
         }

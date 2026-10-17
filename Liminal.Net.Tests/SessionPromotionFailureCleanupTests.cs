@@ -144,7 +144,7 @@ namespace Liminal.Net.Tests
             transport.SetConnectedForTesting(isConnected: true, isServer: true);
 
             ushort kickedId = 0;
-            transport.OnClientKicked += client => kickedId = client.ClientId;
+            transport.OnClientKicked += client => kickedId = client.PeerId;
 
             // Make OnClientConnected throw to simulate promotion failure in high-level listener
             transport.OnClientConnected += id => throw new InvalidOperationException("Simulated promotion failure");

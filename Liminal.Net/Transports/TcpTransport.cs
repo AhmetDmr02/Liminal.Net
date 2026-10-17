@@ -345,8 +345,8 @@ namespace Liminal.Net.Transports
         //a connection already tearing its queue down is ending anyway and its own reader raises the events
         public virtual void Kick(LiminalConnection client)
         {
-            if (client.IsValid && _sendQueues.TryGetValue(client.ClientId, out var state) && state.ConnectionId == client.Generation)
-                KickConnection(client.ClientId, state);
+            if (client.IsValid && _sendQueues.TryGetValue(client.PeerId, out var state) && state.ConnectionId == client.Generation)
+                KickConnection(client.PeerId, state);
         }
 
         //expected set means only that connection may be kicked, a late failure of a replaced connection must not kick the new one
@@ -568,7 +568,7 @@ namespace Liminal.Net.Transports
         public virtual void Send(Span<byte> data, LiminalConnection to, TransportFlags flags)
         {
             if (to.IsValid)
-                SendInternal(data, to.ClientId, to.Generation, flags);
+                SendInternal(data, to.PeerId, to.Generation, flags);
         }
 
         //generation 0 goes to whichever connection holds the id now, only the transport's own pings use that
