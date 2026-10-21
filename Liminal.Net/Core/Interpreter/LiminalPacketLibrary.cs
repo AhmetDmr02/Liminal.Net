@@ -125,6 +125,15 @@ namespace Liminal.Net.Core
                 }
             }
 
+            var duplicate = discovered.GroupBy(d => d.Type.FullName)
+                               .FirstOrDefault(g => g.Count() > 1);
+
+            if (duplicate != null)
+            {
+                throw new InvalidOperationException(
+                    $"[Liminal] Duplicate packet name detected across assemblies: '{duplicate.Key}'");
+            }
+
             var auto = discovered.Where(d => d.Reserved == 0)
                                  .OrderBy(t => t.Type.FullName, StringComparer.Ordinal)
                                  .ToArray();
